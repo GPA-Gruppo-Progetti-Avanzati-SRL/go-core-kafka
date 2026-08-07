@@ -71,6 +71,43 @@ func (t *routingTransformer) Transform(ctx context.Context, batch []*corekafka.R
 }
 ```
 
+## Properties per-consumer + esito deciso dall'handler
+
+Ogni `ConsumerSpec` può portare una mappa `properties` (stringa→stringa) che la business logic legge a
+runtime — dal `ctx` (universale, vale anche per il `Mapper` di `batchsink`) o, per precompute/validazione
+all'avvio, implementando `corekafka.Configurable`:
+
+```go
+// via context (Handler, Transformer o Mapper):
+func condizioneMapper(ctx context.Context, r *corekafka.Record) (mongo.WriteModel, string, bool, error) {
+    p := corekafka.PropertiesFromContext(ctx)
+    coll := p.GetString("collection", "default")   // getter tipizzati: GetString/GetInt/GetBool/GetDuration
+    ...
+}
+
+// oppure precompute + fail-fast all'avvio:
+type condizioneHandler struct{ core.In; /* ... */ }
+func (h *condizioneHandler) Configure(p corekafka.Properties) error {
+    if !p.Has("collection") { return fmt.Errorf("property 'collection' obbligatoria") } // → l'app non parte
+    return nil
+}
+```
+
+L'handler può inoltre **decidere l'esito caso per caso**, oltre alla policy statica `on-error`:
+
+```go
+func (h *condizioneHandler) Handle(ctx context.Context, batch []*corekafka.Record) error {
+    ...
+    if isPoison(rec)      { return corekafka.DeadLetter(err, rec) } // questi record → DLQ, il resto committa
+    if isUnrecoverable()  { return fmt.Errorf("stop: %w", corekafka.ErrFailFast) } // no commit → replay
+    return nil                                                       // commit
+}
+```
+
+Regole d'esito (modalità sink): `nil` → commit; `corekafka.DeadLetter(...)` → DLQ dei record indicati +
+commit (richiede `deadletter-topic`); `corekafka.ErrFailFast` (anche wrappato) → fail-fast; **qualsiasi
+altro errore** → policy di default dello spec (`on-error`: `fail-fast` default | `deadletter`).
+
 ## Config YAML (esempio)
 
 ```yaml
@@ -87,6 +124,8 @@ consumers:
     cut-frequency: 1s
     on-error: deadletter
     deadletter-topic: businessEvents.condizioni.DLQ
+    properties:
+      collection: condizioni
   - name: router
     topics: [in.topic]
     group-id: router

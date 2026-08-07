@@ -68,7 +68,9 @@ func Module(cfg *Config, opts ...Option) {
 
 		needDLQ := o.producer
 		for _, s := range cfg.Consumers {
-			if s.WithDefaults().UsesDeadletter() {
+			// Il Producer/DLQ serve se è configurato un deadletter-topic (policy di default deadletter
+			// o scelta dell'handler a runtime via processor.DeadLetter).
+			if s.HasDeadletter() {
 				needDLQ = true
 			}
 		}

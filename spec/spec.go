@@ -4,7 +4,11 @@
 // referenziano: tenerla qui evita cicli di import e la mantiene priva di tipi del client concreto.
 package spec
 
-import "time"
+import (
+	"context"
+	"strconv"
+	"time"
+)
 
 // Modalità di elaborazione di un consumer.
 const (
@@ -73,6 +77,10 @@ type ConsumerSpec struct {
 	// Modalità transform (EOS).
 	TransactionalID    string `yaml:"transactional-id" mapstructure:"transactional-id" json:"transactional-id"`
 	DefaultOutputTopic string `yaml:"default-output-topic" mapstructure:"default-output-topic" json:"default-output-topic"`
+
+	// Properties applicative arbitrarie, lette dalla business logic a runtime (via context o
+	// tramite l'interfaccia Configurable). Come i Properties dei job di go-core-batch.
+	Properties Properties `yaml:"properties" mapstructure:"properties" json:"properties"`
 }
 
 // WithDefaults ritorna una copia dello spec con i default applicati ai campi non valorizzati.
@@ -98,7 +106,91 @@ func (s ConsumerSpec) WithDefaults() ConsumerSpec {
 	return s
 }
 
-// UsesDeadletter indica se lo spec (in modalità sink) instrada i record poison a un DLQ.
+// UsesDeadletter indica se lo spec (in modalità sink) instrada i record poison a un DLQ per policy
+// di default. Il DLQ serve comunque anche quando l'handler sceglie deadletter a runtime: vedi
+// HasDeadletter.
 func (s ConsumerSpec) UsesDeadletter() bool {
 	return s.Mode != ModeTransform && s.OnError == OnErrorDeadletter
+}
+
+// HasDeadletter indica se è configurato un topic DLQ (abilita il Producer per il deadletter, sia da
+// policy di default sia da scelta dell'handler a runtime).
+func (s ConsumerSpec) HasDeadletter() bool {
+	return s.DeadletterTopic != ""
+}
+
+// Properties è una mappa di configurazione applicativa per-consumer, con getter tipizzati. È
+// deliberatamente stringa→stringa per restare neutra e YAML-friendly.
+type Properties map[string]string
+
+// Has indica se la chiave è presente.
+func (p Properties) Has(key string) bool { _, ok := p[key]; return ok }
+
+// GetString ritorna il valore o def se assente.
+func (p Properties) GetString(key, def string) string {
+	if v, ok := p[key]; ok {
+		return v
+	}
+	return def
+}
+
+// GetInt ritorna il valore intero o def se assente/non parsabile.
+func (p Properties) GetInt(key string, def int) int {
+	if v, ok := p[key]; ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+// GetBool ritorna il valore booleano o def se assente/non parsabile.
+func (p Properties) GetBool(key string, def bool) bool {
+	if v, ok := p[key]; ok {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
+		}
+	}
+	return def
+}
+
+// GetDuration ritorna la durata (es. "5s") o def se assente/non parsabile.
+func (p Properties) GetDuration(key string, def time.Duration) time.Duration {
+	if v, ok := p[key]; ok {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
+type ctxKey int
+
+const (
+	propertiesKey ctxKey = iota
+	consumerNameKey
+)
+
+// ContextWithProperties arricchisce ctx con le Properties e il nome del consumer. L'engine lo chiama
+// una volta per goroutine-consumer; la business logic (Handler/Transformer/Mapper) le legge da ctx.
+func ContextWithProperties(ctx context.Context, name string, p Properties) context.Context {
+	ctx = context.WithValue(ctx, propertiesKey, p)
+	ctx = context.WithValue(ctx, consumerNameKey, name)
+	return ctx
+}
+
+// PropertiesFromContext ritorna le Properties del consumer corrente (o una mappa vuota).
+func PropertiesFromContext(ctx context.Context) Properties {
+	if p, ok := ctx.Value(propertiesKey).(Properties); ok {
+		return p
+	}
+	return Properties{}
+}
+
+// ConsumerNameFromContext ritorna il nome del consumer corrente (o "").
+func ConsumerNameFromContext(ctx context.Context) string {
+	if n, ok := ctx.Value(consumerNameKey).(string); ok {
+		return n
+	}
+	return ""
 }

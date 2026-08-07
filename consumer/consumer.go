@@ -68,13 +68,14 @@ func NewConsumers(p params) (*Consumers, error) {
 				return nil, fmt.Errorf("consumer %q (mode=sink): nessun Handler registrato (usare processor.Register/batchsink.Register con questo nome)", s.Name)
 			}
 			r.handler = h
-			if s.OnError == spec.OnErrorDeadletter {
-				if s.DeadletterTopic == "" {
-					return nil, fmt.Errorf("consumer %q: on-error=deadletter richiede deadletter-topic", s.Name)
-				}
-				if p.DLQ == nil {
-					return nil, fmt.Errorf("consumer %q: on-error=deadletter richiede il Producer DLQ (usare corekafka.WithProducer)", s.Name)
-				}
+			if s.OnError == spec.OnErrorDeadletter && s.DeadletterTopic == "" {
+				return nil, fmt.Errorf("consumer %q: on-error=deadletter richiede deadletter-topic", s.Name)
+			}
+			// Il DLQ (via Producer) serve sia per la policy di default deadletter sia quando l'handler
+			// sceglie il deadletter a runtime (processor.DeadLetter): se c'è un deadletter-topic, il
+			// Producer deve essere presente.
+			if s.HasDeadletter() && p.DLQ == nil {
+				return nil, fmt.Errorf("consumer %q: deadletter-topic impostato richiede il Producer (usare corekafka.WithProducer)", s.Name)
 			}
 		case spec.ModeTransform:
 			t, ok := transformers[s.Name]
@@ -88,6 +89,20 @@ func NewConsumers(p params) (*Consumers, error) {
 		default:
 			return nil, fmt.Errorf("consumer %q: mode %q non valido (sink|transform)", s.Name, s.Mode)
 		}
+
+		// Configure opzionale: passa le Properties dello spec all'handler/transformer che le vuole
+		// all'avvio (precompute/validazione). Un errore fa fail-fast: l'app non parte.
+		if c, ok := r.handler.(processor.Configurable); ok {
+			if err := c.Configure(s.Properties); err != nil {
+				return nil, fmt.Errorf("consumer %q: Configure: %w", s.Name, err)
+			}
+		}
+		if c, ok := r.transformer.(processor.Configurable); ok {
+			if err := c.Configure(s.Properties); err != nil {
+				return nil, fmt.Errorf("consumer %q: Configure: %w", s.Name, err)
+			}
+		}
+
 		runners = append(runners, r)
 	}
 
@@ -120,12 +135,26 @@ func NewConsumers(p params) (*Consumers, error) {
 	return &Consumers{}, nil
 }
 
-// run smista sulla modalità dello spec.
+// run arricchisce il ctx con le Properties/nome del consumer (leggibili dalla business logic) e
+// smista sulla modalità dello spec.
 func (r *runner) run(ctx context.Context) error {
+	ctx = spec.ContextWithProperties(ctx, r.spec.Name, r.spec.Properties)
 	if r.spec.Mode == spec.ModeTransform {
 		return r.runTransform(ctx)
 	}
 	return r.runSink(ctx)
+}
+
+// sendDeadletter produce i record sul topic DLQ dello spec. Ritorna errore (→ fail-fast) se il DLQ
+// non è configurato, così una richiesta di deadletter senza DLQ non perde silenziosamente i dati.
+func (r *runner) sendDeadletter(ctx context.Context, recs []*message.Record, cause error) error {
+	if r.dlq == nil || r.spec.DeadletterTopic == "" {
+		return fmt.Errorf("consumer %q: deadletter richiesto ma non configurato (manca deadletter-topic/Producer): %w", r.spec.Name, cause)
+	}
+	if appErr := r.dlq.Produce(ctx, toDLQ(r.spec.DeadletterTopic, recs, cause)); appErr != nil {
+		return appErr
+	}
+	return nil
 }
 
 // runSink: modalità at-least-once. poll -> accumula -> (cut size/tempo) -> Handle -> commit dopo il sink.
@@ -148,8 +177,7 @@ func (r *runner) runSink(ctx context.Context) error {
 		hErr := r.handler.Handle(ctx, batch)
 		batchDuration.WithLabelValues(r.spec.Name).Observe(time.Since(start).Seconds())
 
-		if hErr == nil {
-			processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch)))
+		commitReset := func() error {
 			if err := gc.Commit(ctx); err != nil {
 				return err
 			}
@@ -157,25 +185,37 @@ func (r *runner) runSink(ctx context.Context) error {
 			return nil
 		}
 
+		switch {
+		case hErr == nil:
+			processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch)))
+			return commitReset()
+
+		case errors.Is(hErr, processor.ErrFailFast):
+			// L'handler ha scelto esplicitamente il fail-fast: niente commit → replay.
+			return hErr
+		}
+
+		// L'handler ha scelto il deadletter per record specifici (processor.DeadLetter): i record
+		// buoni sono già stati elaborati; instrada i poison al DLQ e committa il batch.
 		var pr *processor.PoisonRecords
 		if errors.As(hErr, &pr) {
-			// I record buoni sono già stati scritti sul sink; gestisci i poison.
-			if r.spec.OnError == spec.OnErrorFailFast {
-				return hErr
-			}
-			if err := r.dlq.Produce(ctx, toDLQ(r.spec.DeadletterTopic, pr.Records, pr.Cause)); err != nil {
-				return err // DLQ irraggiungibile -> transiente: replay
+			if err := r.sendDeadletter(ctx, pr.Records, pr.Cause); err != nil {
+				return err // DLQ non configurato/irraggiungibile → replay
 			}
 			deadletteredTotal.WithLabelValues(r.spec.Name).Add(float64(len(pr.Records)))
 			processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch) - len(pr.Records)))
-			if err := gc.Commit(ctx); err != nil {
-				return err
-			}
-			batch = batch[:0]
-			return nil
+			return commitReset()
 		}
 
-		// Errore transiente (es. sink irraggiungibile): non committare, forza il replay.
+		// Errore generico → policy di DEFAULT dello spec (l'handler non ha scelto).
+		if r.spec.OnError == spec.OnErrorDeadletter {
+			if err := r.sendDeadletter(ctx, batch, hErr); err != nil {
+				return err
+			}
+			deadletteredTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch)))
+			return commitReset()
+		}
+		// default fail-fast: non committare → replay.
 		return hErr
 	}
 

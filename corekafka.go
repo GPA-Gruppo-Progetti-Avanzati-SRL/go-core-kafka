@@ -1,6 +1,8 @@
 package corekafka
 
 import (
+	"context"
+
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/batchsink"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/processor"
@@ -25,7 +27,27 @@ type (
 	KafkaConfig = spec.KafkaConfig
 	// ConsumerSpec è la specifica di un singolo consumer.
 	ConsumerSpec = spec.ConsumerSpec
+	// Properties sono le proprietà applicative per-consumer, lette dalla business logic.
+	Properties = spec.Properties
+	// Configurable è implementata da Handler/Transformer che vogliono le Properties all'avvio.
+	Configurable = processor.Configurable
 )
+
+// ErrFailFast: ritornalo (anche wrappato) da Handler/Transformer per forzare il fail-fast (no commit,
+// l'app esce → replay), a prescindere dalla policy on-error dello spec.
+var ErrFailFast = processor.ErrFailFast
+
+// DeadLetter costruisce l'esito con cui l'handler chiede di instradare QUESTI record al DLQ (e
+// committare il resto). Da ritornare come error da Handle. Richiede un deadletter-topic configurato.
+func DeadLetter(cause error, recs ...*Record) error {
+	return processor.DeadLetter(cause, recs...)
+}
+
+// PropertiesFromContext ritorna le Properties del consumer corrente (dentro Handle/Transform/Mapper).
+func PropertiesFromContext(ctx context.Context) Properties { return spec.PropertiesFromContext(ctx) }
+
+// ConsumerNameFromContext ritorna il nome del consumer corrente.
+func ConsumerNameFromContext(ctx context.Context) string { return spec.ConsumerNameFromContext(ctx) }
 
 // Sink, Mapper, BatchSpooler della modalità sink (alias generici verso batchsink).
 type (

@@ -7,9 +7,11 @@ package processor
 
 import (
 	"context"
+	"errors"
 
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 	"go.uber.org/fx"
 )
 
@@ -51,6 +53,25 @@ func (e *PoisonRecords) Error() string {
 }
 
 func (e *PoisonRecords) Unwrap() error { return e.Cause }
+
+// ErrFailFast, se ritornato (anche wrappato) da Handler/Transformer, forza il fail-fast: l'engine NON
+// committa e fa uscire l'applicazione (replay al riavvio), indipendentemente dalla policy on-error
+// dello spec. Permette all'handler di scegliere fail-fast caso per caso.
+var ErrFailFast = errors.New("corekafka: fail-fast requested by handler")
+
+// DeadLetter costruisce l'errore *PoisonRecords con cui l'handler chiede all'engine di instradare
+// QUESTI record al DLQ (e committare il resto), a prescindere dalla policy on-error di default.
+// Richiede un deadletter-topic configurato sullo spec; altrimenti l'engine ripiega su fail-fast.
+func DeadLetter(cause error, recs ...*message.Record) *PoisonRecords {
+	return &PoisonRecords{Records: recs, Cause: cause}
+}
+
+// Configurable è implementata opzionalmente da un Handler/Transformer che vuole ricevere le
+// Properties del proprio consumer all'avvio (per precompute/validazione). Se implementata, l'engine
+// chiama Configure dopo il binding nome→handler; un errore fa fail-fast (l'app non parte).
+type Configurable interface {
+	Configure(props spec.Properties) error
+}
 
 // HandlerRegistration lega un Handler al nome del consumer (ConsumerSpec.Name).
 type HandlerRegistration struct {
