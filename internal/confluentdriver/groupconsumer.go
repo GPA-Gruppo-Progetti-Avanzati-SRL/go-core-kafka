@@ -9,7 +9,7 @@ import (
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
 
-// groupConsumer implementa driver.GroupConsumer (modalità sink, at-least-once).
+// groupConsumer implementa driver.GroupConsumer (modalità handle, at-least-once).
 type groupConsumer struct {
 	c       *kafka.Consumer
 	offsets *offsetTracker

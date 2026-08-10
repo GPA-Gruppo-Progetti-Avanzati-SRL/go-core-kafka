@@ -20,7 +20,6 @@ type Option func(*options)
 
 type options struct {
 	modes    []string
-	sink     ModuleFunc
 	producer bool
 	modules  []ModuleFunc
 }
@@ -28,12 +27,6 @@ type options struct {
 // WithModes limita i consumer (e i backend collegati) ai core.Mode indicati. Vuoto = sempre attivi.
 func WithModes(modes ...string) Option {
 	return func(o *options) { o.modes = modes }
-}
-
-// WithSink inietta il backend Sink[Op] usato dalla modalità sink (es. mongospooler.Module). Passato
-// per riferimento; il suo eventuale config è gestito dalla sua lib / dall'app.
-func WithSink(m ModuleFunc) Option {
-	return func(o *options) { o.sink = m }
 }
 
 // WithProducer abilita esplicitamente il Producer pubblico. Viene comunque abilitato in automatico se
@@ -62,15 +55,11 @@ func Module(cfg *Config, opts ...Option) {
 
 		provideDriver(o.modes...)
 
-		if o.sink != nil {
-			o.sink(o.modes...)
-		}
-
 		needDLQ := o.producer
 		for _, s := range cfg.Consumers {
-			// Il Producer/DLQ serve se è configurato un deadletter-topic (policy di default deadletter
-			// o scelta dell'handler a runtime via processor.DeadLetter).
-			if s.HasDeadletter() {
+			// Il Producer condiviso (non transazionale) serve solo al DLQ della modalità handle; il
+			// transform instrada a DLQ dentro la propria sessione EOS.
+			if s.WithDefaults().NeedsProducerDLQ() {
 				needDLQ = true
 			}
 		}

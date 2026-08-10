@@ -1,5 +1,5 @@
 // Package producer espone un Producer Kafka pubblico (idempotente / transazionale), usato dall'engine
-// per il DLQ della modalità sink e disponibile alle app. È sottile: incapsula un driver.Producer, così
+// per il DLQ della modalità handle e disponibile alle app. È sottile: incapsula un driver.Producer, così
 // nessun tipo del client concreto compare nella firma pubblica.
 package producer
 

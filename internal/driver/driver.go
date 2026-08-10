@@ -17,7 +17,7 @@ import (
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 )
 
-// GroupConsumer è un consumer di consumer-group per la modalità sink (at-least-once). Il driver tiene
+// GroupConsumer è un consumer di consumer-group per la modalità handle (at-least-once). Il driver tiene
 // traccia internamente degli offset dei record ritornati da Poll dall'ultimo Commit; Commit li
 // conferma (offset+1). Poll ritorna (nil, nil) allo scadere del timeout senza messaggi.
 type GroupConsumer interface {
@@ -38,7 +38,7 @@ type TransactSession interface {
 	Close() error
 }
 
-// Producer è un producer non transazionale, usato per il DLQ (modalità sink) e come servizio pubblico.
+// Producer è un producer non transazionale, usato per il DLQ (modalità handle) e come servizio pubblico.
 type Producer interface {
 	Produce(ctx context.Context, recs []*message.ProducerRecord) error
 	Close() error

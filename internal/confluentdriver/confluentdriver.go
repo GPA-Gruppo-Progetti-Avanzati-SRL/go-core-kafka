@@ -20,7 +20,7 @@ type Factory struct{}
 // New ritorna la Factory Confluent come driver.Factory (usata di default dal package root).
 func New() driver.Factory { return Factory{} }
 
-// NewGroupConsumer crea un consumer di consumer-group per la modalità sink (at-least-once).
+// NewGroupConsumer crea un consumer di consumer-group per la modalità handle (at-least-once).
 func (Factory) NewGroupConsumer(s spec.ConsumerSpec, k spec.KafkaConfig) (driver.GroupConsumer, error) {
 	cm := consumerConfigMap(s, k)
 	c, err := kafka.NewConsumer(cm)

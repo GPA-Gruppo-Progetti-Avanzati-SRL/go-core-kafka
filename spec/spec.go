@@ -12,11 +12,11 @@ import (
 
 // Modalità di elaborazione di un consumer.
 const (
-	ModeSink      = "sink"      // at-least-once: commit degli offset DOPO il sink (idempotente)
+	ModeHandle    = "handle"    // at-least-once: l'Handler fa business logic libera; commit degli offset dopo Handle nil
 	ModeTransform = "transform" // EOS Kafka->Kafka: produce + commit offset nella stessa transazione
 )
 
-// Policy sull'errore business (record "poison") in modalità sink.
+// Policy sull'errore business (record "poison") in modalità handle.
 const (
 	OnErrorDeadletter = "deadletter" // produce su DeadletterTopic, poi committa e prosegue (default)
 	OnErrorFailFast   = "fail-fast"  // non committa ed esce: replay al riavvio
@@ -58,7 +58,7 @@ type ConsumerSpec struct {
 	Name    string   `yaml:"name" mapstructure:"name" json:"name" validate:"required"`
 	Topics  []string `yaml:"topics" mapstructure:"topics" json:"topics" validate:"required,min=1"`
 	GroupID string   `yaml:"group-id" mapstructure:"group-id" json:"group-id" validate:"required"`
-	Mode    string   `yaml:"mode" mapstructure:"mode" json:"mode"` // ModeSink (default) | ModeTransform
+	Mode    string   `yaml:"mode" mapstructure:"mode" json:"mode"` // ModeHandle (default) | ModeTransform
 
 	// Tuning consumer (mappato su ConfigMap dal driver).
 	MaxBatchSize      int           `yaml:"max-batch-size" mapstructure:"max-batch-size" json:"max-batch-size"`
@@ -86,7 +86,7 @@ type ConsumerSpec struct {
 // WithDefaults ritorna una copia dello spec con i default applicati ai campi non valorizzati.
 func (s ConsumerSpec) WithDefaults() ConsumerSpec {
 	if s.Mode == "" {
-		s.Mode = ModeSink
+		s.Mode = ModeHandle
 	}
 	if s.MaxBatchSize <= 0 {
 		s.MaxBatchSize = DefaultMaxBatchSize
@@ -106,17 +106,23 @@ func (s ConsumerSpec) WithDefaults() ConsumerSpec {
 	return s
 }
 
-// UsesDeadletter indica se lo spec (in modalità sink) instrada i record poison a un DLQ per policy
+// UsesDeadletter indica se lo spec (in modalità handle) instrada i record poison a un DLQ per policy
 // di default. Il DLQ serve comunque anche quando l'handler sceglie deadletter a runtime: vedi
 // HasDeadletter.
 func (s ConsumerSpec) UsesDeadletter() bool {
 	return s.Mode != ModeTransform && s.OnError == OnErrorDeadletter
 }
 
-// HasDeadletter indica se è configurato un topic DLQ (abilita il Producer per il deadletter, sia da
-// policy di default sia da scelta dell'handler a runtime).
+// HasDeadletter indica se è configurato un topic DLQ (abilita il deadletter, sia da policy di default
+// sia da scelta dell'handler/transformer a runtime).
 func (s ConsumerSpec) HasDeadletter() bool {
 	return s.DeadletterTopic != ""
+}
+
+// NeedsProducerDLQ indica se lo spec richiede il *producer.Producer condiviso (non transazionale) per
+// il DLQ. Solo la modalità handle lo usa: il transform instrada a DLQ dentro la propria sessione EOS.
+func (s ConsumerSpec) NeedsProducerDLQ() bool {
+	return s.Mode != ModeTransform && s.DeadletterTopic != ""
 }
 
 // Properties è una mappa di configurazione applicativa per-consumer, con getter tipizzati. È

@@ -17,15 +17,19 @@ CGO_ENABLED=1 go build ./...
 CGO_ENABLED=1 go test ./...
 ```
 
-## Due modalità (per-consumer, campo `mode`)
+## Due seam di business logic (per-consumer, campo `mode`)
 
-- **`sink`** (default) — *at-least-once*. poll → `Handler.Handle(batch)` → commit degli offset **dopo**
-  il sink. Con sink idempotente (upsert) è effectively-once. Sink pluggable via `WithSink`.
+- **`handle`** (default) — *at-least-once*. poll → `Handler.Handle(batch) error` → commit degli offset
+  **dopo** il ritorno nil. **Business logic LIBERA**: l'handler fa ciò che vuole (Mongo, SQL, chiamate
+  esterne…). Con scrittura idempotente (upsert) è effectively-once. La libreria NON fornisce un
+  "sinker": è l'`Handler` a fare tutto.
 - **`transform`** — *EOS Kafka→Kafka*. poll → `Transformer.Transform(batch) → []*ProducerRecord` →
   produce + commit degli offset consumati nella **stessa transazione** (`SendOffsetsToTransaction`).
 
-Record "poison" (errore business): `on-error: deadletter` (default, produce su `deadletter-topic` poi
-committa) | `fail-fast` (non committa, esce → replay).
+Esito **uniforme** tra i due seam (via lo stesso errore gestito): `nil` → commit; `corekafka.DeadLetter(
+cause, recs...)` → i record indicati vanno al **DLQ** (in handle via Producer; in transform prodotti nella
+stessa transazione EOS) e il resto viene committato; `corekafka.ErrFailFast` → replay; qualsiasi altro
+errore → policy `on-error` dello spec (`fail-fast` default | `deadletter`).
 
 ## Astrazione client → futuro franz-go
 
@@ -33,40 +37,52 @@ Il client concreto è confinato in `internal/confluentdriver`, dietro le interfa
 `internal/driver`. L'API pubblica e l'engine non importano mai confluent-kafka-go. Aggiungere un
 `internal/franzdriver` e cambiare `driversel.go` fa lo switch **senza toccare le app**.
 
-## Esempio A — spooler Kafka→Mongo (mode: sink)
+## Esempio A — handle Kafka→Mongo (mode: handle)
+
+La business logic è libera nell'handler (qui persiste via un data layer `IData`); nessun "sinker" della libreria.
 
 ```go
-func init() {
-    core.ReadConfig(cfgYAML, "KAFKA_CONFIG", &cfg)
+func init() { corekafka.RegisterHandler[eventoHandler]("events") }
 
-    corekafka.Module(&cfg.Kafka,
-        corekafka.WithModes("spooler"),
-        corekafka.WithSink(mongospooler.Module), // richiede una mongospooler.CollectionFunc dall'app
-    )
-    // l'app fornisce un getter LAZY della collection (risolto alla prima Flush, quando il
-    // LinkedService di go-core-mongo è connesso in OnStart):
-    core.Provide(func(lks *mongolks.LinkedService) mongospooler.CollectionFunc {
-        return func() *mongo.Collection { return lks.GetCollection("condizioni", "") }
-    })
-    // business logic = un Mapper record -> WriteModel + chiave di dedup
-    corekafka.RegisterSink[mongo.WriteModel]("condizione", condizioneMapper)
+type eventoHandler struct {
+    core.In
+    Data data.IData   // data layer dell'app (scrive su Mongo)
+}
+
+func (h *eventoHandler) Handle(ctx context.Context, batch []*corekafka.Record) error {
+    eventi, poison := convert(batch)            // business logic dell'app
+    if err := h.Data.UpsertEventi(ctx, eventi); err != nil {
+        return err                              // transiente → no commit → replay
+    }
+    if len(poison) > 0 {
+        return corekafka.DeadLetter(errParse, poison...) // → DLQ + commit (serve deadletter-topic)
+    }
+    return nil                                  // → commit
 }
 ```
 
-## Esempio B — consume-transform-produce EOS (mode: transform)
+## Esempio B — consume-transform-produce EOS (mode: transform), con mix output + deadletter
+
+Il DLQ nel transform si fa con lo **stesso** `corekafka.DeadLetter(...)` dell'handle: si ritornano gli
+output "buoni" PIÙ un `DeadLetter` per i record poison. L'engine produce output + DLQ (sul
+`deadletter-topic` dello spec) nella **stessa transazione EOS**, poi committa.
 
 ```go
-func init() {
-    core.ReadConfig(cfgYAML, "KAFKA_CONFIG", &cfg)
-    corekafka.Module(&cfg.Kafka, corekafka.WithModes("router"))
-    corekafka.RegisterTransformer[routingTransformer]("router")
-}
+func init() { corekafka.RegisterTransformer[routingTransformer]("router") }
 
 type routingTransformer struct{ core.In }
 func (t *routingTransformer) Transform(ctx context.Context, batch []*corekafka.Record) ([]*corekafka.ProducerRecord, error) {
     out := make([]*corekafka.ProducerRecord, 0, len(batch))
+    var poison []*corekafka.Record
     for _, r := range batch {
-        out = append(out, &corekafka.ProducerRecord{Topic: "out.topic", Key: r.Key, Value: transform(r.Value)})
+        if topic, ok := route(r); ok {
+            out = append(out, &corekafka.ProducerRecord{Topic: topic, Key: r.Key, Value: r.Value})
+        } else {
+            poison = append(poison, r)   // instradato al DLQ dall'engine, nella stessa TX EOS
+        }
+    }
+    if len(poison) > 0 {
+        return out, corekafka.DeadLetter(fmt.Errorf("routing non valido"), poison...)
     }
     return out, nil
 }
@@ -75,12 +91,12 @@ func (t *routingTransformer) Transform(ctx context.Context, batch []*corekafka.R
 ## Properties per-consumer + esito deciso dall'handler
 
 Ogni `ConsumerSpec` può portare una mappa `properties` (stringa→stringa) che la business logic legge a
-runtime — dal `ctx` (universale, vale anche per il `Mapper` di `batchsink`) o, per precompute/validazione
-all'avvio, implementando `corekafka.Configurable`:
+runtime — dal `ctx` (universale, vale sia per `Handler` sia per `Transformer`) o, per
+precompute/validazione all'avvio, implementando `corekafka.Configurable`:
 
 ```go
-// via context (Handler, Transformer o Mapper):
-func condizioneMapper(ctx context.Context, r *corekafka.Record) (mongo.WriteModel, string, bool, error) {
+// via context (dentro Handle/Transform):
+func (h *eventoHandler) Handle(ctx context.Context, batch []*corekafka.Record) error {
     p := corekafka.PropertiesFromContext(ctx)
     coll := p.GetString("collection", "default")   // getter tipizzati: GetString/GetInt/GetBool/GetDuration
     ...
@@ -105,9 +121,10 @@ func (h *condizioneHandler) Handle(ctx context.Context, batch []*corekafka.Recor
 }
 ```
 
-Regole d'esito (modalità sink): `nil` → commit; `corekafka.DeadLetter(...)` → DLQ dei record indicati +
-commit (richiede `deadletter-topic`); `corekafka.ErrFailFast` (anche wrappato) → fail-fast; **qualsiasi
-altro errore** → policy di default dello spec (`on-error`: `fail-fast` default | `deadletter`).
+Regole d'esito (uniformi handle/transform): `nil` → commit; `corekafka.DeadLetter(...)` → DLQ dei
+record indicati + commit (richiede `deadletter-topic`); `corekafka.ErrFailFast` (anche wrappato) →
+fail-fast; **qualsiasi altro errore** → policy di default dello spec (`on-error`: `fail-fast` default |
+`deadletter`).
 
 ## Config YAML (esempio)
 
@@ -120,7 +137,7 @@ consumers:
   - name: condizione
     topics: [businessEvents.condizioni]
     group-id: condizioni-spooler
-    mode: sink
+    mode: handle
     max-batch-size: 500
     cut-frequency: 1s
     on-error: deadletter
@@ -133,4 +150,5 @@ consumers:
     mode: transform
     transactional-id: router-tx-1
     default-output-topic: out.topic
+    deadletter-topic: routing.DLQ        # dove finiscono i record da DeadLetter (in TX EOS)
 ```

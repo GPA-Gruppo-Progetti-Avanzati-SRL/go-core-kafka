@@ -3,7 +3,6 @@ package corekafka
 import (
 	"context"
 
-	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/batchsink"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/processor"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
@@ -11,13 +10,21 @@ import (
 
 // Ri-esporta i tipi neutri e gli helper dei sub-package, così l'app importa il solo package corekafka.
 // (I sub-package restano usabili direttamente per casi avanzati.)
+//
+// Due seam di business logic, nessun altro:
+//   - Handler (modalità handle, at-least-once): business logic LIBERA (l'app fa ciò che vuole — Mongo,
+//     SQL, chiamate esterne, ...); l'engine committa gli offset dopo il ritorno nil.
+//   - Transformer (modalità transform, EOS Kafka->Kafka): ritorna la lista dei ProducerRecord da
+//     produrre, con possibilità di MIX output + deadletter (basta impostare Topic sul topic DLQ per i
+//     record "cattivi": vengono prodotti nella stessa transazione EOS).
 
 type (
 	// Record è un messaggio consumato in forma neutra.
 	Record = message.Record
-	// ProducerRecord è un messaggio da produrre.
+	// ProducerRecord è un messaggio da produrre (output della modalità transform; il campo Topic
+	// permette di instradare, nella stessa lista, sia agli output "buoni" sia a un topic DLQ).
 	ProducerRecord = message.ProducerRecord
-	// Handler è il contratto della modalità sink.
+	// Handler è il contratto della modalità handle (at-least-once): business logic libera nell'app.
 	Handler = processor.Handler
 	// Transformer è il contratto della modalità EOS Kafka->Kafka.
 	Transformer = processor.Transformer
@@ -37,8 +44,10 @@ type (
 // l'app esce → replay), a prescindere dalla policy on-error dello spec.
 var ErrFailFast = processor.ErrFailFast
 
-// DeadLetter costruisce l'esito con cui l'handler chiede di instradare QUESTI record al DLQ (e
-// committare il resto). Da ritornare come error da Handle. Richiede un deadletter-topic configurato.
+// DeadLetter costruisce l'esito gestito con cui Handler O Transformer chiedono di instradare QUESTI
+// record al DLQ. Da ritornare come error da Handle o da Transform: in sink il resto viene committato,
+// in transform i record DLQ sono prodotti nella stessa transazione EOS degli output. Richiede un
+// deadletter-topic configurato sullo spec.
 func DeadLetter(cause error, recs ...*Record) error {
 	return processor.DeadLetter(cause, recs...)
 }
@@ -49,27 +58,21 @@ func PropertiesFromContext(ctx context.Context) Properties { return spec.Propert
 // ConsumerNameFromContext ritorna il nome del consumer corrente.
 func ConsumerNameFromContext(ctx context.Context) string { return spec.ConsumerNameFromContext(ctx) }
 
-// Sink, Mapper, BatchSpooler della modalità sink (alias generici verso batchsink).
-type (
-	Sink[Op any]         = batchsink.Sink[Op]
-	Mapper[Op any]       = batchsink.Mapper[Op]
-	BatchSpooler[Op any] = batchsink.BatchSpooler[Op]
-)
-
 // Costanti di configurazione.
 const (
-	ModeSink          = spec.ModeSink
+	ModeHandle        = spec.ModeHandle
 	ModeTransform     = spec.ModeTransform
 	OnErrorDeadletter = spec.OnErrorDeadletter
 	OnErrorFailFast   = spec.OnErrorFailFast
 )
 
-// Register registra un tipo struct T come Handler (modalità sink) per il consumer indicato.
-func Register[T any, PT interface {
+// RegisterHandler registra un tipo struct T come Handler (modalità handle) per il consumer indicato.
+// In dualità con RegisterTransformer.
+func RegisterHandler[T any, PT interface {
 	*T
 	processor.Handler
 }](consumerName string, modes ...string) {
-	processor.Register[T, PT](consumerName, modes...)
+	processor.RegisterHandler[T, PT](consumerName, modes...)
 }
 
 // RegisterTransformer registra un tipo struct T come Transformer (modalità EOS) per il consumer.
@@ -78,12 +81,6 @@ func RegisterTransformer[T any, PT interface {
 	processor.Transformer
 }](consumerName string, modes ...string) {
 	processor.RegisterTransformer[T, PT](consumerName, modes...)
-}
-
-// RegisterSink wira un BatchSpooler[Op] come Handler: il Mapper è dell'app, il Sink[Op] è iniettato
-// (es. da mongospooler.Module passato a WithSink).
-func RegisterSink[Op any](consumerName string, mapper Mapper[Op], modes ...string) {
-	batchsink.Register[Op](consumerName, mapper, modes...)
 }
 
 // ProvideHandler / ProvideTransformer registrano un costruttore fx che ritorna la relativa

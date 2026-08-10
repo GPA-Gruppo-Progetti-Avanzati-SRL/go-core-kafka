@@ -1,4 +1,4 @@
-// Package processor definisce i due seam di business logic di go-core-kafka — Handler (modalità sink)
+// Package processor definisce i due seam di business logic di go-core-kafka — Handler (modalità handle)
 // e Transformer (modalità EOS Kafka->Kafka) — e l'infrastruttura di registrazione via fx value group,
 // modellata su go-core-batch (scheduler/registry.go, distributedjob/runner/runner.go). L'engine
 // costruisce le mappe consumerName->Handler/Transformer consumando i due gruppi, quindi l'ordine di
@@ -21,7 +21,7 @@ const (
 	TransformerGroup = "kafka_transformers"
 )
 
-// Handler è il contratto della modalità sink (at-least-once). Riceve un batch di record già pollati;
+// Handler è il contratto della modalità handle (at-least-once). Riceve un batch di record già pollati;
 // NON committa gli offset (lo fa l'engine dopo il ritorno). Ritorno nil -> l'engine committa; errore
 // -> l'engine applica la policy on-error del consumer (deadletter | fail-fast).
 type Handler interface {
@@ -29,8 +29,10 @@ type Handler interface {
 }
 
 // Transformer è il contratto della modalità EOS Kafka->Kafka. Mappa il batch consumato nei record da
-// produrre. L'engine produce e committa gli offset consumati nella STESSA transazione: un errore
-// abortisce la transazione (nessun record prodotto, nessun offset committato -> replay).
+// produrre. L'engine produce e committa gli offset consumati nella STESSA transazione. Modello a esiti
+// UNIFORME con Handler: ritorno (out, nil) -> produce out + commit; (out, *PoisonRecords via DeadLetter)
+// -> produce out E instrada i record poison al deadletter-topic, tutto nella stessa transazione EOS,
+// poi commit; (_, ErrFailFast) -> abort + replay; (_, altro errore) -> policy on-error dello spec.
 type Transformer interface {
 	Transform(ctx context.Context, batch []*message.Record) ([]*message.ProducerRecord, error)
 }
@@ -59,9 +61,11 @@ func (e *PoisonRecords) Unwrap() error { return e.Cause }
 // dello spec. Permette all'handler di scegliere fail-fast caso per caso.
 var ErrFailFast = errors.New("corekafka: fail-fast requested by handler")
 
-// DeadLetter costruisce l'errore *PoisonRecords con cui l'handler chiede all'engine di instradare
-// QUESTI record al DLQ (e committare il resto), a prescindere dalla policy on-error di default.
-// Richiede un deadletter-topic configurato sullo spec; altrimenti l'engine ripiega su fail-fast.
+// DeadLetter costruisce l'errore *PoisonRecords con cui Handler O Transformer chiedono all'engine di
+// instradare QUESTI record al DLQ (e committare/produrre il resto), a prescindere dalla policy
+// on-error. In modalità handle il DLQ passa dal Producer condiviso; in modalità transform i record DLQ
+// sono prodotti nella stessa transazione EOS. Richiede un deadletter-topic configurato sullo spec;
+// altrimenti l'engine ripiega su fail-fast (nessuna perdita silenziosa).
 func DeadLetter(cause error, recs ...*message.Record) *PoisonRecords {
 	return &PoisonRecords{Records: recs, Cause: cause}
 }
@@ -96,18 +100,18 @@ func ProvideTransformer(constructor any, modes ...string) {
 	core.Provide(fx.Annotate(constructor, fx.ResultTags(`group:"`+TransformerGroup+`"`)), modes...)
 }
 
-// Register registra un tipo struct T come Handler per il consumer indicato. T deve incorporare
+// RegisterHandler registra un tipo struct T come Handler per il consumer indicato. T deve incorporare
 // core.In (per la dependency injection) e implementare Handler (via receiver a puntatore). Stesso
-// idioma di runner.Register di go-core-batch.
+// idioma di runner.Register di go-core-batch; in dualità con RegisterTransformer.
 //
-//	func init() { processor.Register[myHandler]("condizione") }
+//	func init() { processor.RegisterHandler[myHandler]("condizione") }
 //
 //	type myHandler struct {
 //	    core.In
 //	    Svc mypkg.IService
 //	}
 //	func (h *myHandler) Handle(ctx context.Context, batch []*message.Record) error { ... }
-func Register[T any, PT interface {
+func RegisterHandler[T any, PT interface {
 	*T
 	Handler
 }](consumerName string, modes ...string) {
@@ -117,7 +121,7 @@ func Register[T any, PT interface {
 	}, modes...)
 }
 
-// RegisterTransformer è l'analogo di Register per la modalità EOS: T deve implementare Transformer.
+// RegisterTransformer è l'analogo di RegisterHandler per la modalità EOS: T deve implementare Transformer.
 func RegisterTransformer[T any, PT interface {
 	*T
 	Transformer

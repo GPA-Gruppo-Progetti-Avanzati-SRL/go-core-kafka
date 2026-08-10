@@ -1,5 +1,5 @@
 // Package consumer è l'engine di go-core-kafka: per ogni ConsumerSpec attivo avvia una goroutine che
-// consuma dal client (dietro internal/driver) ed esegue il Handler (modalità sink, at-least-once) o
+// consuma dal client (dietro internal/driver) ed esegue il Handler (modalità handle, at-least-once) o
 // il Transformer (modalità transform, EOS Kafka->Kafka). Non importa mai il client concreto: usa solo
 // le interfacce driver.* ottenute dalla driver.Factory iniettata.
 package consumer
@@ -62,10 +62,10 @@ func NewConsumers(p params) (*Consumers, error) {
 		s := raw.WithDefaults()
 		r := &runner{spec: s, kafka: p.Kafka, factory: p.Factory, dlq: p.DLQ}
 		switch s.Mode {
-		case spec.ModeSink:
+		case spec.ModeHandle:
 			h, ok := handlers[s.Name]
 			if !ok {
-				return nil, fmt.Errorf("consumer %q (mode=sink): nessun Handler registrato (usare processor.Register/batchsink.Register con questo nome)", s.Name)
+				return nil, fmt.Errorf("consumer %q (mode=handle): nessun Handler registrato (usare corekafka.RegisterHandler con questo nome)", s.Name)
 			}
 			r.handler = h
 			if s.OnError == spec.OnErrorDeadletter && s.DeadletterTopic == "" {
@@ -87,7 +87,7 @@ func NewConsumers(p params) (*Consumers, error) {
 			}
 			r.transformer = t
 		default:
-			return nil, fmt.Errorf("consumer %q: mode %q non valido (sink|transform)", s.Name, s.Mode)
+			return nil, fmt.Errorf("consumer %q: mode %q non valido (handle|transform)", s.Name, s.Mode)
 		}
 
 		// Configure opzionale: passa le Properties dello spec all'handler/transformer che le vuole
@@ -142,7 +142,7 @@ func (r *runner) run(ctx context.Context) error {
 	if r.spec.Mode == spec.ModeTransform {
 		return r.runTransform(ctx)
 	}
-	return r.runSink(ctx)
+	return r.runHandle(ctx)
 }
 
 // sendDeadletter produce i record sul topic DLQ dello spec. Ritorna errore (→ fail-fast) se il DLQ
@@ -157,8 +157,8 @@ func (r *runner) sendDeadletter(ctx context.Context, recs []*message.Record, cau
 	return nil
 }
 
-// runSink: modalità at-least-once. poll -> accumula -> (cut size/tempo) -> Handle -> commit dopo il sink.
-func (r *runner) runSink(ctx context.Context) error {
+// runHandle: modalità at-least-once. poll -> accumula -> (cut size/tempo) -> Handle -> commit dopo il ritorno.
+func (r *runner) runHandle(ctx context.Context) error {
 	gc, err := r.factory.NewGroupConsumer(r.spec, r.kafka)
 	if err != nil {
 		return err
@@ -271,11 +271,43 @@ func (r *runner) runTransform(ctx context.Context) error {
 			return err
 		}
 		out, tErr := r.transformer.Transform(ctx, batch)
-		if tErr != nil {
+		resolveTopics(out, r.spec.DefaultOutputTopic)
+
+		// Stesso modello a esiti della modalità handle, ma la consegna DLQ avviene DENTRO la sessione
+		// transazionale (append agli output) così l'EOS resta intatto: output "buoni" + record DLQ +
+		// commit offset sono atomici.
+		var pr *processor.PoisonRecords
+		switch {
+		case tErr == nil:
+			// solo output
+		case errors.As(tErr, &pr):
+			// DeadLetter gestito: produce gli output E instrada i poison al DLQ, poi committa.
+			dlq, derr := r.dlqRecords(pr.Records, pr.Cause)
+			if derr != nil {
+				_ = sess.Abort(ctx)
+				return derr
+			}
+			out = append(out, dlq...)
+			deadletteredTotal.WithLabelValues(r.spec.Name).Add(float64(len(pr.Records)))
+		case errors.Is(tErr, processor.ErrFailFast):
 			_ = sess.Abort(ctx)
 			return tErr
+		default:
+			// Errore generico → policy di default dello spec.
+			if r.spec.OnError == spec.OnErrorDeadletter {
+				dlq, derr := r.dlqRecords(batch, tErr)
+				if derr != nil {
+					_ = sess.Abort(ctx)
+					return derr
+				}
+				out = append(out, dlq...)
+				deadletteredTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch)))
+			} else {
+				_ = sess.Abort(ctx) // fail-fast (default)
+				return tErr
+			}
 		}
-		resolveTopics(out, r.spec.DefaultOutputTopic)
+
 		if err := sess.Produce(ctx, out); err != nil {
 			_ = sess.Abort(ctx)
 			return err
@@ -315,6 +347,16 @@ func (r *runner) runTransform(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// dlqRecords converte i record poison in ProducerRecord verso il deadletter-topic dello spec (usati
+// dalla modalità transform per instradare a DLQ dentro la stessa transazione EOS). Ritorna errore se
+// il topic DLQ non è configurato, così una richiesta di DeadLetter senza DLQ non perde dati.
+func (r *runner) dlqRecords(recs []*message.Record, cause error) ([]*message.ProducerRecord, error) {
+	if r.spec.DeadletterTopic == "" {
+		return nil, fmt.Errorf("consumer %q: DeadLetter richiesto ma deadletter-topic assente", r.spec.Name)
+	}
+	return toDLQ(r.spec.DeadletterTopic, recs, cause), nil
 }
 
 // toDLQ costruisce i ProducerRecord per il DLQ preservando payload e origine del record poison.
