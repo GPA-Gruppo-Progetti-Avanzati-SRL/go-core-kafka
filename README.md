@@ -41,11 +41,12 @@ func init() {
 
     corekafka.Module(&cfg.Kafka,
         corekafka.WithModes("spooler"),
-        corekafka.WithSink(mongospooler.Module), // richiede una *mongo.Collection fornita dall'app
+        corekafka.WithSink(mongospooler.Module), // richiede una mongospooler.CollectionFunc dall'app
     )
-    // l'app fornisce la collection di destinazione (da go-core-mongo)
-    core.Provide(func(lks *mongolks.LinkedService) *mongo.Collection {
-        return lks.GetCollection("condizioni", "")
+    // l'app fornisce un getter LAZY della collection (risolto alla prima Flush, quando il
+    // LinkedService di go-core-mongo è connesso in OnStart):
+    core.Provide(func(lks *mongolks.LinkedService) mongospooler.CollectionFunc {
+        return func() *mongo.Collection { return lks.GetCollection("condizioni", "") }
     })
     // business logic = un Mapper record -> WriteModel + chiave di dedup
     corekafka.RegisterSink[mongo.WriteModel]("condizione", condizioneMapper)
