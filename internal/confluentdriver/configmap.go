@@ -6,17 +6,14 @@ import (
 )
 
 // consumerConfigMap traduce KafkaConfig + ConsumerSpec nella kafka.ConfigMap del consumer.
-// enable.auto.commit è sempre false: il commit degli offset è manuale (dopo il sink, o dentro la
-// transazione EOS). In modalità transform si legge in read_committed.
+// enable.auto.commit è sempre false: il commit degli offset è manuale (dopo l'handle, o dentro la
+// transazione EOS). read_committed per la modalità transform è impostato da NewTransactSession.
 func consumerConfigMap(s spec.ConsumerSpec, k spec.KafkaConfig) *kafka.ConfigMap {
 	cm := &kafka.ConfigMap{
 		"bootstrap.servers":  k.BootstrapServers,
 		"group.id":           s.GroupID,
 		"enable.auto.commit": false,
 		"auto.offset.reset":  s.AutoOffsetReset,
-	}
-	if s.Mode == spec.ModeTransform {
-		_ = cm.SetKey("isolation.level", "read_committed")
 	}
 	if s.SessionTimeoutMs > 0 {
 		_ = cm.SetKey("session.timeout.ms", s.SessionTimeoutMs)

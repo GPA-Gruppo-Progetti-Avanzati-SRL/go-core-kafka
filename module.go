@@ -57,9 +57,11 @@ func Module(cfg *Config, opts ...Option) {
 
 		needDLQ := o.producer
 		for _, s := range cfg.Consumers {
-			// Il Producer condiviso (non transazionale) serve solo al DLQ della modalità handle; il
-			// transform instrada a DLQ dentro la propria sessione EOS.
-			if s.WithDefaults().NeedsProducerDLQ() {
+			// Il Producer condiviso (non transazionale) serve al DLQ della modalità handle. A questo
+			// punto (wiring) la modalità non è ancora nota (dipende dalla registrazione fx), quindi lo
+			// abilitiamo per qualsiasi spec ATTIVO con deadletter-topic: un eventuale consumer transform
+			// lo lascerebbe inutilizzato (il transform produce il DLQ nella sua sessione EOS).
+			if !s.Disabled && s.HasDeadletter() {
 				needDLQ = true
 			}
 		}

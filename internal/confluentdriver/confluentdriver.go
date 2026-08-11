@@ -39,7 +39,10 @@ func (Factory) NewTransactSession(s spec.ConsumerSpec, k spec.KafkaConfig) (driv
 	if s.TransactionalID == "" {
 		return nil, fmt.Errorf("confluentdriver: transactional-id mancante per il consumer %q (modalità transform)", s.Name)
 	}
-	c, err := kafka.NewConsumer(consumerConfigMap(s, k))
+	// EOS: il consumer legge solo record committati.
+	cm := consumerConfigMap(s, k)
+	_ = cm.SetKey("isolation.level", "read_committed")
+	c, err := kafka.NewConsumer(cm)
 	if err != nil {
 		return nil, fmt.Errorf("confluentdriver: NewConsumer %q: %w", s.Name, err)
 	}

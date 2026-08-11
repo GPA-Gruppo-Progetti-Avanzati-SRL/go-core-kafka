@@ -60,34 +60,40 @@ func NewConsumers(p params) (*Consumers, error) {
 	runners := make([]*runner, 0, len(p.Specs))
 	for _, raw := range p.Specs {
 		s := raw.WithDefaults()
+
+		// È la lista `consumers` di config a comandare l'attivazione; disabled=true la salta.
+		if s.Disabled {
+			log.Info().Str("consumer", s.Name).Msg("corekafka: consumer disabilitato (disabled=true), non attivato")
+			continue
+		}
+
 		r := &runner{spec: s, kafka: p.Kafka, factory: p.Factory, dlq: p.DLQ}
-		switch s.Mode {
-		case spec.ModeHandle:
-			h, ok := handlers[s.Name]
-			if !ok {
-				return nil, fmt.Errorf("consumer %q (mode=handle): nessun Handler registrato (usare corekafka.RegisterHandler con questo nome)", s.Name)
-			}
+
+		// La modalità è DERIVATA dalla registrazione: nome nel gruppo kafka_handlers -> handle, in
+		// kafka_transformers -> transform. In entrambi -> ambiguo; in nessuno -> non registrato.
+		h, isHandler := handlers[s.Name]
+		t, isTransformer := transformers[s.Name]
+		switch {
+		case isHandler && isTransformer:
+			return nil, fmt.Errorf("consumer %q: registrato sia come Handler sia come Transformer (ambiguo)", s.Name)
+		case isHandler:
 			r.handler = h
 			if s.OnError == spec.OnErrorDeadletter && s.DeadletterTopic == "" {
 				return nil, fmt.Errorf("consumer %q: on-error=deadletter richiede deadletter-topic", s.Name)
 			}
-			// Il DLQ (via Producer) serve sia per la policy di default deadletter sia quando l'handler
-			// sceglie il deadletter a runtime (processor.DeadLetter): se c'è un deadletter-topic, il
-			// Producer deve essere presente.
+			// Il DLQ (via Producer condiviso) serve sia per la policy di default deadletter sia quando
+			// l'handler sceglie il deadletter a runtime (processor.DeadLetter): se c'è un
+			// deadletter-topic, il Producer deve essere presente.
 			if s.HasDeadletter() && p.DLQ == nil {
 				return nil, fmt.Errorf("consumer %q: deadletter-topic impostato richiede il Producer (usare corekafka.WithProducer)", s.Name)
 			}
-		case spec.ModeTransform:
-			t, ok := transformers[s.Name]
-			if !ok {
-				return nil, fmt.Errorf("consumer %q (mode=transform): nessun Transformer registrato (usare processor.RegisterTransformer con questo nome)", s.Name)
-			}
-			if s.TransactionalID == "" {
-				return nil, fmt.Errorf("consumer %q (mode=transform): transactional-id obbligatorio", s.Name)
-			}
+		case isTransformer:
 			r.transformer = t
+			if s.TransactionalID == "" {
+				return nil, fmt.Errorf("consumer %q (transform): transactional-id obbligatorio", s.Name)
+			}
 		default:
-			return nil, fmt.Errorf("consumer %q: mode %q non valido (handle|transform)", s.Name, s.Mode)
+			return nil, fmt.Errorf("consumer %q: nessun processor registrato (usare corekafka.RegisterHandler o RegisterTransformer con questo nome)", s.Name)
 		}
 
 		// Configure opzionale: passa le Properties dello spec all'handler/transformer che le vuole
@@ -104,6 +110,23 @@ func NewConsumers(p params) (*Consumers, error) {
 		}
 
 		runners = append(runners, r)
+	}
+
+	// La config comanda l'attivazione: i processori registrati ma non presenti (o disabilitati) nella
+	// lista `consumers` non vengono istanziati; lo segnaliamo per chiarezza operativa.
+	active := make(map[string]bool, len(runners))
+	for _, r := range runners {
+		active[r.spec.Name] = true
+	}
+	for name := range handlers {
+		if !active[name] {
+			log.Info().Str("consumer", name).Msg("corekafka: Handler registrato ma non presente/attivo in config: non attivato")
+		}
+	}
+	for name := range transformers {
+		if !active[name] {
+			log.Info().Str("consumer", name).Msg("corekafka: Transformer registrato ma non presente/attivo in config: non attivato")
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -136,10 +159,10 @@ func NewConsumers(p params) (*Consumers, error) {
 }
 
 // run arricchisce il ctx con le Properties/nome del consumer (leggibili dalla business logic) e
-// smista sulla modalità dello spec.
+// smista sulla modalità DERIVATA dal processor registrato (transformer -> transform, altrimenti handle).
 func (r *runner) run(ctx context.Context) error {
 	ctx = spec.ContextWithProperties(ctx, r.spec.Name, r.spec.Properties)
-	if r.spec.Mode == spec.ModeTransform {
+	if r.transformer != nil {
 		return r.runTransform(ctx)
 	}
 	return r.runHandle(ctx)

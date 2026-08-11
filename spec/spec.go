@@ -10,11 +10,9 @@ import (
 	"time"
 )
 
-// Modalità di elaborazione di un consumer.
-const (
-	ModeHandle    = "handle"    // at-least-once: l'Handler fa business logic libera; commit degli offset dopo Handle nil
-	ModeTransform = "transform" // EOS Kafka->Kafka: produce + commit offset nella stessa transazione
-)
+// La modalità (handle vs transform) NON è in config: è DERIVATA dalla registrazione — RegisterHandler
+// mette il processore nel gruppo kafka_handlers, RegisterTransformer in kafka_transformers. L'engine
+// deriva il tipo dal gruppo di appartenenza (unica fonte di verità, niente mismatch con la config).
 
 // Policy sull'errore business (record "poison") in modalità handle.
 const (
@@ -55,10 +53,14 @@ type SaslCfg struct {
 // ConsumerSpec è la specifica di un singolo consumer/spooler: lega un nome (a cui è associato un
 // Handler o Transformer registrato) a uno o più topic sorgente e alla policy di consegna/errore.
 type ConsumerSpec struct {
-	Name    string   `yaml:"name" mapstructure:"name" json:"name" validate:"required"`
-	Topics  []string `yaml:"topics" mapstructure:"topics" json:"topics" validate:"required,min=1"`
-	GroupID string   `yaml:"group-id" mapstructure:"group-id" json:"group-id" validate:"required"`
-	Mode    string   `yaml:"mode" mapstructure:"mode" json:"mode"` // ModeHandle (default) | ModeTransform
+	Name string `yaml:"name" mapstructure:"name" json:"name" validate:"required"`
+	// Disabled=true: il consumer NON viene attivato (utile per spegnere un consumer senza rimuoverlo
+	// dalla config). È comunque la presenza in questa lista `consumers` a comandare l'attivazione:
+	// un processore registrato ma non presente qui non viene istanziato.
+	Disabled bool     `yaml:"disabled" mapstructure:"disabled" json:"disabled"`
+	Topics   []string `yaml:"topics" mapstructure:"topics" json:"topics" validate:"required,min=1"`
+	GroupID  string   `yaml:"group-id" mapstructure:"group-id" json:"group-id" validate:"required"`
+	// NB: nessun campo "mode" — la modalità è derivata da RegisterHandler/RegisterTransformer.
 
 	// Tuning consumer (mappato su ConfigMap dal driver).
 	MaxBatchSize      int           `yaml:"max-batch-size" mapstructure:"max-batch-size" json:"max-batch-size"`
@@ -85,9 +87,6 @@ type ConsumerSpec struct {
 
 // WithDefaults ritorna una copia dello spec con i default applicati ai campi non valorizzati.
 func (s ConsumerSpec) WithDefaults() ConsumerSpec {
-	if s.Mode == "" {
-		s.Mode = ModeHandle
-	}
 	if s.MaxBatchSize <= 0 {
 		s.MaxBatchSize = DefaultMaxBatchSize
 	}
@@ -106,23 +105,10 @@ func (s ConsumerSpec) WithDefaults() ConsumerSpec {
 	return s
 }
 
-// UsesDeadletter indica se lo spec (in modalità handle) instrada i record poison a un DLQ per policy
-// di default. Il DLQ serve comunque anche quando l'handler sceglie deadletter a runtime: vedi
-// HasDeadletter.
-func (s ConsumerSpec) UsesDeadletter() bool {
-	return s.Mode != ModeTransform && s.OnError == OnErrorDeadletter
-}
-
 // HasDeadletter indica se è configurato un topic DLQ (abilita il deadletter, sia da policy di default
 // sia da scelta dell'handler/transformer a runtime).
 func (s ConsumerSpec) HasDeadletter() bool {
 	return s.DeadletterTopic != ""
-}
-
-// NeedsProducerDLQ indica se lo spec richiede il *producer.Producer condiviso (non transazionale) per
-// il DLQ. Solo la modalità handle lo usa: il transform instrada a DLQ dentro la propria sessione EOS.
-func (s ConsumerSpec) NeedsProducerDLQ() bool {
-	return s.Mode != ModeTransform && s.DeadletterTopic != ""
 }
 
 // Properties è una mappa di configurazione applicativa per-consumer, con getter tipizzati. È

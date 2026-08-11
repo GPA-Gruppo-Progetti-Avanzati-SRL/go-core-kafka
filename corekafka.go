@@ -58,10 +58,9 @@ func PropertiesFromContext(ctx context.Context) Properties { return spec.Propert
 // ConsumerNameFromContext ritorna il nome del consumer corrente.
 func ConsumerNameFromContext(ctx context.Context) string { return spec.ConsumerNameFromContext(ctx) }
 
-// Costanti di configurazione.
+// Costanti della policy on-error (la modalità handle/transform è derivata dalla registrazione, non
+// è un valore di config).
 const (
-	ModeHandle        = spec.ModeHandle
-	ModeTransform     = spec.ModeTransform
 	OnErrorDeadletter = spec.OnErrorDeadletter
 	OnErrorFailFast   = spec.OnErrorFailFast
 )

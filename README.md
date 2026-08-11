@@ -17,7 +17,16 @@ CGO_ENABLED=1 go build ./...
 CGO_ENABLED=1 go test ./...
 ```
 
-## Due seam di business logic (per-consumer, campo `mode`)
+## Due seam di business logic (la modalità è DERIVATA dalla registrazione, non da config)
+
+> Il tipo del consumer NON si dichiara in config: `RegisterHandler[T]("nome")` → modalità **handle**,
+> `RegisterTransformer[T]("nome")` → modalità **transform**. L'engine lo deriva dal gruppo fx in cui è
+> registrato il processore (nome in entrambi → errore; in nessuno → errore). Unica fonte di verità.
+>
+> **L'attivazione è comandata dalla lista `consumers` di config**: un processore registrato ma **non
+> presente** in `consumers` non viene istanziato (solo un log info). Un consumer con **`disabled: true`**
+> non viene attivato (per spegnerlo senza rimuoverlo dalla config).
+
 
 - **`handle`** (default) — *at-least-once*. poll → `Handler.Handle(batch) error` → commit degli offset
   **dopo** il ritorno nil. **Business logic LIBERA**: l'handler fa ciò che vuole (Mongo, SQL, chiamate
@@ -37,7 +46,7 @@ Il client concreto è confinato in `internal/confluentdriver`, dietro le interfa
 `internal/driver`. L'API pubblica e l'engine non importano mai confluent-kafka-go. Aggiungere un
 `internal/franzdriver` e cambiare `driversel.go` fa lo switch **senza toccare le app**.
 
-## Esempio A — handle Kafka→Mongo (mode: handle)
+## Esempio A — handle Kafka→Mongo (modalità handle, da RegisterHandler)
 
 La business logic è libera nell'handler (qui persiste via un data layer `IData`); nessun "sinker" della libreria.
 
@@ -61,7 +70,7 @@ func (h *eventoHandler) Handle(ctx context.Context, batch []*corekafka.Record) e
 }
 ```
 
-## Esempio B — consume-transform-produce EOS (mode: transform), con mix output + deadletter
+## Esempio B — consume-transform-produce EOS (modalità transform, da RegisterTransformer), con mix output + deadletter
 
 Il DLQ nel transform si fa con lo **stesso** `corekafka.DeadLetter(...)` dell'handle: si ritornano gli
 output "buoni" PIÙ un `DeadLetter` per i record poison. L'engine produce output + DLQ (sul
@@ -134,20 +143,20 @@ kafka:
   security-protocol: SASL_SSL
   sasl: { mechanisms: SCRAM-SHA-512, username: ${KAFKA_USER}, password: ${KAFKA_PASS} }
 consumers:
-  - name: condizione
+  # nessun campo "mode": la modalità è derivata da RegisterHandler/RegisterTransformer sul nome
+  - name: condizione            # RegisterHandler[...]("condizione") -> handle
+    # disabled: true            # → non attiva questo consumer (senza rimuoverlo)
     topics: [businessEvents.condizioni]
     group-id: condizioni-spooler
-    mode: handle
     max-batch-size: 500
     cut-frequency: 1s
     on-error: deadletter
     deadletter-topic: businessEvents.condizioni.DLQ
     properties:
       collection: condizioni
-  - name: router
+  - name: router                # RegisterTransformer[...]("router") -> transform (EOS)
     topics: [in.topic]
     group-id: router
-    mode: transform
     transactional-id: router-tx-1
     default-output-topic: out.topic
     deadletter-topic: routing.DLQ        # dove finiscono i record da DeadLetter (in TX EOS)
