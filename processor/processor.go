@@ -12,6 +12,7 @@ import (
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
+	"github.com/rs/zerolog/log"
 	"go.uber.org/fx"
 )
 
@@ -111,23 +112,103 @@ func ProvideTransformer(constructor any, modes ...string) {
 //	    Svc mypkg.IService
 //	}
 //	func (h *myHandler) Handle(ctx context.Context, batch []*message.Record) error { ... }
+//
+// COSTRUZIONE LAZY: la registrazione NON fornisce subito il costruttore a fx. Il costruttore (e quindi
+// l'intero sotto-grafo di dipendenze di T — es. un data layer Mongo) viene fornito SOLO se il consumer
+// è attivo nella lista `consumers` di config (vedi Configure). Un consumer disabilitato/assente non fa
+// costruire nulla: le sue dipendenze non entrano nel grafo fx e non vengono mai connesse.
 func RegisterHandler[T any, PT interface {
 	*T
 	Handler
 }](consumerName string, modes ...string) {
-	Provide(func(p T) HandlerRegistration {
-		pp := PT(&p)
-		return HandlerRegistration{Consumer: consumerName, Handler: pp}
-	}, modes...)
+	registerLazy(HandlerGroup, consumerName, func() {
+		Provide(func(p T) HandlerRegistration {
+			pp := PT(&p)
+			return HandlerRegistration{Consumer: consumerName, Handler: pp}
+		}, modes...)
+	}, modes)
 }
 
 // RegisterTransformer è l'analogo di RegisterHandler per la modalità EOS: T deve implementare Transformer.
+// Stessa costruzione lazy: il Transformer è fornito a fx solo se il consumer è attivo.
 func RegisterTransformer[T any, PT interface {
 	*T
 	Transformer
 }](consumerName string, modes ...string) {
-	ProvideTransformer(func(p T) TransformerRegistration {
-		pp := PT(&p)
-		return TransformerRegistration{Consumer: consumerName, Transformer: pp}
-	}, modes...)
+	registerLazy(TransformerGroup, consumerName, func() {
+		ProvideTransformer(func(p T) TransformerRegistration {
+			pp := PT(&p)
+			return TransformerRegistration{Consumer: consumerName, Transformer: pp}
+		}, modes...)
+	}, modes)
+}
+
+// --- Registry lazy: fornisce a fx solo i processor dei consumer ATTIVI ------------------------------
+//
+// Il problema: fx costruisce EAGERLY tutti i membri di un value group (kafka_handlers/kafka_transformers)
+// per poterlo iniettare nell'engine. Fornire direttamente ogni costruttore Handler/Transformer farebbe
+// quindi costruire l'intero sotto-grafo di dipendenze di OGNI processor registrato (anche dei consumer
+// disabilitati) — es. il LinkedService Mongo, che nel suo OnStart apre la connessione. Risultato: Mongo
+// si connette anche a consumer tutti spenti.
+//
+// La soluzione: RegisterHandler/RegisterTransformer accodano una registrazione "lazy" nel registry;
+// corekafka.Module calcola l'insieme dei consumer attivi (da config) e chiama Configure. Solo i processor
+// dei consumer attivi vengono forniti a fx (core.Provide nel value group). È order-independent: la
+// materializzazione parte da qualunque delle due — registrazione o Configure — arrivi per ultima.
+
+type lazyReg struct {
+	consumer string
+	provide  func() // fornisce a fx il costruttore annotato per il value group
+	done     bool   // già fornito o già scartato (idempotenza)
+}
+
+var (
+	handlerRegs     []*lazyReg
+	transformerRegs []*lazyReg
+	configured      bool            // Configure è già stata chiamata
+	activeConsumers map[string]bool // consumer attivi (presenti in config e non disabled)
+	subsystemModes  []string        // modes del sottosistema Kafka (WithModes)
+)
+
+func registerLazy(group, consumer string, provide func(), _ []string) {
+	r := &lazyReg{consumer: consumer, provide: provide}
+	if group == HandlerGroup {
+		handlerRegs = append(handlerRegs, r)
+	} else {
+		transformerRegs = append(transformerRegs, r)
+	}
+	if configured {
+		tryProvide(r)
+	}
+}
+
+// Configure comunica al registry quali consumer sono attivi (e i modes del sottosistema). Chiamata da
+// corekafka.Module. Fornisce a fx i processor già registrati per i consumer attivi; le registrazioni
+// che arrivano dopo si forniscono da sole in registerLazy (order-independent). Tutto in init()/main
+// single-thread, prima di core.Run: nessun problema di concorrenza.
+func Configure(active map[string]bool, modes []string) {
+	activeConsumers = active
+	subsystemModes = modes
+	configured = true
+	if !core.IsMode(modes...) {
+		return // sottosistema non attivo in questo Mode: non fornire nulla
+	}
+	for _, r := range handlerRegs {
+		tryProvide(r)
+	}
+	for _, r := range transformerRegs {
+		tryProvide(r)
+	}
+}
+
+func tryProvide(r *lazyReg) {
+	if r.done || !core.IsMode(subsystemModes...) {
+		return
+	}
+	r.done = true
+	if activeConsumers[r.consumer] {
+		r.provide()
+		return
+	}
+	log.Info().Str("consumer", r.consumer).Msg("corekafka: processor registrato ma consumer non attivo in config: costruzione saltata (dipendenze non istanziate)")
 }

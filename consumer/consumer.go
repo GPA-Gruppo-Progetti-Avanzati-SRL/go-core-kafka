@@ -112,22 +112,9 @@ func NewConsumers(p params) (*Consumers, error) {
 		runners = append(runners, r)
 	}
 
-	// La config comanda l'attivazione: i processori registrati ma non presenti (o disabilitati) nella
-	// lista `consumers` non vengono istanziati; lo segnaliamo per chiarezza operativa.
-	active := make(map[string]bool, len(runners))
-	for _, r := range runners {
-		active[r.spec.Name] = true
-	}
-	for name := range handlers {
-		if !active[name] {
-			log.Info().Str("consumer", name).Msg("corekafka: Handler registrato ma non presente/attivo in config: non attivato")
-		}
-	}
-	for name := range transformers {
-		if !active[name] {
-			log.Info().Str("consumer", name).Msg("corekafka: Transformer registrato ma non presente/attivo in config: non attivato")
-		}
-	}
+	// Nota: i processor dei consumer non attivi non arrivano nemmeno qui — la costruzione lazy
+	// (processor.Configure) fornisce a fx solo i processor dei consumer attivi, quindi i due value group
+	// contengono già solo quelli attivati. Lo skip è loggato dal registry al momento della registrazione.
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var done chan struct{}

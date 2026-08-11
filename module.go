@@ -8,6 +8,7 @@ package corekafka
 import (
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/consumer"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/processor"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/producer"
 )
 
@@ -48,6 +49,19 @@ func Module(cfg *Config, opts ...Option) {
 	for _, opt := range opts {
 		opt(&o)
 	}
+
+	// Costruzione lazy: comunica al registry dei processor quali consumer sono ATTIVI (presenti nella
+	// lista `consumers` e non disabled). Solo i processor dei consumer attivi vengono forniti a fx, così
+	// le dipendenze di un consumer spento (es. il data layer Mongo) non entrano nel grafo e non vengono
+	// mai connesse. Fatto fuori dallo scope core.Module("kafka") perché i processor sono sempre stati
+	// forniti a root e il value group aggrega comunque root + modulo (l'engine li vede lo stesso).
+	active := make(map[string]bool, len(cfg.Consumers))
+	for _, s := range cfg.Consumers {
+		if !s.Disabled {
+			active[s.Name] = true
+		}
+	}
+	processor.Configure(active, o.modes)
 
 	core.Module("kafka", func() {
 		core.Supply(cfg.Kafka, o.modes...)
