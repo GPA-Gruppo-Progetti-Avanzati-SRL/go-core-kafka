@@ -33,3 +33,44 @@ func TestErrFailFast_IsWrappable(t *testing.T) {
 		t.Fatal("ErrFailFast deve essere riconoscibile anche se wrappato")
 	}
 }
+
+// Apply deve eseguire register() fornendo (via provideIfActive) solo i consumer nell'insieme active,
+// e saltare silenziosamente gli altri (consumer disabilitato/assente in config).
+func TestApply_ProvidesOnlyActiveConsumers(t *testing.T) {
+	var provided []string
+	register := func() {
+		provideIfActive("attivo", func() { provided = append(provided, "attivo") })
+		provideIfActive("spento", func() { provided = append(provided, "spento") })
+	}
+
+	Apply(register, map[string]bool{"attivo": true}, nil)
+
+	if len(provided) != 1 || provided[0] != "attivo" {
+		t.Fatalf("atteso solo 'attivo' fornito, ottenuto %v", provided)
+	}
+}
+
+// Apply non deve chiamare register() se il sottosistema non è attivo nel Mode corrente, anche se il
+// consumer è nell'insieme active.
+func TestApply_SkipsAllWhenSubsystemModeInactive(t *testing.T) {
+	var called bool
+	register := func() { called = true }
+
+	Apply(register, map[string]bool{"attivo": true}, []string{"modo-non-attivo"})
+
+	if called {
+		t.Fatal("Apply non deve invocare register() se il sottosistema non è nel Mode corrente")
+	}
+}
+
+// provideIfActive deve panicare se chiamata fuori dalla finestra sincrona aperta da Apply (cioè fuori
+// dalla funzione di registrazione passata a Module) — RegisterHandler/RegisterTransformer si
+// appoggiano a questo stesso meccanismo.
+func TestProvideIfActive_PanicsOutsideApply(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("atteso panic se chiamata fuori dalla funzione passata ad Apply")
+		}
+	}()
+	provideIfActive("x", func() {})
+}

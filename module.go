@@ -41,27 +41,30 @@ func WithModule(m ...ModuleFunc) Option {
 	return func(o *options) { o.modules = append(o.modules, m...) }
 }
 
-// Module wira il sottosistema Kafka a partire da una singola Config. Fornisce a fx la connessione e la
-// lista consumer (core.Supply), la driver.Factory (provideDriver), l'eventuale Producer/DLQ e i
-// backend iniettati, poi registra e avvia l'engine. Il gating è per-registrazione via i modes.
-func Module(cfg *Config, opts ...Option) {
+// Module wira il sottosistema Kafka a partire da una singola Config e dalla funzione di registrazione
+// dell'app (che chiama RegisterHandler/RegisterTransformer per ogni consumer). Fornisce a fx la
+// connessione e la lista consumer (core.Supply), la driver.Factory (provideDriver), l'eventuale
+// Producer/DLQ e i backend iniettati, poi registra e avvia l'engine. Il gating è per-registrazione via
+// i modes.
+func Module(cfg *Config, register func(), opts ...Option) {
 	var o options
 	for _, opt := range opts {
 		opt(&o)
 	}
 
-	// Costruzione lazy: comunica al registry dei processor quali consumer sono ATTIVI (presenti nella
-	// lista `consumers` e non disabled). Solo i processor dei consumer attivi vengono forniti a fx, così
-	// le dipendenze di un consumer spento (es. il data layer Mongo) non entrano nel grafo e non vengono
-	// mai connesse. Fatto fuori dallo scope core.Module("kafka") perché i processor sono sempre stati
-	// forniti a root e il value group aggrega comunque root + modulo (l'engine li vede lo stesso).
+	// Solo i processor dei consumer ATTIVI (presenti nella lista `consumers` e non disabled) vengono
+	// forniti a fx, così le dipendenze di un consumer spento (es. il data layer Mongo) non entrano nel
+	// grafo e non vengono mai connesse. Fatto fuori dallo scope core.Module("kafka") perché i processor
+	// sono sempre stati forniti a root e il value group aggrega comunque root + modulo (l'engine li vede
+	// lo stesso). register() gira sincronamente qui dentro: RegisterHandler/RegisterTransformer forniscono
+	// subito a fx solo i consumer attivi, nessuna finestra temporale con l'esterno.
 	active := make(map[string]bool, len(cfg.Consumers))
 	for _, s := range cfg.Consumers {
 		if !s.Disabled {
 			active[s.Name] = true
 		}
 	}
-	processor.Configure(active, o.modes)
+	processor.Apply(register, active, o.modes)
 
 	core.Module("kafka", func() {
 		core.Supply(cfg.Kafka, o.modes...)

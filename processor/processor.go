@@ -105,7 +105,11 @@ func ProvideTransformer(constructor any, modes ...string) {
 // core.In (per la dependency injection) e implementare Handler (via receiver a puntatore). Stesso
 // idioma di runner.Register di go-core-batch; in dualità con RegisterTransformer.
 //
-//	func init() { processor.RegisterHandler[myHandler]("condizione") }
+//	func Register() {
+//	    processor.RegisterHandler[myHandler]("condizione")
+//	}
+//
+//	corekafka.Module(cfg, Register)
 //
 //	type myHandler struct {
 //	    core.In
@@ -113,37 +117,37 @@ func ProvideTransformer(constructor any, modes ...string) {
 //	}
 //	func (h *myHandler) Handle(ctx context.Context, batch []*message.Record) error { ... }
 //
-// COSTRUZIONE LAZY: la registrazione NON fornisce subito il costruttore a fx. Il costruttore (e quindi
-// l'intero sotto-grafo di dipendenze di T — es. un data layer Mongo) viene fornito SOLO se il consumer
-// è attivo nella lista `consumers` di config (vedi Configure). Un consumer disabilitato/assente non fa
-// costruire nulla: le sue dipendenze non entrano nel grafo fx e non vengono mai connesse.
+// Va chiamata SOLO dall'interno della funzione passata a Module (vedi Apply): panica altrimenti. Il
+// costruttore (e quindi l'intero sotto-grafo di dipendenze di T — es. un data layer Mongo) viene
+// fornito a fx SOLO se il consumer è attivo nella lista `consumers` di config. Un consumer
+// disabilitato/assente non fa costruire nulla: le sue dipendenze non entrano nel grafo fx e non
+// vengono mai connesse.
 func RegisterHandler[T any, PT interface {
 	*T
 	Handler
 }](consumerName string, modes ...string) {
-	registerLazy(HandlerGroup, consumerName, func() {
+	provideIfActive(consumerName, func() {
 		Provide(func(p T) HandlerRegistration {
 			pp := PT(&p)
 			return HandlerRegistration{Consumer: consumerName, Handler: pp}
 		}, modes...)
-	}, modes)
+	})
 }
 
 // RegisterTransformer è l'analogo di RegisterHandler per la modalità EOS: T deve implementare Transformer.
-// Stessa costruzione lazy: il Transformer è fornito a fx solo se il consumer è attivo.
 func RegisterTransformer[T any, PT interface {
 	*T
 	Transformer
 }](consumerName string, modes ...string) {
-	registerLazy(TransformerGroup, consumerName, func() {
+	provideIfActive(consumerName, func() {
 		ProvideTransformer(func(p T) TransformerRegistration {
 			pp := PT(&p)
 			return TransformerRegistration{Consumer: consumerName, Transformer: pp}
 		}, modes...)
-	}, modes)
+	})
 }
 
-// --- Registry lazy: fornisce a fx solo i processor dei consumer ATTIVI ------------------------------
+// --- Apply: fornisce a fx solo i processor dei consumer ATTIVI --------------------------------------
 //
 // Il problema: fx costruisce EAGERLY tutti i membri di un value group (kafka_handlers/kafka_transformers)
 // per poterlo iniettare nell'engine. Fornire direttamente ogni costruttore Handler/Transformer farebbe
@@ -151,64 +155,34 @@ func RegisterTransformer[T any, PT interface {
 // disabilitati) — es. il LinkedService Mongo, che nel suo OnStart apre la connessione. Risultato: Mongo
 // si connette anche a consumer tutti spenti.
 //
-// La soluzione: RegisterHandler/RegisterTransformer accodano una registrazione "lazy" nel registry;
-// corekafka.Module calcola l'insieme dei consumer attivi (da config) e chiama Configure. Solo i processor
-// dei consumer attivi vengono forniti a fx (core.Provide nel value group). È order-independent: la
-// materializzazione parte da qualunque delle due — registrazione o Configure — arrivi per ultima.
+// La soluzione: corekafka.Module riceve il riferimento alla funzione di registrazione dell'app (che
+// chiama RegisterHandler/RegisterTransformer) e la invoca lui stesso dentro Apply, che nel frattempo sa
+// già quali consumer sono attivi (da config). RegisterHandler/RegisterTransformer consultano
+// l'insieme attivo corrente (activeConsumers, valido SOLO durante l'esecuzione sincrona di Apply) per
+// decidere se fornire subito il costruttore a fx. Nessuna finestra temporale tra registrazione e
+// applicazione: la funzione di registrazione gira sincronamente dentro Apply, sempre nello stesso
+// punto in cui l'app chiama Module — non prima (init) né dopo (main).
+var activeConsumers map[string]bool // valido solo durante l'esecuzione sincrona di Apply; nil altrimenti
 
-type lazyReg struct {
-	consumer string
-	provide  func() // fornisce a fx il costruttore annotato per il value group
-	done     bool   // già fornito o già scartato (idempotenza)
+func provideIfActive(consumerName string, provide func()) {
+	if activeConsumers == nil {
+		panic("corekafka: RegisterHandler/RegisterTransformer chiamata fuori dalla funzione passata a Module")
+	}
+	if activeConsumers[consumerName] {
+		provide()
+		return
+	}
+	log.Info().Str("consumer", consumerName).Msg("corekafka: processor registrato ma consumer non attivo in config: costruzione saltata (dipendenze non istanziate)")
 }
 
-var (
-	handlerRegs     []*lazyReg
-	transformerRegs []*lazyReg
-	configured      bool            // Configure è già stata chiamata
-	activeConsumers map[string]bool // consumer attivi (presenti in config e non disabled)
-	subsystemModes  []string        // modes del sottosistema Kafka (WithModes)
-)
-
-func registerLazy(group, consumer string, provide func(), _ []string) {
-	r := &lazyReg{consumer: consumer, provide: provide}
-	if group == HandlerGroup {
-		handlerRegs = append(handlerRegs, r)
-	} else {
-		transformerRegs = append(transformerRegs, r)
-	}
-	if configured {
-		tryProvide(r)
-	}
-}
-
-// Configure comunica al registry quali consumer sono attivi (e i modes del sottosistema). Chiamata da
-// corekafka.Module. Fornisce a fx i processor già registrati per i consumer attivi; le registrazioni
-// che arrivano dopo si forniscono da sole in registerLazy (order-independent). Tutto in init()/main
-// single-thread, prima di core.Run: nessun problema di concorrenza.
-func Configure(active map[string]bool, modes []string) {
-	activeConsumers = active
-	subsystemModes = modes
-	configured = true
+// Apply chiama register() con l'insieme dei consumer attivi disponibile a RegisterHandler/
+// RegisterTransformer: le chiamate al loro interno forniscono a fx solo i processor attivi. Chiamata
+// una sola volta da corekafka.Module.
+func Apply(register func(), active map[string]bool, modes []string) {
 	if !core.IsMode(modes...) {
 		return // sottosistema non attivo in questo Mode: non fornire nulla
 	}
-	for _, r := range handlerRegs {
-		tryProvide(r)
-	}
-	for _, r := range transformerRegs {
-		tryProvide(r)
-	}
-}
-
-func tryProvide(r *lazyReg) {
-	if r.done || !core.IsMode(subsystemModes...) {
-		return
-	}
-	r.done = true
-	if activeConsumers[r.consumer] {
-		r.provide()
-		return
-	}
-	log.Info().Str("consumer", r.consumer).Msg("corekafka: processor registrato ma consumer non attivo in config: costruzione saltata (dipendenze non istanziate)")
+	activeConsumers = active
+	defer func() { activeConsumers = nil }()
+	register()
 }

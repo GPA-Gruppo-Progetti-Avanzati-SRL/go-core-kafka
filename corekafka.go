@@ -66,7 +66,7 @@ const (
 )
 
 // RegisterHandler registra un tipo struct T come Handler (modalità handle) per il consumer indicato.
-// In dualità con RegisterTransformer.
+// Va chiamata SOLO dall'interno della funzione passata a Module. In dualità con RegisterTransformer.
 func RegisterHandler[T any, PT interface {
 	*T
 	processor.Handler
@@ -74,7 +74,8 @@ func RegisterHandler[T any, PT interface {
 	processor.RegisterHandler[T, PT](consumerName, modes...)
 }
 
-// RegisterTransformer registra un tipo struct T come Transformer (modalità EOS) per il consumer.
+// RegisterTransformer registra un tipo struct T come Transformer (modalità EOS) per il consumer
+// indicato. Va chiamata SOLO dall'interno della funzione passata a Module.
 func RegisterTransformer[T any, PT interface {
 	*T
 	processor.Transformer
