@@ -10,6 +10,7 @@ import (
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/consumer"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/processor"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/producer"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 )
 
 // ModuleFunc è la firma comune dei Module() componibili (backend sink e componenti extra): modes-only,
@@ -58,10 +59,10 @@ func Module(cfg *Config, register func(), opts ...Option) {
 	// sono sempre stati forniti a root e il value group aggrega comunque root + modulo (l'engine li vede
 	// lo stesso). register() gira sincronamente qui dentro: RegisterHandler/RegisterTransformer forniscono
 	// subito a fx solo i consumer attivi, nessuna finestra temporale con l'esterno.
-	active := make(map[string]bool, len(cfg.Consumers))
+	active := make(map[string]spec.ConsumerSpec, len(cfg.Consumers))
 	for _, s := range cfg.Consumers {
 		if !s.Disabled {
-			active[s.Name] = true
+			active[s.Name] = s
 		}
 	}
 	processor.Apply(register, active, o.modes)

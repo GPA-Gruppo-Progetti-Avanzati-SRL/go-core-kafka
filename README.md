@@ -257,19 +257,62 @@ assente da `consumers[]` produce solo un log info ("costruzione saltata"), nessu
 
 ## Properties per-consumer + esito deciso dall'handler
 
-Ogni `ConsumerSpec` può portare una mappa `properties` (stringa→stringa) che la business logic legge a
-runtime — dal `ctx` (universale, vale sia per `Handler` sia per `Transformer`) o, per
-precompute/validazione all'avvio, implementando `corekafka.Configurable`:
+Ogni `ConsumerSpec` può portare un blocco `properties`. Il modo raccomandato per leggerle è
+**mapparle sui campi della struct dell'Handler/Transformer** con il tag `prop:`: il mapping avviene al
+wiring, quindi default e validazione sono applicati **prima dell'avvio** (config sbagliata → l'app non
+parte, nessun client Kafka aperto).
+
+```go
+type Handler struct {
+    core.In
+    Svc mypkg.IService                                                   // iniettato da fx
+
+    Collection string        `prop:"collection" optional:"true" validate:"required"`
+    BatchLimit int           `prop:"batch-limit" optional:"true" default:"100"`
+    Timeout    time.Duration `prop:"timeout" optional:"true" default:"5s"`
+    Tags       []string      `prop:"tags" optional:"true"`
+}
+
+func (h *Handler) Handle(ctx context.Context, batch []*corekafka.Record) error {
+    _ = h.Collection   // tipizzato, con default, già validato al boot
+    _ = h.BatchLimit
+}
+```
+
+```yaml
+properties:
+  collection: events
+  batch-limit: 200
+  timeout: 5s
+  tags: [a, b]        # liste e mappe annidate: i valori conservano il tipo YAML
+```
+
+Regole del mapping:
+
+| Tag | A cosa serve |
+|---|---|
+| `prop:"chiave"` | marca il campo come property e ne indica la chiave (`prop:""` = nome del campo in minuscolo). **Solo** i campi taggati vengono toccati: le dipendenze fx non sono candidate. |
+| `optional:"true"` | serve a **fx, non alla libreria**: la struct è un param object dig, quindi ogni campo esportato è una dipendenza. Senza questo tag l'avvio fallisce con `missing type: string`. |
+| `default:"..."` | valore usato quando la chiave è assente; è una stringa e passa per la stessa conversione dei valori YAML (`"100"`, `"5s"`, `"true"`, `"a,b"`). |
+| `validate:"..."` | vincolo [go-playground/validator](https://github.com/go-playground/validator) applicato al singolo campo dopo il decode. Attenzione: `required` su un `int` fallisce anche col valore `0` — di norma si abbina a un `default:`. |
+
+Un valore presente ma non convertibile (`batch-limit: "abc"`) è un **errore al boot**, non un fallback
+silenzioso al default. Una chiave non reclamata da nessun campo viene ignorata e loggata a Warn (rete di
+sicurezza sui typo). I campi property vengono azzerati prima del decode, così un valore che dovesse
+arrivare dal grafo fx non può mai spacciarsi per una property.
+
+Per le properties dinamiche/non strutturate restano i getter tipizzati, dal `ctx` (universale, vale sia
+per `Handler` sia per `Transformer`) o all'avvio implementando `corekafka.Configurable`:
 
 ```go
 // via context (dentro Handle/Transform):
 func (h *Handler) Handle(ctx context.Context, batch []*corekafka.Record) error {
     p := corekafka.PropertiesFromContext(ctx)
-    coll := p.GetString("collection", "default")   // getter tipizzati: GetString/GetInt/GetBool/GetDuration
+    coll := p.GetString("collection", "default")   // GetString/GetInt/GetBool/GetDuration
     ...
 }
 
-// oppure precompute + fail-fast all'avvio:
+// oppure precompute/validazioni incrociate all'avvio (girano dopo il mapping):
 func (h *Handler) Configure(p corekafka.Properties) error {
     if !p.Has("collection") { return fmt.Errorf("property 'collection' obbligatoria") } // → l'app non parte
     return nil
@@ -318,8 +361,9 @@ services:
       on-error: fail-fast                 # errore generico -> replay (default)
       deadletter-topic: gpa.events.DLQ    # abilita il DLQ (l'handler ci instrada i payload non validi)
       flush-timeout: 60s
-      properties:
+      properties:               # mappate sui campi `prop:` dell'handler (o lette dal ctx)
         collection: events
+        batch-limit: 200
 
     - name: transformer           # RegisterTransformer[transformer.Transformer]("transformer") -> EOS
       topics: [gpa.events.in]

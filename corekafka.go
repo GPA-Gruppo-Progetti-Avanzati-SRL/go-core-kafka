@@ -34,7 +34,8 @@ type (
 	KafkaConfig = spec.KafkaConfig
 	// ConsumerSpec è la specifica di un singolo consumer.
 	ConsumerSpec = spec.ConsumerSpec
-	// Properties sono le proprietà applicative per-consumer, lette dalla business logic.
+	// Properties sono le proprietà applicative per-consumer (valori con il tipo YAML nativo). Il modo
+	// raccomandato per leggerle è il mapping sui campi della struct del consumer via tag `prop:`.
 	Properties = spec.Properties
 	// Configurable è implementata da Handler/Transformer che vogliono le Properties all'avvio.
 	Configurable = processor.Configurable
@@ -51,6 +52,12 @@ var ErrFailFast = processor.ErrFailFast
 func DeadLetter(cause error, recs ...*Record) error {
 	return processor.DeadLetter(cause, recs...)
 }
+
+// BindProps mappa le properties di un consumer sui campi di target taggati `prop:` (con `default:` e
+// `validate:` per campo). È il meccanismo usato automaticamente da RegisterHandler/RegisterTransformer
+// sui campi dell'Handler/Transformer: serve solo per il percorso manuale (un Configure scritto a mano o
+// un costruttore passato a ProvideHandler/ProvideTransformer).
+func BindProps(target any, props Properties) error { return processor.BindProps(target, props) }
 
 // PropertiesFromContext ritorna le Properties del consumer corrente (dentro Handle/Transform/Mapper).
 func PropertiesFromContext(ctx context.Context) Properties { return spec.PropertiesFromContext(ctx) }

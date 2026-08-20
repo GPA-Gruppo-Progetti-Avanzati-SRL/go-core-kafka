@@ -8,6 +8,7 @@ package processor
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
@@ -126,10 +127,13 @@ func RegisterHandler[T any, PT interface {
 	*T
 	Handler
 }](consumerName string, modes ...string) {
-	provideIfActive(consumerName, func() {
-		Provide(func(p T) HandlerRegistration {
+	provideIfActive(consumerName, func(s spec.ConsumerSpec) {
+		Provide(func(p T) (HandlerRegistration, error) {
 			pp := PT(&p)
-			return HandlerRegistration{Consumer: consumerName, Handler: pp}
+			if err := BindProps(pp, s.Properties); err != nil {
+				return HandlerRegistration{}, fmt.Errorf("consumer %q: %w", consumerName, err)
+			}
+			return HandlerRegistration{Consumer: consumerName, Handler: pp}, nil
 		}, modes...)
 	})
 }
@@ -139,10 +143,13 @@ func RegisterTransformer[T any, PT interface {
 	*T
 	Transformer
 }](consumerName string, modes ...string) {
-	provideIfActive(consumerName, func() {
-		ProvideTransformer(func(p T) TransformerRegistration {
+	provideIfActive(consumerName, func(s spec.ConsumerSpec) {
+		ProvideTransformer(func(p T) (TransformerRegistration, error) {
 			pp := PT(&p)
-			return TransformerRegistration{Consumer: consumerName, Transformer: pp}
+			if err := BindProps(pp, s.Properties); err != nil {
+				return TransformerRegistration{}, fmt.Errorf("consumer %q: %w", consumerName, err)
+			}
+			return TransformerRegistration{Consumer: consumerName, Transformer: pp}, nil
 		}, modes...)
 	})
 }
@@ -162,14 +169,16 @@ func RegisterTransformer[T any, PT interface {
 // decidere se fornire subito il costruttore a fx. Nessuna finestra temporale tra registrazione e
 // applicazione: la funzione di registrazione gira sincronamente dentro Apply, sempre nello stesso
 // punto in cui l'app chiama Module — non prima (init) né dopo (main).
-var activeConsumers map[string]bool // valido solo durante l'esecuzione sincrona di Apply; nil altrimenti
+// activeConsumers mappa nome->spec dei consumer attivi: serve lo spec (non il solo nome) perché il
+// wrapper di registrazione mappa le sue Properties sui campi `prop:` del processor (vedi BindProps).
+var activeConsumers map[string]spec.ConsumerSpec // valido solo durante l'esecuzione sincrona di Apply; nil altrimenti
 
-func provideIfActive(consumerName string, provide func()) {
+func provideIfActive(consumerName string, provide func(spec.ConsumerSpec)) {
 	if activeConsumers == nil {
 		panic("corekafka: RegisterHandler/RegisterTransformer chiamata fuori dalla funzione passata a Module")
 	}
-	if activeConsumers[consumerName] {
-		provide()
+	if s, ok := activeConsumers[consumerName]; ok {
+		provide(s)
 		return
 	}
 	log.Info().Str("consumer", consumerName).Msg("corekafka: processor registrato ma consumer non attivo in config: costruzione saltata (dipendenze non istanziate)")
@@ -178,7 +187,7 @@ func provideIfActive(consumerName string, provide func()) {
 // Apply chiama register() con l'insieme dei consumer attivi disponibile a RegisterHandler/
 // RegisterTransformer: le chiamate al loro interno forniscono a fx solo i processor attivi. Chiamata
 // una sola volta da corekafka.Module.
-func Apply(register func(), active map[string]bool, modes []string) {
+func Apply(register func(), active map[string]spec.ConsumerSpec, modes []string) {
 	if !core.IsMode(modes...) {
 		return // sottosistema non attivo in questo Mode: non fornire nulla
 	}

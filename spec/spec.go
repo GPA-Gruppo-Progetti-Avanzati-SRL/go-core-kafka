@@ -6,8 +6,9 @@ package spec
 
 import (
 	"context"
-	"strconv"
 	"time"
+
+	"github.com/spf13/cast"
 )
 
 // La modalità (handle vs transform) NON è in config: è DERIVATA dalla registrazione — RegisterHandler
@@ -80,8 +81,10 @@ type ConsumerSpec struct {
 	TransactionalID    string `yaml:"transactional-id" mapstructure:"transactional-id" json:"transactional-id"`
 	DefaultOutputTopic string `yaml:"default-output-topic" mapstructure:"default-output-topic" json:"default-output-topic"`
 
-	// Properties applicative arbitrarie, lette dalla business logic a runtime (via context o
-	// tramite l'interfaccia Configurable). Come i Properties dei job di go-core-batch.
+	// Properties applicative del consumer. Il modo raccomandato per leggerle è il mapping sui campi
+	// della struct dell'Handler/Transformer via tag `prop:` (fatto al wiring, con default e validazione
+	// per campo: vedi processor.BindProps); restano leggibili a runtime dal context o all'avvio tramite
+	// l'interfaccia Configurable. Come i Properties dei job di go-core-batch.
 	Properties Properties `yaml:"properties" mapstructure:"properties" json:"properties"`
 }
 
@@ -111,45 +114,49 @@ func (s ConsumerSpec) HasDeadletter() bool {
 	return s.DeadletterTopic != ""
 }
 
-// Properties è una mappa di configurazione applicativa per-consumer, con getter tipizzati. È
-// deliberatamente stringa→stringa per restare neutra e YAML-friendly.
-type Properties map[string]string
+// Properties è la mappa di configurazione applicativa di un consumer (blocco `properties:` dello spec).
+// I valori conservano il tipo YAML nativo (stringa, intero, booleano, lista, mappa annidata): il modo
+// raccomandato per leggerli è il mapping sui campi della struct del consumer via tag `prop:` (vedi
+// processor.BindProps); i getter qui sotto restano per le properties dinamiche, non strutturate.
+type Properties map[string]any
 
 // Has indica se la chiave è presente.
 func (p Properties) Has(key string) bool { _, ok := p[key]; return ok }
 
-// GetString ritorna il valore o def se assente.
+// GetString ritorna il valore o def se assente/non convertibile.
 func (p Properties) GetString(key, def string) string {
 	if v, ok := p[key]; ok {
-		return v
+		if s, err := cast.ToStringE(v); err == nil {
+			return s
+		}
 	}
 	return def
 }
 
-// GetInt ritorna il valore intero o def se assente/non parsabile.
+// GetInt ritorna il valore intero o def se assente/non convertibile.
 func (p Properties) GetInt(key string, def int) int {
 	if v, ok := p[key]; ok {
-		if n, err := strconv.Atoi(v); err == nil {
+		if n, err := cast.ToIntE(v); err == nil {
 			return n
 		}
 	}
 	return def
 }
 
-// GetBool ritorna il valore booleano o def se assente/non parsabile.
+// GetBool ritorna il valore booleano o def se assente/non convertibile.
 func (p Properties) GetBool(key string, def bool) bool {
 	if v, ok := p[key]; ok {
-		if b, err := strconv.ParseBool(v); err == nil {
+		if b, err := cast.ToBoolE(v); err == nil {
 			return b
 		}
 	}
 	return def
 }
 
-// GetDuration ritorna la durata (es. "5s") o def se assente/non parsabile.
+// GetDuration ritorna la durata (es. "5s") o def se assente/non convertibile.
 func (p Properties) GetDuration(key string, def time.Duration) time.Duration {
 	if v, ok := p[key]; ok {
-		if d, err := time.ParseDuration(v); err == nil {
+		if d, err := cast.ToDurationE(v); err == nil {
 			return d
 		}
 	}

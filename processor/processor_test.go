@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 )
 
 // L'handler può ritornare DeadLetter(...) per instradare record specifici al DLQ: deve essere
@@ -39,11 +40,11 @@ func TestErrFailFast_IsWrappable(t *testing.T) {
 func TestApply_ProvidesOnlyActiveConsumers(t *testing.T) {
 	var provided []string
 	register := func() {
-		provideIfActive("attivo", func() { provided = append(provided, "attivo") })
-		provideIfActive("spento", func() { provided = append(provided, "spento") })
+		provideIfActive("attivo", func(spec.ConsumerSpec) { provided = append(provided, "attivo") })
+		provideIfActive("spento", func(spec.ConsumerSpec) { provided = append(provided, "spento") })
 	}
 
-	Apply(register, map[string]bool{"attivo": true}, nil)
+	Apply(register, map[string]spec.ConsumerSpec{"attivo": {Name: "attivo"}}, nil)
 
 	if len(provided) != 1 || provided[0] != "attivo" {
 		t.Fatalf("atteso solo 'attivo' fornito, ottenuto %v", provided)
@@ -56,7 +57,7 @@ func TestApply_SkipsAllWhenSubsystemModeInactive(t *testing.T) {
 	var called bool
 	register := func() { called = true }
 
-	Apply(register, map[string]bool{"attivo": true}, []string{"modo-non-attivo"})
+	Apply(register, map[string]spec.ConsumerSpec{"attivo": {Name: "attivo"}}, []string{"modo-non-attivo"})
 
 	if called {
 		t.Fatal("Apply non deve invocare register() se il sottosistema non è nel Mode corrente")
@@ -72,5 +73,5 @@ func TestProvideIfActive_PanicsOutsideApply(t *testing.T) {
 			t.Fatal("atteso panic se chiamata fuori dalla funzione passata ad Apply")
 		}
 	}()
-	provideIfActive("x", func() {})
+	provideIfActive("x", func(spec.ConsumerSpec) {})
 }

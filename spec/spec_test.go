@@ -43,3 +43,25 @@ func TestProperties_Context(t *testing.T) {
 		t.Fatalf("nome consumer da ctx errato: %q", got)
 	}
 }
+
+// I valori arrivano dal YAML col tipo nativo (non più solo stringhe): i getter devono convertirli.
+func TestProperties_Getters_NativeTypes(t *testing.T) {
+	p := Properties{"n": 42, "b": true, "d": 5 * time.Second, "l": []any{"a", "b"}}
+
+	if p.GetInt("n", -1) != 42 {
+		t.Fatal("GetInt su int nativo errato")
+	}
+	if p.GetString("n", "") != "42" {
+		t.Fatal("GetString su int nativo errato")
+	}
+	if !p.GetBool("b", false) {
+		t.Fatal("GetBool su bool nativo errato")
+	}
+	if p.GetDuration("d", 0) != 5*time.Second {
+		t.Fatal("GetDuration su Duration nativa errato")
+	}
+	// una lista non è convertibile a stringa: si ricade sul default, senza panic.
+	if p.GetString("l", "def") != "def" {
+		t.Fatal("un valore non convertibile deve ricadere sul default")
+	}
+}
