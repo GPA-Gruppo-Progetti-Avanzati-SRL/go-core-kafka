@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
@@ -128,13 +129,10 @@ func RegisterHandler[T any, PT interface {
 	Handler
 }](consumerName string, modes ...string) {
 	provideIfActive(consumerName, func(s spec.ConsumerSpec) {
-		Provide(func(p T) (HandlerRegistration, error) {
-			pp := PT(&p)
-			if err := BindProps(pp, s.Properties); err != nil {
-				return HandlerRegistration{}, fmt.Errorf("consumer %q: %w", consumerName, err)
-			}
-			return HandlerRegistration{Consumer: consumerName, Handler: pp}, nil
-		}, modes...)
+		provideSynth[T](consumerName, s, reflect.TypeOf(HandlerRegistration{}), HandlerGroup, modes,
+			func(ptr any) any {
+				return HandlerRegistration{Consumer: consumerName, Handler: PT(ptr.(*T))}
+			})
 	})
 }
 
@@ -144,14 +142,23 @@ func RegisterTransformer[T any, PT interface {
 	Transformer
 }](consumerName string, modes ...string) {
 	provideIfActive(consumerName, func(s spec.ConsumerSpec) {
-		ProvideTransformer(func(p T) (TransformerRegistration, error) {
-			pp := PT(&p)
-			if err := BindProps(pp, s.Properties); err != nil {
-				return TransformerRegistration{}, fmt.Errorf("consumer %q: %w", consumerName, err)
-			}
-			return TransformerRegistration{Consumer: consumerName, Transformer: pp}, nil
-		}, modes...)
+		provideSynth[T](consumerName, s, reflect.TypeOf(TransformerRegistration{}), TransformerGroup, modes,
+			func(ptr any) any {
+				return TransformerRegistration{Consumer: consumerName, Transformer: PT(ptr.(*T))}
+			})
 	})
+}
+
+// provideSynth fornisce a fx il costruttore sintetizzato per il processor T del consumer indicato
+// (vedi synthCtor): dig riceve un param object con le sole dipendenze di T, quindi i campi `prop:` non
+// vanno marcati `optional:"true"`. Una struct che non si riesce a rappresentare è un errore di
+// programmazione, non di configurazione: panic subito, al wiring.
+func provideSynth[T any](consumerName string, s spec.ConsumerSpec, regType reflect.Type, group string, modes []string, mk func(ptr any) any) {
+	ctor, err := synthCtor(reflect.TypeOf((*T)(nil)).Elem(), regType, group, s, mk)
+	if err != nil {
+		panic(fmt.Sprintf("corekafka: consumer %q: %v", consumerName, err))
+	}
+	core.Provide(ctor, modes...)
 }
 
 // --- Apply: fornisce a fx solo i processor dei consumer ATTIVI --------------------------------------

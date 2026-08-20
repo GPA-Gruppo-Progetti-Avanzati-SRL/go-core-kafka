@@ -1,15 +1,12 @@
 package processor
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
 
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
-	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
-	"go.uber.org/fx"
 )
 
 type nested struct {
@@ -178,92 +175,5 @@ func TestBindProps_NoPropFields(t *testing.T) {
 func TestBindProps_RequiresPointerToStruct(t *testing.T) {
 	if err := BindProps(props{}, nil); err == nil {
 		t.Fatal("atteso errore passando un valore non-puntatore")
-	}
-}
-
-// --- interazione con fx/dig ------------------------------------------------------------------------
-
-type fakeDep struct{}
-
-// fxHandler è la forma reale di un consumer: core.In, una dipendenza iniettata e i campi property, che
-// per dig DEVONO portare `optional:"true"` (sono campi esportati di un param object, quindi altrimenti
-// vengono cercati nel grafo).
-type fxHandler struct {
-	core.In
-	Dep        *fakeDep
-	Collection string `prop:"collection" optional:"true" validate:"required"`
-	BatchLimit int    `prop:"batch-limit" optional:"true" default:"100"`
-}
-
-func (h *fxHandler) Handle(context.Context, []*message.Record) error { return nil }
-
-// Come RegisterHandler: dig costruisce il param object, BindProps riempie i campi property.
-func provideFxHandler(s spec.ConsumerSpec) fx.Option {
-	return fx.Provide(func(p fxHandler) (HandlerRegistration, error) {
-		pp := &p
-		if err := BindProps(pp, s.Properties); err != nil {
-			return HandlerRegistration{}, err
-		}
-		return HandlerRegistration{Consumer: s.Name, Handler: pp}, nil
-	})
-}
-
-func TestBindProps_FxParamObject(t *testing.T) {
-	var got *fxHandler
-	app := fx.New(
-		fx.NopLogger,
-		fx.Supply(&fakeDep{}),
-		provideFxHandler(spec.ConsumerSpec{Name: "eventi", Properties: spec.Properties{"collection": "events"}}),
-		fx.Invoke(func(r HandlerRegistration) { got = r.Handler.(*fxHandler) }),
-	)
-	if err := app.Err(); err != nil {
-		t.Fatalf("il grafo fx deve costruirsi: %v", err)
-	}
-	if got == nil || got.Dep == nil {
-		t.Fatal("la dipendenza doveva essere iniettata da fx")
-	}
-	if got.Collection != "events" || got.BatchLimit != 100 {
-		t.Fatalf("properties non mappate: %+v", got)
-	}
-}
-
-// Una property non valida fa fallire la costruzione del grafo: l'app non parte (nessun client Kafka
-// aperto), stesso fail-fast del Configure.
-func TestBindProps_FxFailFastOnInvalidProperty(t *testing.T) {
-	app := fx.New(
-		fx.NopLogger,
-		fx.Supply(&fakeDep{}),
-		provideFxHandler(spec.ConsumerSpec{Name: "eventi"}), // manca `collection` (required)
-		fx.Invoke(func(HandlerRegistration) {}),
-	)
-	err := app.Err()
-	if err == nil {
-		t.Fatal("atteso fallimento della build del grafo fx")
-	}
-	if !strings.Contains(err.Error(), "collection") {
-		t.Fatalf("l'errore fx deve riportare la property: %v", err)
-	}
-}
-
-// Documenta la trappola: senza `optional:"true"` dig cerca un provider per il tipo del campo e fallisce
-// con "missing type". È l'errore che si ottiene scordando il tag.
-func TestBindProps_FxMissingOptionalTag(t *testing.T) {
-	type badHandler struct {
-		core.In
-		Dep        *fakeDep
-		Collection string `prop:"collection"` // manca optional:"true"
-	}
-	app := fx.New(
-		fx.NopLogger,
-		fx.Supply(&fakeDep{}),
-		fx.Provide(func(p badHandler) HandlerRegistration { return HandlerRegistration{} }),
-		fx.Invoke(func(HandlerRegistration) {}),
-	)
-	err := app.Err()
-	if err == nil {
-		t.Fatal("senza optional:\"true\" dig deve chiedere un provider per il campo")
-	}
-	if !strings.Contains(err.Error(), "missing type: string") {
-		t.Fatalf("atteso 'missing type: string', ottenuto: %v", err)
 	}
 }

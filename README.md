@@ -264,13 +264,12 @@ parte, nessun client Kafka aperto).
 
 ```go
 type Handler struct {
-    core.In
-    Svc mypkg.IService                                                   // iniettato da fx
+    Svc mypkg.IService                                       // iniettato da fx
 
-    Collection string        `prop:"collection" optional:"true" validate:"required"`
-    BatchLimit int           `prop:"batch-limit" optional:"true" default:"100"`
-    Timeout    time.Duration `prop:"timeout" optional:"true" default:"5s"`
-    Tags       []string      `prop:"tags" optional:"true"`
+    Collection string        `prop:"collection" validate:"required"`
+    BatchLimit int           `prop:"batch-limit" default:"100"`
+    Timeout    time.Duration `prop:"timeout" default:"5s"`
+    Tags       []string      `prop:"tags"`
 }
 
 func (h *Handler) Handle(ctx context.Context, batch []*corekafka.Record) error {
@@ -291,10 +290,14 @@ Regole del mapping:
 
 | Tag | A cosa serve |
 |---|---|
-| `prop:"chiave"` | marca il campo come property e ne indica la chiave (`prop:""` = nome del campo in minuscolo). **Solo** i campi taggati vengono toccati: le dipendenze fx non sono candidate. |
-| `optional:"true"` | serve a **fx, non alla libreria**: la struct è un param object dig, quindi ogni campo esportato è una dipendenza. Senza questo tag l'avvio fallisce con `missing type: string`. |
+| `prop:"chiave"` | marca il campo come property e ne indica la chiave (`prop:""` = nome del campo in minuscolo). **Solo** i campi taggati vengono toccati; gli altri campi esportati restano dipendenze iniettate da fx. |
 | `default:"..."` | valore usato quando la chiave è assente; è una stringa e passa per la stessa conversione dei valori YAML (`"100"`, `"5s"`, `"true"`, `"a,b"`). |
 | `validate:"..."` | vincolo [go-playground/validator](https://github.com/go-playground/validator) applicato al singolo campo dopo il decode. Attenzione: `required` su un `int` fallisce anche col valore `0` — di norma si abbina a un `default:`. |
+
+Nessun tag di dependency injection sui campi property: il costruttore fornito a fx è **sintetizzato**
+dalla libreria (`processor.synthCtor`) con un param object che contiene le sole dipendenze, quindi dig
+non vede mai i campi `prop:` e non prova a risolverli. Per lo stesso motivo `core.In` nella struct del
+processor è diventato facoltativo (resta innocuo se c'è).
 
 Un valore presente ma non convertibile (`batch-limit: "abc"`) è un **errore al boot**, non un fallback
 silenzioso al default. Una chiave non reclamata da nessun campo viene ignorata e loggata a Warn (rete di

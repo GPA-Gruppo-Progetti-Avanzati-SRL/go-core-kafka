@@ -30,18 +30,16 @@ const (
 // costruzione del grafo fx: l'app non parte (nessuna connessione Kafka aperta).
 //
 //	type myHandler struct {
-//	    core.In
-//	    Svc mypkg.IService                                                    // iniettato da fx
-//	    Collection string        `prop:"collection" optional:"true" validate:"required"`
-//	    BatchLimit int           `prop:"batch-limit" optional:"true" default:"100"`
-//	    Timeout    time.Duration `prop:"timeout" optional:"true" default:"5s"`
+//	    Svc mypkg.IService                                        // iniettato da fx
+//	    Collection string        `prop:"collection" validate:"required"`
+//	    BatchLimit int           `prop:"batch-limit" default:"100"`
+//	    Timeout    time.Duration `prop:"timeout" default:"5s"`
 //	}
 //
-// `optional:"true"` serve a fx, non a questa funzione: la struct è un param object dig, quindi ogni
-// campo esportato è una dipendenza da risolvere e senza quel tag fx fallisce con "missing type: string".
-// Un optional però non impedisce l'iniezione (se il grafo fornisce davvero un string, dig lo mette):
-// per questo i campi `prop:` vengono AZZERATI prima del decode — una property non può mai ricevere
-// silenziosamente un valore dal grafo fx.
+// Nessun tag DI sui campi property: dig non li vede mai, perché il costruttore fornito a fx è
+// sintetizzato da synthCtor con un param object che contiene le sole dipendenze. I campi `prop:`
+// vengono comunque AZZERATI prima del decode, così nemmeno per vie indirette una property può
+// ereditare un valore dal grafo fx.
 //
 // Le chiavi presenti nelle properties e non reclamate da nessun campo sono ignorate e loggate a Warn
 // (rete di sicurezza sui typo, senza bloccare l'avvio).
