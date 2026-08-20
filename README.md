@@ -217,7 +217,7 @@ sia `services` sia `app/api/routes` nei microservizi REST.
 // services/services.go — SOLO Config, nessun wiring
 type Config struct {
     Kafka corekafka.Config `mapstructure:",squash"`   // campi `kafka` + `consumers` sotto `services`
-    Mongo mongolks.Config  `yaml:"mongo" mapstructure:"mongo"`
+    Mongo coremongo.Config `yaml:"mongo" mapstructure:"mongo"`
 }
 ```
 
@@ -233,10 +233,7 @@ import (
 func init() {
     // ... ReadConfig ...
 
-    core.Module("mongo", func() {
-        core.Supply(&applicationConfig.ServicesConfig.Mongo)
-        core.Provide(coremongo.NewService)
-    })
+    coremongo.Module(&applicationConfig.ServicesConfig.Mongo)
 
     corekafka.Module(&applicationConfig.ServicesConfig.Kafka, consumer.Register) // NB: senza parentesi
 }
