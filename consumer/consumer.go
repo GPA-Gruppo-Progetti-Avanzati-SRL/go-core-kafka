@@ -8,6 +8,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"runtime/pprof"
 	"time"
 
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
@@ -18,6 +20,9 @@ import (
 	"github.com/rs/zerolog/log"
 	"go.uber.org/fx"
 )
+
+// LabelConsumer è l'etichetta pprof applicata alla goroutine di ogni consumer.
+const LabelConsumer = "kafka_consumer"
 
 // Consumers è il valore fx che tiene vivo l'engine (nessuna API pubblica: la sua costruzione avvia i
 // consumer via lifecycle).
@@ -123,13 +128,16 @@ func NewConsumers(p params) (*Consumers, error) {
 		OnStart: func(context.Context) error {
 			done = make(chan struct{}, len(runners))
 			for _, r := range runners {
-				go func(r *runner) {
+				// pprof.Do etichetta la goroutine col nome del consumer: da Go 1.27 la
+				// label compare anche nei traceback e rende leggibili i profili
+				// goroutine/goroutineleak di un processo con più consumer.
+				go pprof.Do(ctx, pprof.Labels(LabelConsumer, r.spec.Name), func(context.Context) {
 					defer func() { done <- struct{}{} }()
 					if err := r.run(ctx); err != nil && ctx.Err() == nil {
 						log.Error().Err(err).Str("consumer", r.spec.Name).Msg("corekafka: consumer terminato con errore, arresto dell'applicazione")
 						_ = p.Shutdowner.Shutdown()
 					}
-				}(r)
+				})
 			}
 			return nil
 		},
@@ -207,8 +215,7 @@ func (r *runner) runHandle(ctx context.Context) error {
 
 		// L'handler ha scelto il deadletter per record specifici (processor.DeadLetter): i record
 		// buoni sono già stati elaborati; instrada i poison al DLQ e committa il batch.
-		var pr *processor.PoisonRecords
-		if errors.As(hErr, &pr) {
+		if pr, ok := errors.AsType[*processor.PoisonRecords](hErr); ok {
 			if err := r.sendDeadletter(ctx, pr.Records, pr.Cause); err != nil {
 				return err // DLQ non configurato/irraggiungibile → replay
 			}
@@ -374,9 +381,7 @@ func toDLQ(topic string, recs []*message.Record, cause error) []*message.Produce
 	out := make([]*message.ProducerRecord, 0, len(recs))
 	for _, r := range recs {
 		h := make(map[string]string, len(r.Headers)+2)
-		for k, v := range r.Headers {
-			h[k] = v
-		}
+		maps.Copy(h, r.Headers)
 		h["corekafka-dlq-source-topic"] = r.Topic
 		if cause != nil {
 			h["corekafka-dlq-error"] = cause.Error()

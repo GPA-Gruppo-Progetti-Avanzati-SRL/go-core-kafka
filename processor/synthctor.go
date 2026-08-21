@@ -9,9 +9,9 @@ import (
 )
 
 var (
-	inType    = reflect.TypeOf(core.In{})
-	outType   = reflect.TypeOf(core.Out{})
-	errorType = reflect.TypeOf((*error)(nil)).Elem()
+	inType    = reflect.TypeFor[core.In]()
+	outType   = reflect.TypeFor[core.Out]()
+	errorType = reflect.TypeFor[error]()
 )
 
 // synthCtor sintetizza il costruttore fx per il tipo struct t di un Handler/Transformer:
@@ -120,7 +120,7 @@ func checkableDep(f reflect.StructField) bool {
 		return false
 	}
 	switch f.Type.Kind() {
-	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Chan, reflect.Func:
 		return true
 	default:
 		return false

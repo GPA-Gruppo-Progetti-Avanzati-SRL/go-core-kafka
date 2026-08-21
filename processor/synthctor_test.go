@@ -45,7 +45,7 @@ func handlerCtor[T any, PT interface {
 	Handler
 }](t *testing.T, s spec.ConsumerSpec) any {
 	t.Helper()
-	ctor, err := synthCtor(reflect.TypeOf((*T)(nil)).Elem(), reflect.TypeOf(HandlerRegistration{}), HandlerGroup, s,
+	ctor, err := synthCtor(reflect.TypeFor[T](), reflect.TypeFor[HandlerRegistration](), HandlerGroup, s,
 		func(ptr any) any {
 			return HandlerRegistration{Consumer: s.Name, Handler: PT(ptr.(*T))}
 		})
@@ -145,7 +145,7 @@ func TestSynthCtor_MissingDependencyInNestedParamObject(t *testing.T) {
 		Nested     depsObject
 		Collection string `prop:"collection" default:"eventi"`
 	}
-	ctor, err := synthCtor(reflect.TypeOf(onlyNested{}), reflect.TypeOf(HandlerRegistration{}), HandlerGroup,
+	ctor, err := synthCtor(reflect.TypeFor[onlyNested](), reflect.TypeFor[HandlerRegistration](), HandlerGroup,
 		spec.ConsumerSpec{Name: "eventi"}, func(ptr any) any { return HandlerRegistration{Consumer: "eventi"} })
 	if err != nil {
 		t.Fatalf("synthCtor: %v", err)
@@ -211,7 +211,7 @@ func TestSynthCtor_PreservesDigTagsOnDependencies(t *testing.T) {
 }
 
 func TestSynthCtor_RejectsNonStruct(t *testing.T) {
-	if _, err := synthCtor(reflect.TypeOf(0), reflect.TypeOf(HandlerRegistration{}), HandlerGroup, spec.ConsumerSpec{}, func(any) any { return nil }); err == nil {
+	if _, err := synthCtor(reflect.TypeFor[int](), reflect.TypeFor[HandlerRegistration](), HandlerGroup, spec.ConsumerSpec{}, func(any) any { return nil }); err == nil {
 		t.Fatal("atteso errore per un tipo non struct")
 	}
 }

@@ -3,7 +3,7 @@ package processor
 import (
 	"fmt"
 	"reflect"
-	"sort"
+	"slices"
 	"strings"
 
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
@@ -45,7 +45,7 @@ const (
 // (rete di sicurezza sui typo, senza bloccare l'avvio).
 func BindProps(target any, props spec.Properties) error {
 	rv := reflect.ValueOf(target)
-	if rv.Kind() != reflect.Ptr || rv.IsNil() || rv.Elem().Kind() != reflect.Struct {
+	if rv.Kind() != reflect.Pointer || rv.IsNil() || rv.Elem().Kind() != reflect.Struct {
 		return fmt.Errorf("corekafka: BindProps richiede un puntatore a struct, ricevuto %T", target)
 	}
 	elem := rv.Elem()
@@ -140,7 +140,7 @@ func warnUnclaimed(t reflect.Type, props spec.Properties, claimed map[string]boo
 	if len(extra) == 0 {
 		return
 	}
-	sort.Strings(extra)
+	slices.Sort(extra)
 	log.Warn().Str("type", t.Name()).Strs("keys", extra).
 		Msg("corekafka: properties non mappate su alcun campo `prop:` (typo in config?)")
 }

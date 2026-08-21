@@ -129,7 +129,7 @@ func RegisterHandler[T any, PT interface {
 	Handler
 }](consumerName string, modes ...string) {
 	provideIfActive(consumerName, func(s spec.ConsumerSpec) {
-		provideSynth[T](consumerName, s, reflect.TypeOf(HandlerRegistration{}), HandlerGroup, modes,
+		provideSynth[T](consumerName, s, reflect.TypeFor[HandlerRegistration](), HandlerGroup, modes,
 			func(ptr any) any {
 				return HandlerRegistration{Consumer: consumerName, Handler: PT(ptr.(*T))}
 			})
@@ -142,7 +142,7 @@ func RegisterTransformer[T any, PT interface {
 	Transformer
 }](consumerName string, modes ...string) {
 	provideIfActive(consumerName, func(s spec.ConsumerSpec) {
-		provideSynth[T](consumerName, s, reflect.TypeOf(TransformerRegistration{}), TransformerGroup, modes,
+		provideSynth[T](consumerName, s, reflect.TypeFor[TransformerRegistration](), TransformerGroup, modes,
 			func(ptr any) any {
 				return TransformerRegistration{Consumer: consumerName, Transformer: PT(ptr.(*T))}
 			})
@@ -154,7 +154,7 @@ func RegisterTransformer[T any, PT interface {
 // vanno marcati `optional:"true"`. Una struct che non si riesce a rappresentare è un errore di
 // programmazione, non di configurazione: panic subito, al wiring.
 func provideSynth[T any](consumerName string, s spec.ConsumerSpec, regType reflect.Type, group string, modes []string, mk func(ptr any) any) {
-	ctor, err := synthCtor(reflect.TypeOf((*T)(nil)).Elem(), regType, group, s, mk)
+	ctor, err := synthCtor(reflect.TypeFor[T](), regType, group, s, mk)
 	if err != nil {
 		panic(fmt.Sprintf("corekafka: consumer %q: %v", consumerName, err))
 	}
