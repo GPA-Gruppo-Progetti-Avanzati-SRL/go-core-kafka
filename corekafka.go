@@ -3,6 +3,7 @@ package corekafka
 import (
 	"context"
 
+	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/processor"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
@@ -36,7 +37,8 @@ type (
 	ConsumerSpec = spec.ConsumerSpec
 	// Properties sono le proprietà applicative per-consumer (valori con il tipo YAML nativo). Il modo
 	// raccomandato per leggerle è il mapping sui campi della struct del consumer via tag `prop:`.
-	Properties = spec.Properties
+	// È core.Properties: stesso tipo e stesso meccanismo dei task di go-core-batch.
+	Properties = core.Properties
 	// Configurable è implementata da Handler/Transformer che vogliono le Properties all'avvio.
 	Configurable = processor.Configurable
 )
@@ -57,7 +59,7 @@ func DeadLetter(cause error, recs ...*Record) error {
 // `validate:` per campo). È il meccanismo usato automaticamente da RegisterHandler/RegisterTransformer
 // sui campi dell'Handler/Transformer: serve solo per il percorso manuale (un Configure scritto a mano o
 // un costruttore passato a ProvideHandler/ProvideTransformer).
-func BindProps(target any, props Properties) error { return processor.BindProps(target, props) }
+func BindProps(target any, props Properties) error { return core.BindProps(target, props) }
 
 // PropertiesFromContext ritorna le Properties del consumer corrente (dentro Handle/Transform/Mapper).
 func PropertiesFromContext(ctx context.Context) Properties { return spec.PropertiesFromContext(ctx) }

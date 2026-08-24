@@ -1,8 +1,11 @@
 package processor
 
 import (
+	"context"
 	"errors"
 	"testing"
+
+	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
@@ -74,4 +77,45 @@ func TestProvideIfActive_PanicsOutsideApply(t *testing.T) {
 		}
 	}()
 	provideIfActive("x", func(spec.ConsumerSpec) {})
+}
+
+// --- integrazione col meccanismo di go-core-app -----------------------------------------------------
+
+type propsHandler struct {
+	Svc *fakeSvc `inject:""`
+
+	Collection string `prop:"collection" validate:"required"`
+	BatchLimit int    `prop:"batch-limit" default:"100"`
+
+	scratch []byte // campo di lavorazione
+}
+
+type fakeSvc struct{}
+
+func (h *propsHandler) Handle(context.Context, []*message.Record) error { return nil }
+
+// Le properties dello spec finiscono sui campi `prop:` (il mapping vive in go-core-app: qui si
+// verifica solo che il wrapper deleghi correttamente, default e validazione inclusi).
+func TestProps_BoundOnProcessorStruct(t *testing.T) {
+	var h propsHandler
+	if err := core.BindProps(&h, core.Properties{"collection": "events"}); err != nil {
+		t.Fatalf("errore inatteso: %v", err)
+	}
+	if h.Collection != "events" || h.BatchLimit != 100 {
+		t.Fatalf("properties non mappate: %+v", h)
+	}
+	if err := core.BindProps(&h, core.Properties{}); err == nil {
+		t.Fatal("atteso errore di validazione per `collection` mancante")
+	}
+}
+
+// RegisterHandler dentro Apply sintetizza il costruttore del consumer attivo: una struct non
+// rappresentabile o una combinazione di tag illegale panicherebbe qui, al wiring.
+func TestRegisterHandler_SynthesizesInsideApply(t *testing.T) {
+	Apply(func() {
+		RegisterHandler[propsHandler]("eventi")
+		RegisterHandler[propsHandler]("spento") // non attivo: non deve nemmeno sintetizzare
+	}, map[string]spec.ConsumerSpec{
+		"eventi": {Name: "eventi", Properties: core.Properties{"collection": "events"}},
+	}, nil)
 }

@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
@@ -77,7 +76,7 @@ func DeadLetter(cause error, recs ...*message.Record) *PoisonRecords {
 // Properties del proprio consumer all'avvio (per precompute/validazione). Se implementata, l'engine
 // chiama Configure dopo il binding nome→handler; un errore fa fail-fast (l'app non parte).
 type Configurable interface {
-	Configure(props spec.Properties) error
+	Configure(props core.Properties) error
 }
 
 // HandlerRegistration lega un Handler al nome del consumer (ConsumerSpec.Name).
@@ -103,9 +102,14 @@ func ProvideTransformer(constructor any, modes ...string) {
 	core.Provide(fx.Annotate(constructor, fx.ResultTags(`group:"`+TransformerGroup+`"`)), modes...)
 }
 
-// RegisterHandler registra un tipo struct T come Handler per il consumer indicato. T deve incorporare
-// core.In (per la dependency injection) e implementare Handler (via receiver a puntatore). Stesso
-// idioma di runner.Register di go-core-batch; in dualità con RegisterTransformer.
+// RegisterHandler registra un tipo struct T come Handler per il consumer indicato. T deve
+// implementare Handler (via receiver a puntatore) e dichiarare i suoi campi con i tag di go-core-app:
+//
+//	`inject:""` / `inject:"nome"` / `from:"gruppo"`  → dipendenza iniettata da fx
+//	`prop:"chiave"`                                   → property del consumer (blocco `properties:`)
+//	nessun tag                                        → campo di lavorazione, ignorato dal grafo
+//
+// Stesso idioma di runner.Register di go-core-batch; in dualità con RegisterTransformer.
 //
 //	func Register() {
 //	    processor.RegisterHandler[myHandler]("condizione")
@@ -114,8 +118,8 @@ func ProvideTransformer(constructor any, modes ...string) {
 //	corekafka.Module(cfg, Register)
 //
 //	type myHandler struct {
-//	    core.In
-//	    Svc mypkg.IService
+//	    Svc        mypkg.IService `inject:""`
+//	    Collection string         `prop:"collection" validate:"required"`
 //	}
 //	func (h *myHandler) Handle(ctx context.Context, batch []*message.Record) error { ... }
 //
@@ -129,10 +133,9 @@ func RegisterHandler[T any, PT interface {
 	Handler
 }](consumerName string, modes ...string) {
 	provideIfActive(consumerName, func(s spec.ConsumerSpec) {
-		provideSynth[T](consumerName, s, reflect.TypeFor[HandlerRegistration](), HandlerGroup, modes,
-			func(ptr any) any {
-				return HandlerRegistration{Consumer: consumerName, Handler: PT(ptr.(*T))}
-			})
+		core.ProvideStruct(func(p *T) HandlerRegistration {
+			return HandlerRegistration{Consumer: consumerName, Handler: PT(p)}
+		}, owner(consumerName), s.Properties, HandlerGroup, modes...)
 	})
 }
 
@@ -142,23 +145,16 @@ func RegisterTransformer[T any, PT interface {
 	Transformer
 }](consumerName string, modes ...string) {
 	provideIfActive(consumerName, func(s spec.ConsumerSpec) {
-		provideSynth[T](consumerName, s, reflect.TypeFor[TransformerRegistration](), TransformerGroup, modes,
-			func(ptr any) any {
-				return TransformerRegistration{Consumer: consumerName, Transformer: PT(ptr.(*T))}
-			})
+		core.ProvideStruct(func(p *T) TransformerRegistration {
+			return TransformerRegistration{Consumer: consumerName, Transformer: PT(p)}
+		}, owner(consumerName), s.Properties, TransformerGroup, modes...)
 	})
 }
 
-// provideSynth fornisce a fx il costruttore sintetizzato per il processor T del consumer indicato
-// (vedi synthCtor): dig riceve un param object con le sole dipendenze di T, quindi i campi `prop:` non
-// vanno marcati `optional:"true"`. Una struct che non si riesce a rappresentare è un errore di
-// programmazione, non di configurazione: panic subito, al wiring.
-func provideSynth[T any](consumerName string, s spec.ConsumerSpec, regType reflect.Type, group string, modes []string, mk func(ptr any) any) {
-	ctor, err := synthCtor(reflect.TypeFor[T](), regType, group, s, mk)
-	if err != nil {
-		panic(fmt.Sprintf("corekafka: consumer %q: %v", consumerName, err))
-	}
-	core.Provide(ctor, modes...)
+// owner è l'etichetta con cui core.ProvideStruct contestualizza i suoi errori (dipendenza mancante,
+// property non valida): senza, fx riporterebbe solo `reflect.makeFuncStub`.
+func owner(consumerName string) string {
+	return fmt.Sprintf("corekafka: consumer %q", consumerName)
 }
 
 // --- Apply: fornisce a fx solo i processor dei consumer ATTIVI --------------------------------------
@@ -177,7 +173,7 @@ func provideSynth[T any](consumerName string, s spec.ConsumerSpec, regType refle
 // applicazione: la funzione di registrazione gira sincronamente dentro Apply, sempre nello stesso
 // punto in cui l'app chiama Module — non prima (init) né dopo (main).
 // activeConsumers mappa nome->spec dei consumer attivi: serve lo spec (non il solo nome) perché il
-// wrapper di registrazione mappa le sue Properties sui campi `prop:` del processor (vedi BindProps).
+// wrapper di registrazione mappa le sue Properties sui campi `prop:` del processor (core.BindProps).
 var activeConsumers map[string]spec.ConsumerSpec // valido solo durante l'esecuzione sincrona di Apply; nil altrimenti
 
 func provideIfActive(consumerName string, provide func(spec.ConsumerSpec)) {

@@ -3,28 +3,9 @@ package spec
 import (
 	"context"
 	"testing"
-	"time"
+
+	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 )
-
-func TestProperties_Getters(t *testing.T) {
-	p := Properties{"s": "hello", "n": "42", "b": "true", "d": "5s"}
-
-	if !p.Has("s") || p.Has("missing") {
-		t.Fatal("Has errato")
-	}
-	if p.GetString("s", "def") != "hello" || p.GetString("missing", "def") != "def" {
-		t.Fatal("GetString errato")
-	}
-	if p.GetInt("n", -1) != 42 || p.GetInt("missing", -1) != -1 || p.GetInt("s", -1) != -1 {
-		t.Fatal("GetInt errato")
-	}
-	if p.GetBool("b", false) != true || p.GetBool("missing", true) != true {
-		t.Fatal("GetBool errato")
-	}
-	if p.GetDuration("d", 0) != 5*time.Second || p.GetDuration("missing", time.Minute) != time.Minute {
-		t.Fatal("GetDuration errato")
-	}
-}
 
 func TestProperties_Context(t *testing.T) {
 	// senza properties nel ctx: mappa vuota, nome vuoto.
@@ -35,33 +16,11 @@ func TestProperties_Context(t *testing.T) {
 		t.Fatalf("atteso nome vuoto, ottenuto %q", got)
 	}
 
-	ctx := ContextWithProperties(context.Background(), "condizione", Properties{"collection": "condizioni"})
+	ctx := ContextWithProperties(context.Background(), "condizione", core.Properties{"collection": "condizioni"})
 	if got := PropertiesFromContext(ctx).GetString("collection", ""); got != "condizioni" {
 		t.Fatalf("property da ctx errata: %q", got)
 	}
 	if got := ConsumerNameFromContext(ctx); got != "condizione" {
 		t.Fatalf("nome consumer da ctx errato: %q", got)
-	}
-}
-
-// I valori arrivano dal YAML col tipo nativo (non più solo stringhe): i getter devono convertirli.
-func TestProperties_Getters_NativeTypes(t *testing.T) {
-	p := Properties{"n": 42, "b": true, "d": 5 * time.Second, "l": []any{"a", "b"}}
-
-	if p.GetInt("n", -1) != 42 {
-		t.Fatal("GetInt su int nativo errato")
-	}
-	if p.GetString("n", "") != "42" {
-		t.Fatal("GetString su int nativo errato")
-	}
-	if !p.GetBool("b", false) {
-		t.Fatal("GetBool su bool nativo errato")
-	}
-	if p.GetDuration("d", 0) != 5*time.Second {
-		t.Fatal("GetDuration su Duration nativa errato")
-	}
-	// una lista non è convertibile a stringa: si ricade sul default, senza panic.
-	if p.GetString("l", "def") != "def" {
-		t.Fatal("un valore non convertibile deve ricadere sul default")
 	}
 }

@@ -8,7 +8,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/spf13/cast"
+	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 )
 
 // La modalità (handle vs transform) NON è in config: è DERIVATA dalla registrazione — RegisterHandler
@@ -83,9 +83,9 @@ type ConsumerSpec struct {
 
 	// Properties applicative del consumer. Il modo raccomandato per leggerle è il mapping sui campi
 	// della struct dell'Handler/Transformer via tag `prop:` (fatto al wiring, con default e validazione
-	// per campo: vedi processor.BindProps); restano leggibili a runtime dal context o all'avvio tramite
-	// l'interfaccia Configurable. Come i Properties dei job di go-core-batch.
-	Properties Properties `yaml:"properties" mapstructure:"properties" json:"properties"`
+	// per campo: vedi core.BindProps); restano leggibili a runtime dal context o all'avvio tramite
+	// l'interfaccia Configurable. È lo stesso tipo usato dai task di go-core-batch.
+	Properties core.Properties `yaml:"properties" mapstructure:"properties" json:"properties"`
 }
 
 // WithDefaults ritorna una copia dello spec con i default applicati ai campi non valorizzati.
@@ -114,55 +114,6 @@ func (s ConsumerSpec) HasDeadletter() bool {
 	return s.DeadletterTopic != ""
 }
 
-// Properties è la mappa di configurazione applicativa di un consumer (blocco `properties:` dello spec).
-// I valori conservano il tipo YAML nativo (stringa, intero, booleano, lista, mappa annidata): il modo
-// raccomandato per leggerli è il mapping sui campi della struct del consumer via tag `prop:` (vedi
-// processor.BindProps); i getter qui sotto restano per le properties dinamiche, non strutturate.
-type Properties map[string]any
-
-// Has indica se la chiave è presente.
-func (p Properties) Has(key string) bool { _, ok := p[key]; return ok }
-
-// GetString ritorna il valore o def se assente/non convertibile.
-func (p Properties) GetString(key, def string) string {
-	if v, ok := p[key]; ok {
-		if s, err := cast.ToStringE(v); err == nil {
-			return s
-		}
-	}
-	return def
-}
-
-// GetInt ritorna il valore intero o def se assente/non convertibile.
-func (p Properties) GetInt(key string, def int) int {
-	if v, ok := p[key]; ok {
-		if n, err := cast.ToIntE(v); err == nil {
-			return n
-		}
-	}
-	return def
-}
-
-// GetBool ritorna il valore booleano o def se assente/non convertibile.
-func (p Properties) GetBool(key string, def bool) bool {
-	if v, ok := p[key]; ok {
-		if b, err := cast.ToBoolE(v); err == nil {
-			return b
-		}
-	}
-	return def
-}
-
-// GetDuration ritorna la durata (es. "5s") o def se assente/non convertibile.
-func (p Properties) GetDuration(key string, def time.Duration) time.Duration {
-	if v, ok := p[key]; ok {
-		if d, err := cast.ToDurationE(v); err == nil {
-			return d
-		}
-	}
-	return def
-}
-
 type ctxKey int
 
 const (
@@ -172,18 +123,18 @@ const (
 
 // ContextWithProperties arricchisce ctx con le Properties e il nome del consumer. L'engine lo chiama
 // una volta per goroutine-consumer; la business logic (Handler/Transformer/Mapper) le legge da ctx.
-func ContextWithProperties(ctx context.Context, name string, p Properties) context.Context {
+func ContextWithProperties(ctx context.Context, name string, p core.Properties) context.Context {
 	ctx = context.WithValue(ctx, propertiesKey, p)
 	ctx = context.WithValue(ctx, consumerNameKey, name)
 	return ctx
 }
 
 // PropertiesFromContext ritorna le Properties del consumer corrente (o una mappa vuota).
-func PropertiesFromContext(ctx context.Context) Properties {
-	if p, ok := ctx.Value(propertiesKey).(Properties); ok {
+func PropertiesFromContext(ctx context.Context) core.Properties {
+	if p, ok := ctx.Value(propertiesKey).(core.Properties); ok {
 		return p
 	}
-	return Properties{}
+	return core.Properties{}
 }
 
 // ConsumerNameFromContext ritorna il nome del consumer corrente (o "").

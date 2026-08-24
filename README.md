@@ -56,10 +56,10 @@ gpa-consumer-app/
 │   ├── consumer/
 │   │   ├── register.go         # ← Register(): TUTTE le RegisterHandler/RegisterTransformer + i nomi
 │   │   ├── handler/            # ← business logic del consumer "handler" (modalità handle)
-│   │   │   ├── consumer.go     #   Handler (core.In + IData) — Handle(ctx, batch)
+│   │   │   ├── consumer.go     #   Handler (IData con `inject:""`) — Handle(ctx, batch)
 │   │   │   └── serializer.go   #   convertXxx(): Record Kafka -> model BSON (privato)
 │   │   └── transformer/        # ← business logic del consumer "transformer" (modalità transform/EOS)
-│   │       ├── routing.go      #   Transformer (core.In) — Transform(ctx, batch)
+│   │       ├── routing.go      #   Transformer — Transform(ctx, batch)
 │   │       └── serializer.go   #   transformRecord(): payload -> topic di destinazione (privato)
 │   └── data/
 │       ├── data.go             # IData + core.In Data + init() core.ProvideAs[IData]
@@ -141,8 +141,7 @@ nel business layer dei microservizi REST.
 package handler
 
 type Handler struct {
-    core.In
-    Data data.IData   // data layer dell'app (scrive su Mongo)
+    Data data.IData `inject:""`   // data layer dell'app (scrive su Mongo)
 }
 
 func (h *Handler) Handle(ctx context.Context, batch []*corekafka.Record) error {
@@ -183,7 +182,7 @@ output "buoni" PIÙ un `DeadLetter` per i record poison. L'engine produce output
 // app/consumer/transformer/routing.go
 package transformer
 
-type Transformer struct{ core.In }   // router puro Kafka→Kafka: nessun data layer
+type Transformer struct{}   // router puro Kafka→Kafka: nessun data layer né properties
 
 func (t *Transformer) Transform(ctx context.Context, batch []*corekafka.Record) ([]*corekafka.ProducerRecord, error) {
     prefix := corekafka.PropertiesFromContext(ctx).GetString("topic-prefix", "gpa.")
@@ -264,7 +263,7 @@ parte, nessun client Kafka aperto).
 
 ```go
 type Handler struct {
-    Svc mypkg.IService                                       // iniettato da fx
+    Svc mypkg.IService `inject:""`                           // iniettato da fx
 
     Collection string        `prop:"collection" validate:"required"`
     BatchLimit int           `prop:"batch-limit" default:"100"`
@@ -290,14 +289,18 @@ Regole del mapping:
 
 | Tag | A cosa serve |
 |---|---|
-| `prop:"chiave"` | marca il campo come property e ne indica la chiave (`prop:""` = nome del campo in minuscolo). **Solo** i campi taggati vengono toccati; gli altri campi esportati restano dipendenze iniettate da fx. |
+| `inject:""` / `inject:"nome"` | dipendenza iniettata da fx (il nome diventa `name:` per dig); `from:"gruppo"` per un value group, `optional:"true"` per una dipendenza facoltativa |
+| `prop:"chiave"` | marca il campo come property e ne indica la chiave (`prop:""` = nome del campo in minuscolo) |
+| *nessun tag* | campo di lavorazione: né dipendenza né property, resta al valore zero |
 | `default:"..."` | valore usato quando la chiave è assente; è una stringa e passa per la stessa conversione dei valori YAML (`"100"`, `"5s"`, `"true"`, `"a,b"`). |
 | `validate:"..."` | vincolo [go-playground/validator](https://github.com/go-playground/validator) applicato al singolo campo dopo il decode. Attenzione: `required` su un `int` fallisce anche col valore `0` — di norma si abbina a un `default:`. |
 
-Nessun tag di dependency injection sui campi property: il costruttore fornito a fx è **sintetizzato**
-dalla libreria (`processor.synthCtor`) con un param object che contiene le sole dipendenze, quindi dig
-non vede mai i campi `prop:` e non prova a risolverli. Per lo stesso motivo `core.In` nella struct del
-processor è diventato facoltativo (resta innocuo se c'è).
+Il meccanismo vive in **go-core-app** (`core.ProvideStruct` + `core.BindProps`) ed è lo stesso usato dai
+task di go-core-batch. Il costruttore fornito a fx è **sintetizzato**: dig riceve un param object con le
+sole dipendenze `inject:`/`from:`, quindi non vede mai i campi `prop:` e non prova a risolverli — e non
+serve `optional:"true"` per nasconderglieli. Per lo stesso motivo `core.In` nella struct del processor
+non serve più: se c'è, la struct torna alla semantica storica (ogni campo esportato è una dipendenza),
+con un Warn di deprecazione.
 
 Un valore presente ma non convertibile (`batch-limit: "abc"`) è un **errore al boot**, non un fallback
 silenzioso al default. Una chiave non reclamata da nessun campo viene ignorata e loggata a Warn (rete di
