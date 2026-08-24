@@ -299,8 +299,9 @@ Il meccanismo vive in **go-core-app** (`core.ProvideStruct` + `core.BindProps`) 
 task di go-core-batch. Il costruttore fornito a fx è **sintetizzato**: dig riceve un param object con le
 sole dipendenze `inject:`/`from:`, quindi non vede mai i campi `prop:` e non prova a risolverli — e non
 serve `optional:"true"` per nasconderglieli. Per lo stesso motivo `core.In` nella struct del processor
-non serve più: se c'è, la struct torna alla semantica storica (ogni campo esportato è una dipendenza),
-con un Warn di deprecazione.
+**non va usato**: è un errore al wiring, perché il marker lo porta il param object sintetico e
+accettarlo lascerebbe passare struct scritte per la vecchia semantica, con le dipendenze non taggate
+silenziosamente a nil. Resta valido nei param object dei costruttori scritti a mano.
 
 Un valore presente ma non convertibile (`batch-limit: "abc"`) è un **errore al boot**, non un fallback
 silenzioso al default. Una chiave non reclamata da nessun campo viene ignorata e loggata a Warn (rete di
