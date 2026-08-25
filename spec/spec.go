@@ -31,7 +31,7 @@ const (
 )
 
 // KafkaConfig è la connessione condivisa da tutti i consumer/producer di un processo.
-type KafkaConfig struct {
+type KafkaServer struct {
 	BootstrapServers string  `yaml:"bootstrap-servers" mapstructure:"bootstrap-servers" json:"bootstrap-servers" validate:"required"`
 	SecurityProtocol string  `yaml:"security-protocol" mapstructure:"security-protocol" json:"security-protocol"`
 	SSL              SSLCfg  `yaml:"ssl" mapstructure:"ssl" json:"ssl"`

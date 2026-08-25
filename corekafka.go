@@ -32,7 +32,7 @@ type (
 	// PoisonRecords segnala all'engine i record poison da instradare a DLQ.
 	PoisonRecords = processor.PoisonRecords
 	// KafkaConfig è la connessione Kafka condivisa.
-	KafkaConfig = spec.KafkaConfig
+	KafkaConfig = spec.KafkaServer
 	// ConsumerSpec è la specifica di un singolo consumer.
 	ConsumerSpec = spec.ConsumerSpec
 	// Properties sono le proprietà applicative per-consumer (valori con il tipo YAML nativo). Il modo

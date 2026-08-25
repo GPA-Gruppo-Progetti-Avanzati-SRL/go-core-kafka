@@ -33,7 +33,7 @@ type params struct {
 	LC           fx.Lifecycle
 	Shutdowner   fx.Shutdowner
 	Specs        []spec.ConsumerSpec
-	Kafka        spec.KafkaConfig
+	Kafka        spec.KafkaServer
 	Factory      driver.Factory
 	Handlers     []processor.HandlerRegistration     `group:"kafka_handlers"`
 	Transformers []processor.TransformerRegistration `group:"kafka_transformers"`
@@ -43,7 +43,7 @@ type params struct {
 // runner incapsula uno spec e il suo processor; apre il proprio client all'avvio.
 type runner struct {
 	spec        spec.ConsumerSpec
-	kafka       spec.KafkaConfig
+	kafka       spec.KafkaServer
 	factory     driver.Factory
 	handler     processor.Handler
 	transformer processor.Transformer

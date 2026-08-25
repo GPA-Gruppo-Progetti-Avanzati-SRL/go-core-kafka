@@ -47,7 +47,7 @@ type Producer interface {
 // Factory è l'unico punto legato all'implementazione del client. La Factory attiva è scelta a
 // compile-time nel package root (driversel.go).
 type Factory interface {
-	NewGroupConsumer(s spec.ConsumerSpec, k spec.KafkaConfig) (GroupConsumer, error)
-	NewTransactSession(s spec.ConsumerSpec, k spec.KafkaConfig) (TransactSession, error)
-	NewProducer(k spec.KafkaConfig) (Producer, error)
+	NewGroupConsumer(s spec.ConsumerSpec, k spec.KafkaServer) (GroupConsumer, error)
+	NewTransactSession(s spec.ConsumerSpec, k spec.KafkaServer) (TransactSession, error)
+	NewProducer(k spec.KafkaServer) (Producer, error)
 }

@@ -27,7 +27,7 @@ func (p *Producer) Produce(ctx context.Context, recs []*message.ProducerRecord) 
 }
 
 // NewProducer costruisce il Producer dalla Factory iniettata e registra la chiusura nel lifecycle fx.
-func NewProducer(lc fx.Lifecycle, f driver.Factory, k spec.KafkaConfig) (*Producer, error) {
+func NewProducer(lc fx.Lifecycle, f driver.Factory, k spec.KafkaServer) (*Producer, error) {
 	d, err := f.NewProducer(k)
 	if err != nil {
 		return nil, err

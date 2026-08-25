@@ -21,7 +21,7 @@ type Factory struct{}
 func New() driver.Factory { return Factory{} }
 
 // NewGroupConsumer crea un consumer di consumer-group per la modalità handle (at-least-once).
-func (Factory) NewGroupConsumer(s spec.ConsumerSpec, k spec.KafkaConfig) (driver.GroupConsumer, error) {
+func (Factory) NewGroupConsumer(s spec.ConsumerSpec, k spec.KafkaServer) (driver.GroupConsumer, error) {
 	cm := consumerConfigMap(s, k)
 	c, err := kafka.NewConsumer(cm)
 	if err != nil {
@@ -35,7 +35,7 @@ func (Factory) NewGroupConsumer(s spec.ConsumerSpec, k spec.KafkaConfig) (driver
 }
 
 // NewTransactSession crea la sessione EOS Kafka->Kafka (consumer + producer transazionale).
-func (Factory) NewTransactSession(s spec.ConsumerSpec, k spec.KafkaConfig) (driver.TransactSession, error) {
+func (Factory) NewTransactSession(s spec.ConsumerSpec, k spec.KafkaServer) (driver.TransactSession, error) {
 	if s.TransactionalID == "" {
 		return nil, fmt.Errorf("confluentdriver: transactional-id mancante per il consumer %q (modalità transform)", s.Name)
 	}
@@ -59,7 +59,7 @@ func (Factory) NewTransactSession(s spec.ConsumerSpec, k spec.KafkaConfig) (driv
 }
 
 // NewProducer crea un producer non transazionale (DLQ / servizio pubblico).
-func (Factory) NewProducer(k spec.KafkaConfig) (driver.Producer, error) {
+func (Factory) NewProducer(k spec.KafkaServer) (driver.Producer, error) {
 	p, err := kafka.NewProducer(producerConfigMap("", k))
 	if err != nil {
 		return nil, fmt.Errorf("confluentdriver: NewProducer: %w", err)

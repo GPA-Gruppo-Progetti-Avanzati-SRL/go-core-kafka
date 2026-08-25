@@ -8,7 +8,7 @@ import (
 // consumerConfigMap traduce KafkaConfig + ConsumerSpec nella kafka.ConfigMap del consumer.
 // enable.auto.commit è sempre false: il commit degli offset è manuale (dopo l'handle, o dentro la
 // transazione EOS). read_committed per la modalità transform è impostato da NewTransactSession.
-func consumerConfigMap(s spec.ConsumerSpec, k spec.KafkaConfig) *kafka.ConfigMap {
+func consumerConfigMap(s spec.ConsumerSpec, k spec.KafkaServer) *kafka.ConfigMap {
 	cm := &kafka.ConfigMap{
 		"bootstrap.servers":  k.BootstrapServers,
 		"group.id":           s.GroupID,
@@ -33,7 +33,7 @@ func consumerConfigMap(s spec.ConsumerSpec, k spec.KafkaConfig) *kafka.ConfigMap
 
 // producerConfigMap traduce KafkaConfig nella kafka.ConfigMap del producer. Il producer è sempre
 // idempotente; se transactionalID != "" diventa transazionale (EOS).
-func producerConfigMap(transactionalID string, k spec.KafkaConfig) *kafka.ConfigMap {
+func producerConfigMap(transactionalID string, k spec.KafkaServer) *kafka.ConfigMap {
 	cm := &kafka.ConfigMap{
 		"bootstrap.servers":  k.BootstrapServers,
 		"enable.idempotence": true,
@@ -46,7 +46,7 @@ func producerConfigMap(transactionalID string, k spec.KafkaConfig) *kafka.Config
 }
 
 // applySecurity mappa security-protocol / SASL / TLS sulle chiavi dotted di librdkafka.
-func applySecurity(cm *kafka.ConfigMap, k spec.KafkaConfig) {
+func applySecurity(cm *kafka.ConfigMap, k spec.KafkaServer) {
 	if k.SecurityProtocol != "" {
 		_ = cm.SetKey("security.protocol", k.SecurityProtocol)
 	}
