@@ -8,8 +8,9 @@ import (
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 )
 
-func boolPtr(b bool) *bool { return &b }
-func intPtr(i int) *int    { return &i }
+func boolPtr(b bool) *bool    { return &b }
+func intPtr(i int) *int       { return &i }
+func strPtr(s string) *string { return &s }
 
 // validSpec è uno ProcessorSpec che supera la validazione: i test dei singoli campi partono da qui e
 // ne guastano uno solo, così un fallimento identifica il campo e non l'insieme.
@@ -60,7 +61,7 @@ func TestResolve_Precedenza(t *testing.T) {
 			MaxBatchSize:     100,
 			AutoOffsetReset:  "latest",
 			OnError:          OnErrorDeadletter,
-			DeadletterTopic:  "comune.DLQ",
+			DeadletterTopic:  strPtr("comune.DLQ"),
 		},
 		Producer: ProducerTuning{Acks: "all", CompressionType: "snappy"},
 		Restart:  RestartSpec{MaxAttempts: 5, MaxBackoff: time.Minute},
@@ -89,8 +90,8 @@ func TestResolve_Precedenza(t *testing.T) {
 	if got.Consumer.AutoOffsetReset != "latest" || got.Consumer.OnError != OnErrorDeadletter {
 		t.Errorf("policy non ereditate dal globale: %+v", got.Consumer)
 	}
-	if got.Consumer.DeadletterTopic != "comune.DLQ" {
-		t.Errorf("deadletter-topic = %q: il DLQ è ereditabile", got.Consumer.DeadletterTopic)
+	if got.Consumer.Deadletter() != "comune.DLQ" {
+		t.Errorf("deadletter-topic = %q: il DLQ è ereditabile", got.Consumer.Deadletter())
 	}
 	if got.Producer.CompressionType != "snappy" {
 		t.Errorf("producer.compression-type = %q, atteso snappy dal globale", got.Producer.CompressionType)
@@ -184,6 +185,36 @@ func TestResolve_ProducerPuntatoriDisattivabili(t *testing.T) {
 	}
 }
 
+// Il DLQ è un *string proprio per questo: un processor deve poter dire "io non ne ho" quando il
+// globale ne dichiara uno, e con una stringa semplice "" sarebbe indistinguibile da "eredita".
+func TestResolve_DeadletterDisattivabileDalProcessor(t *testing.T) {
+	server := KafkaServer{Consumer: ConsumerTuning{DeadletterTopic: strPtr("comune.DLQ")}}
+
+	tests := []struct {
+		name string
+		on   *string
+		want string
+	}{
+		{"assente: eredita il globale", nil, "comune.DLQ"},
+		{"stringa vuota: nessun DLQ per questo processor", strPtr(""), ""},
+		{"valorizzato: override", strPtr("suo.DLQ"), "suo.DLQ"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := validSpec()
+			s.Consumer.DeadletterTopic = tc.on
+
+			got := s.Resolve(server)
+			if got.Consumer.Deadletter() != tc.want {
+				t.Errorf("Deadletter() = %q, atteso %q", got.Consumer.Deadletter(), tc.want)
+			}
+			if got.HasDeadletter() != (tc.want != "") {
+				t.Errorf("HasDeadletter() = %v con topic %q", got.HasDeadletter(), tc.want)
+			}
+		})
+	}
+}
+
 func TestRestartSpec_FlagAssenti(t *testing.T) {
 	var r RestartSpec
 	if r.IsDisabled() {
@@ -273,44 +304,6 @@ func TestProducerTuning_IsZero(t *testing.T) {
 	if (ProducerTuning{KafkaProperties: map[string]string{"a": "b"}}).IsZero() {
 		t.Error("un blocco con kafka-properties non è zero")
 	}
-}
-
-// --- chiavi piatte della forma storica -----------------------------------------------------------
-
-// Le chiavi di tuning scritte piatte sul processor non vengono ignorate ma segnalate: una config che
-// credeva di avere `deadletter-topic` e non ce l'ha più manderebbe altrove i record poison senza che
-// nessuno se ne accorga.
-func TestLegacyKeys(t *testing.T) {
-	if got := validSpec().LegacyKeys(); len(got) != 0 {
-		t.Errorf("uno spec nella forma corrente non deve avere chiavi legacy: %v", got)
-	}
-
-	s := validSpec()
-	s.legacyFlatTuning = legacyFlatTuning{
-		MaxBatchSizeLegacy:    500,
-		OnErrorLegacy:         "deadletter",
-		DeadletterTopicLegacy: "x.DLQ",
-		FlushTimeoutLegacy:    time.Minute,
-	}
-	got := s.LegacyKeys()
-	if len(got) != 4 {
-		t.Fatalf("chiavi legacy rilevate = %d, attese 4: %v", len(got), got)
-	}
-	// Il messaggio deve dire DOVE spostarle: senza, chi legge l'errore non sa cosa fare.
-	for _, g := range got {
-		if !contains(g, "→") {
-			t.Errorf("il messaggio %q non indica la nuova collocazione", g)
-		}
-	}
-}
-
-func contains(s, sub string) bool {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
 
 // --- validazione --------------------------------------------------------------------------------

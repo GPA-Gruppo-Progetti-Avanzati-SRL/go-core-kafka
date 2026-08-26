@@ -1,7 +1,7 @@
 // Package processor definisce i due seam di business logic di go-core-kafka — Handler (modalità handle)
 // e Transformer (modalità EOS Kafka->Kafka) — e l'infrastruttura di registrazione via fx value group,
 // modellata su go-core-batch (scheduler/registry.go, distributedjob/runner/runner.go). L'engine
-// costruisce le mappe consumerName->Handler/Transformer consumando i due gruppi, quindi l'ordine di
+// costruisce le mappe nomeProcessor->Handler/Transformer consumando i due gruppi, quindi l'ordine di
 // registrazione è indifferente.
 package processor
 
@@ -25,7 +25,7 @@ const (
 
 // Handler è il contratto della modalità handle (at-least-once). Riceve un batch di record già pollati;
 // NON committa gli offset (lo fa l'engine dopo il ritorno). Ritorno nil -> l'engine committa; errore
-// -> l'engine applica la policy on-error del consumer (deadletter | fail-fast).
+// -> l'engine applica la policy `consumer.on-error` del processor (deadletter | fail-fast).
 type Handler interface {
 	Handle(ctx context.Context, batch []*message.Record) error
 }
@@ -73,19 +73,19 @@ func DeadLetter(cause error, recs ...*message.Record) *PoisonRecords {
 }
 
 // Configurable è implementata opzionalmente da un Handler/Transformer che vuole ricevere le
-// Properties del proprio consumer all'avvio (per precompute/validazione). Se implementata, l'engine
+// Properties del proprio processor all'avvio (per precompute/validazione). Se implementata, l'engine
 // chiama Configure dopo il binding nome→handler; un errore fa fail-fast (l'app non parte).
 type Configurable interface {
 	Configure(props core.Properties) error
 }
 
-// HandlerRegistration lega un Handler al nome del consumer (ConsumerSpec.Name).
+// HandlerRegistration lega un Handler al nome del processor (ProcessorSpec.Name).
 type HandlerRegistration struct {
 	Consumer string
 	Handler  Handler
 }
 
-// TransformerRegistration lega un Transformer al nome del consumer (ConsumerSpec.Name).
+// TransformerRegistration lega un Transformer al nome del processor (ProcessorSpec.Name).
 type TransformerRegistration struct {
 	Consumer    string
 	Transformer Transformer
@@ -102,11 +102,11 @@ func ProvideTransformer(constructor any, modes ...string) {
 	core.Provide(fx.Annotate(constructor, fx.ResultTags(`group:"`+TransformerGroup+`"`)), modes...)
 }
 
-// RegisterHandler registra un tipo struct T come Handler per il consumer indicato. T deve
+// RegisterHandler registra un tipo struct T come Handler per il processor indicato. T deve
 // implementare Handler (via receiver a puntatore) e dichiarare i suoi campi con i tag di go-core-app:
 //
 //	`inject:""` / `inject:"nome"` / `from:"gruppo"`  → dipendenza iniettata da fx
-//	`prop:"chiave"`                                   → property del consumer (blocco `properties:`)
+//	`prop:"chiave"`                                   → property del processor (blocco `properties:`)
 //	nessun tag                                        → campo di lavorazione, ignorato dal grafo
 //
 // Stesso idioma di runner.Register di go-core-batch; in dualità con RegisterTransformer.
@@ -125,7 +125,7 @@ func ProvideTransformer(constructor any, modes ...string) {
 //
 // Va chiamata SOLO dall'interno della funzione passata a Module (vedi Apply): panica altrimenti. Il
 // costruttore (e quindi l'intero sotto-grafo di dipendenze di T — es. un data layer Mongo) viene
-// fornito a fx SOLO se il consumer è attivo nella lista `consumers` di config. Un consumer
+// fornito a fx SOLO se il processor è attivo nella lista `processors` di config. Un processor
 // disabilitato/assente non fa costruire nulla: le sue dipendenze non entrano nel grafo fx e non
 // vengono mai connesse.
 func RegisterHandler[T any, PT interface {
@@ -154,25 +154,25 @@ func RegisterTransformer[T any, PT interface {
 // owner è l'etichetta con cui core.ProvideStruct contestualizza i suoi errori (dipendenza mancante,
 // property non valida): senza, fx riporterebbe solo `reflect.makeFuncStub`.
 func owner(consumerName string) string {
-	return fmt.Sprintf("corekafka: consumer %q", consumerName)
+	return fmt.Sprintf("corekafka: processor %q", consumerName)
 }
 
-// --- Apply: fornisce a fx solo i processor dei consumer ATTIVI --------------------------------------
+// --- Apply: fornisce a fx solo i processor ATTIVI ---------------------------------------------------
 //
 // Il problema: fx costruisce EAGERLY tutti i membri di un value group (kafka_handlers/kafka_transformers)
 // per poterlo iniettare nell'engine. Fornire direttamente ogni costruttore Handler/Transformer farebbe
-// quindi costruire l'intero sotto-grafo di dipendenze di OGNI processor registrato (anche dei consumer
+// quindi costruire l'intero sotto-grafo di dipendenze di OGNI processor registrato (anche di quelli
 // disabilitati) — es. il LinkedService Mongo, che nel suo OnStart apre la connessione. Risultato: Mongo
-// si connette anche a consumer tutti spenti.
+// si connette anche con tutti i processor spenti.
 //
 // La soluzione: corekafka.Module riceve il riferimento alla funzione di registrazione dell'app (che
 // chiama RegisterHandler/RegisterTransformer) e la invoca lui stesso dentro Apply, che nel frattempo sa
-// già quali consumer sono attivi (da config). RegisterHandler/RegisterTransformer consultano
+// già quali processor sono attivi (da config). RegisterHandler/RegisterTransformer consultano
 // l'insieme attivo corrente (activeConsumers, valido SOLO durante l'esecuzione sincrona di Apply) per
 // decidere se fornire subito il costruttore a fx. Nessuna finestra temporale tra registrazione e
 // applicazione: la funzione di registrazione gira sincronamente dentro Apply, sempre nello stesso
 // punto in cui l'app chiama Module — non prima (init) né dopo (main).
-// activeConsumers mappa nome->spec dei consumer attivi: serve lo spec (non il solo nome) perché il
+// activeConsumers mappa nome->spec dei processor attivi: serve lo spec (non il solo nome) perché il
 // wrapper di registrazione mappa le sue Properties sui campi `prop:` del processor (core.BindProps).
 var activeConsumers map[string]spec.ProcessorSpec // valido solo durante l'esecuzione sincrona di Apply; nil altrimenti
 
@@ -187,7 +187,7 @@ func provideIfActive(consumerName string, provide func(spec.ProcessorSpec)) {
 	log.Info().Str("consumer", consumerName).Msg("corekafka: processor registrato ma consumer non attivo in config: costruzione saltata (dipendenze non istanziate)")
 }
 
-// Apply chiama register() con l'insieme dei consumer attivi disponibile a RegisterHandler/
+// Apply chiama register() con l'insieme dei processor attivi disponibile a RegisterHandler/
 // RegisterTransformer: le chiamate al loro interno forniscono a fx solo i processor attivi. Chiamata
 // una sola volta da corekafka.Module.
 func Apply(register func(), active map[string]spec.ProcessorSpec, modes []string) {

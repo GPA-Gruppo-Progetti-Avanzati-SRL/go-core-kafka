@@ -406,7 +406,7 @@ func TestToDLQ_HeaderDiOrigine(t *testing.T) {
 		Timestamp: ts,
 	}
 	s := testSpec()
-	s.Consumer.DeadletterTopic = "eventi.DLQ"
+	s.Consumer.DeadletterTopic = ptr("eventi.DLQ")
 	r := &runner{spec: s}
 
 	out := r.toDLQ([]*message.Record{src}, errors.New("boom"))
@@ -450,7 +450,7 @@ func TestToDLQ_IncrementaITentativi(t *testing.T) {
 	// Un record ripescato dal DLQ e reimmesso porta il contatore: senza incremento, chi riprocessa
 	// non ha modo di fermarsi.
 	s := testSpec()
-	s.Consumer.DeadletterTopic = "dlq"
+	s.Consumer.DeadletterTopic = ptr("dlq")
 	r := &runner{spec: s}
 
 	src := &message.Record{Topic: "t", Headers: map[string]string{HeaderDeliveryAttempts: "2"}}
@@ -467,7 +467,7 @@ func TestToDLQ_IncrementaITentativi(t *testing.T) {
 
 func TestToDLQ_SenzaCausa(t *testing.T) {
 	s := testSpec()
-	s.Consumer.DeadletterTopic = "dlq"
+	s.Consumer.DeadletterTopic = ptr("dlq")
 	r := &runner{spec: s}
 	if _, present := r.toDLQ([]*message.Record{{Topic: "t"}}, nil)[0].Headers[HeaderDLQError]; present {
 		t.Error("header di errore presente senza causa")

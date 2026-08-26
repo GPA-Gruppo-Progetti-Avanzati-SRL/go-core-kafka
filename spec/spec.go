@@ -145,8 +145,14 @@ type ConsumerTuning struct {
 	// --- policy sull'esito di un batch ---
 	OnError string `yaml:"on-error" mapstructure:"on-error" json:"on-error" validate:"omitempty,oneof=deadletter fail-fast"`
 	// DeadletterTopic è ereditabile: più processor che condividono lo stesso DLQ sono la norma, e i
-	// record ci arrivano comunque etichettati con il processor di origine (header corekafka-dlq-processor).
-	DeadletterTopic string `yaml:"deadletter-topic" mapstructure:"deadletter-topic" json:"deadletter-topic"`
+	// record ci arrivano comunque etichettati con il processor di origine (header
+	// corekafka-dlq-processor).
+	//
+	// È un puntatore per poter essere DISATTIVATO da un processor quando il globale lo valorizza:
+	// `deadletter-topic: ""` significa "nessun DLQ per questo processor" (i record poison forzano il
+	// fail-fast), che con una stringa semplice sarebbe indistinguibile da "eredita". Usare Deadletter()
+	// per leggerlo.
+	DeadletterTopic *string `yaml:"deadletter-topic" mapstructure:"deadletter-topic" json:"deadletter-topic"`
 
 	// KafkaProperties: escape hatch del consumer (vedi KafkaServer.KafkaProperties). Le mappe di
 	// `server.consumer` e del processor si FONDONO chiave per chiave, con il processor a vincere sui
@@ -201,11 +207,19 @@ func (t ConsumerTuning) inherit(g ConsumerTuning) ConsumerTuning {
 	if t.OnError == "" {
 		t.OnError = g.OnError
 	}
-	if t.DeadletterTopic == "" {
+	if t.DeadletterTopic == nil {
 		t.DeadletterTopic = g.DeadletterTopic
 	}
 	t.KafkaProperties = mergeProps(g.KafkaProperties, t.KafkaProperties)
 	return t
+}
+
+// Deadletter ritorna il topic DLQ effettivo: "" se non configurato o disattivato esplicitamente.
+func (t ConsumerTuning) Deadletter() string {
+	if t.DeadletterTopic == nil {
+		return ""
+	}
+	return *t.DeadletterTopic
 }
 
 // WithDefaults applica i default della libreria ai campi rimasti non valorizzati.
@@ -480,54 +494,6 @@ type ProcessorSpec struct {
 	// NB: sono le properties del BUSINESS, non del client Kafka — quelle sono `kafka-properties`
 	// dentro i blocchi `consumer`/`producer`.
 	Properties core.Properties `yaml:"properties" mapstructure:"properties" json:"properties"`
-
-	// legacyFlatTuning cattura le chiavi di tuning scritte PIATTE sul processor, che è la forma
-	// storica: oggi vanno nei blocchi `consumer`/`producer`. Sono lette solo per poterle segnalare —
-	// vedi LegacyKeys — perché ignorarle in silenzio cambierebbe il comportamento di un'app senza
-	// che nessuno se ne accorga (un `deadletter-topic` perso vuol dire record che finiscono altrove).
-	legacyFlatTuning `yaml:",inline" mapstructure:",squash"`
-}
-
-// legacyFlatTuning sono le chiavi di tuning che nelle versioni precedenti si scrivevano direttamente
-// sulla voce del consumer. I nomi dei campi Go portano il suffisso Legacy per non essere confusi, per
-// promozione, con quelli veri dentro Consumer/Producer.
-type legacyFlatTuning struct {
-	MaxBatchSizeLegacy      int           `yaml:"max-batch-size" mapstructure:"max-batch-size" json:"-"`
-	CutFrequencyLegacy      time.Duration `yaml:"cut-frequency" mapstructure:"cut-frequency" json:"-"`
-	AutoOffsetResetLegacy   string        `yaml:"auto-offset-reset" mapstructure:"auto-offset-reset" json:"-"`
-	SessionTimeoutMsLegacy  int           `yaml:"session-timeout-ms" mapstructure:"session-timeout-ms" json:"-"`
-	FetchMinBytesLegacy     int           `yaml:"fetch-min-bytes" mapstructure:"fetch-min-bytes" json:"-"`
-	FetchMaxBytesLegacy     int           `yaml:"fetch-max-bytes" mapstructure:"fetch-max-bytes" json:"-"`
-	MaxPollIntervalMsLegacy int           `yaml:"max-poll-interval-ms" mapstructure:"max-poll-interval-ms" json:"-"`
-	OnErrorLegacy           string        `yaml:"on-error" mapstructure:"on-error" json:"-"`
-	DeadletterTopicLegacy   string        `yaml:"deadletter-topic" mapstructure:"deadletter-topic" json:"-"`
-	FlushTimeoutLegacy      time.Duration `yaml:"flush-timeout" mapstructure:"flush-timeout" json:"-"`
-}
-
-// LegacyKeys ritorna le chiavi di tuning scritte nella forma piatta storica, con la loro nuova
-// collocazione. Vuoto se non ce ne sono.
-//
-// L'engine le trasforma in un errore di avvio invece di ignorarle: una config che credeva di avere
-// `deadletter-topic` e non ce l'ha più è peggio di un'app che non parte.
-func (s ProcessorSpec) LegacyKeys() []string {
-	var out []string
-	add := func(cond bool, msg string) {
-		if cond {
-			out = append(out, msg)
-		}
-	}
-	l := s.legacyFlatTuning
-	add(l.MaxBatchSizeLegacy != 0, "`max-batch-size` → `consumer.max-batch-size`")
-	add(l.CutFrequencyLegacy != 0, "`cut-frequency` → `consumer.cut-frequency`")
-	add(l.AutoOffsetResetLegacy != "", "`auto-offset-reset` → `consumer.auto-offset-reset`")
-	add(l.SessionTimeoutMsLegacy != 0, "`session-timeout-ms` → `consumer.session-timeout-ms`")
-	add(l.FetchMinBytesLegacy != 0, "`fetch-min-bytes` → `consumer.fetch-min-bytes`")
-	add(l.FetchMaxBytesLegacy != 0, "`fetch-max-bytes` → `consumer.fetch-max-bytes`")
-	add(l.MaxPollIntervalMsLegacy != 0, "`max-poll-interval-ms` → `consumer.max-poll-interval-ms`")
-	add(l.OnErrorLegacy != "", "`on-error` → `consumer.on-error`")
-	add(l.DeadletterTopicLegacy != "", "`deadletter-topic` → `consumer.deadletter-topic`")
-	add(l.FlushTimeoutLegacy != 0, "`flush-timeout` → `server.producer.flush-timeout`")
-	return out
 }
 
 // Resolve produce lo spec effettivo: eredita dai blocchi di `server` i campi non valorizzati, poi
@@ -545,7 +511,7 @@ func (s ProcessorSpec) Resolve(server KafkaServer) ProcessorSpec {
 // HasDeadletter indica se è configurato un topic DLQ (abilita il deadletter, sia da policy di default
 // sia da scelta dell'handler/transformer a runtime).
 func (s ProcessorSpec) HasDeadletter() bool {
-	return s.Consumer.DeadletterTopic != ""
+	return s.Consumer.Deadletter() != ""
 }
 
 type ctxKey int

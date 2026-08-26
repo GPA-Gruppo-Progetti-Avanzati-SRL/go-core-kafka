@@ -70,7 +70,7 @@ func Module(cfg *Config, register func(), opts ...Option) {
 	//
 	// Qui gli spec servono grezzi: `properties` non è ereditabile, quindi il blocco globale non
 	// aggiungerebbe nulla al binding dei campi `prop:`.
-	specs := cfg.processors()
+	specs := cfg.Processors
 	active := make(map[string]spec.ProcessorSpec, len(specs))
 	for _, s := range specs {
 		if !s.Disabled {

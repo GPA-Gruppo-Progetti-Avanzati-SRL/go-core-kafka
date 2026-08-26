@@ -15,7 +15,6 @@ import (
 	"maps"
 	"runtime/pprof"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
@@ -83,14 +82,6 @@ func NewConsumers(p params) (*Consumers, error) {
 
 	runners := make([]*runner, 0, len(p.Specs))
 	for _, raw := range p.Specs {
-		// Le chiavi di tuning scritte nella forma piatta storica fermano l'avvio invece di essere
-		// ignorate: una config che credeva di avere `deadletter-topic` e non ce l'ha più manderebbe
-		// altrove i record poison senza che nessuno se ne accorga.
-		if legacy := raw.LegacyKeys(); len(legacy) > 0 {
-			return nil, fmt.Errorf("processor %q: chiavi di tuning nella forma piatta non più supportata, spostarle nei blocchi `consumer`/`producer`: %s",
-				raw.Name, strings.Join(legacy, ", "))
-		}
-
 		// Qui gli spec diventano quelli EFFETTIVI: Resolve eredita dai blocchi di `server` i campi
 		// non valorizzati e poi applica i default della libreria. Da questa riga in poi nessuno
 		// consulta più i blocchi globali — un campo letto da r.spec è già il valore giusto.
@@ -130,7 +121,7 @@ func NewConsumers(p params) (*Consumers, error) {
 				log.Warn().Str("processor", s.Name).
 					Msg("corekafka: il blocco `producer` su un processor in modalità handle è ignorato (il producer del DLQ è condiviso): usare `server.producer`")
 			}
-			if s.Consumer.OnError == spec.OnErrorDeadletter && s.Consumer.DeadletterTopic == "" {
+			if s.Consumer.OnError == spec.OnErrorDeadletter && s.Consumer.Deadletter() == "" {
 				return nil, fmt.Errorf("processor %q: consumer.on-error=deadletter richiede consumer.deadletter-topic", s.Name)
 			}
 			// Il DLQ (via Producer condiviso) serve sia per la policy di default deadletter sia quando
@@ -328,7 +319,7 @@ func (r *runner) absorb(err error, batch *[]*message.Record) bool {
 // sendDeadletter produce i record sul topic DLQ dello spec. Ritorna errore (→ fail-fast) se il DLQ
 // non è configurato, così una richiesta di deadletter senza DLQ non perde silenziosamente i dati.
 func (r *runner) sendDeadletter(ctx context.Context, recs []*message.Record, cause error) error {
-	if r.dlq == nil || r.spec.Consumer.DeadletterTopic == "" {
+	if r.dlq == nil || r.spec.Consumer.Deadletter() == "" {
 		return fmt.Errorf("processor %q: deadletter richiesto ma non configurato (manca deadletter-topic/Producer): %w", r.spec.Name, cause)
 	}
 	if appErr := r.dlq.Produce(ctx, r.toDLQ(recs, cause)); appErr != nil {
@@ -526,7 +517,7 @@ func (r *runner) runTransform(ctx context.Context) error {
 // dalla modalità transform per instradare a DLQ dentro la stessa transazione EOS). Ritorna errore se
 // il topic DLQ non è configurato, così una richiesta di DeadLetter senza DLQ non perde dati.
 func (r *runner) dlqRecords(recs []*message.Record, cause error) ([]*message.ProducerRecord, error) {
-	if r.spec.Consumer.DeadletterTopic == "" {
+	if r.spec.Consumer.Deadletter() == "" {
 		return nil, fmt.Errorf("processor %q: DeadLetter richiesto ma deadletter-topic assente", r.spec.Name)
 	}
 	return r.toDLQ(recs, cause), nil
@@ -568,7 +559,7 @@ func (r *runner) toDLQ(recs []*message.Record, cause error) []*message.ProducerR
 		// Un record già passato dal DLQ e reimmesso porta il contatore: incrementarlo permette a chi
 		// riprocessa di fermarsi invece di girare all'infinito.
 		h[HeaderDeliveryAttempts] = strconv.Itoa(attempts(rec.Headers) + 1)
-		out = append(out, &message.ProducerRecord{Topic: r.spec.Consumer.DeadletterTopic, Key: rec.Key, Value: rec.Value, Headers: h})
+		out = append(out, &message.ProducerRecord{Topic: r.spec.Consumer.Deadletter(), Key: rec.Key, Value: rec.Value, Headers: h})
 	}
 	return out
 }

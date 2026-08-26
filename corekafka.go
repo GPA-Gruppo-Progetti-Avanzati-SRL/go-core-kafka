@@ -35,10 +35,6 @@ type (
 	KafkaConfig = spec.KafkaServer
 	// ProcessorSpec è la specifica di un singolo processor (una voce di `processors`).
 	ProcessorSpec = spec.ProcessorSpec
-	// ConsumerSpec è il nome storico di ProcessorSpec.
-	//
-	// Deprecated: usare ProcessorSpec.
-	ConsumerSpec = spec.ProcessorSpec
 	// ConsumerTuning è il blocco `consumer`: si scrive in `server.consumer` e ogni processor può
 	// sovrascriverne i singoli campi nel proprio blocco omonimo.
 	ConsumerTuning = spec.ConsumerTuning

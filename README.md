@@ -444,11 +444,6 @@ services:
           topic-prefix: "gpa."
 ```
 
-> La chiave `consumers:` è il nome storico di `processors:` e continua a funzionare con un warning al
-> boot. È stata rinominata perché con l'arrivo di `server.consumer` due parole quasi identiche
-> indicavano due cose diverse. Se sono valorizzate entrambe vince `processors` e l'altra viene
-> segnalata: non si fondono, perché una fusione silenziosa nasconderebbe una migrazione lasciata a metà.
-
 ### Eredità e override
 
 **La precedenza è: valore nel blocco del processor → valore nel blocco omonimo di `server` → default
@@ -489,11 +484,8 @@ I valori enumerati sono validati al boot (`validate:"oneof=..."` su `on-error`, 
 `producer.acks`, `producer.compression-type`) — ai **due** livelli, perché sono gli stessi tipi:
 **un typo ferma l'avvio** invece di degradare in silenzio.
 
-> **Forma piatta non più supportata.** Le chiavi di tuning scritte direttamente sulla voce del
-> processor (`max-batch-size`, `on-error`, `deadletter-topic`, `session-timeout-ms`, `flush-timeout`…)
-> vanno ora nei blocchi `consumer`/`producer`. Se ne trova una, l'engine **ferma l'avvio** elencando
-> dove spostarla: ignorarle sarebbe peggio, perché una config che credeva di avere `deadletter-topic`
-> e non ce l'ha più manderebbe altrove i record poison senza che nessuno se ne accorga.
+> Le chiavi di tuning vanno **dentro** i blocchi `consumer`/`producer`, non direttamente sulla voce
+> del processor: una chiave piatta non viene mappata e resta senza effetto.
 
 ### Escape hatch: `kafka-properties`
 
