@@ -46,7 +46,21 @@ type Transformer interface {
 // transiente (es. sink irraggiungibile): l'engine NON committa e forza il replay.
 type PoisonRecords struct {
 	Records []*message.Record
-	Cause   error
+	// Causes, se valorizzata, porta la causa del SINGOLO record (stessa lunghezza e stesso ordine di
+	// Records): è quella a finire nell'header corekafka-dlq-error di quel record. Un elemento nil, o
+	// una Causes nil, fa ricadere il record su Cause. La costruisce DeadLetterEach (e quindi Convert);
+	// DeadLetter(cause, recs...) la lascia nil, etichettando tutto il gruppo con l'unica Cause.
+	Causes []error
+	Cause  error
+}
+
+// CauseFor ritorna la causa da attribuire all'i-esimo record: quella specifica se presente, altrimenti
+// la causa comune del gruppo.
+func (e *PoisonRecords) CauseFor(i int) error {
+	if i >= 0 && i < len(e.Causes) && e.Causes[i] != nil {
+		return e.Causes[i]
+	}
+	return e.Cause
 }
 
 func (e *PoisonRecords) Error() string {

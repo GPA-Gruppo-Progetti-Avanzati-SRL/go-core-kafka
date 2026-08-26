@@ -132,8 +132,9 @@ Il client concreto è confinato in `internal/confluentdriver`, dietro le interfa
 ## Esempio A — handle Kafka→Mongo (modalità handle, da RegisterHandler)
 
 La business logic è libera nell'handler (qui persiste via il data layer `IData` dell'app); nessun
-"sinker" della libreria. Le conversioni record→modello stanno nel `serializer.go` del package, come
-nel business layer dei microservizi REST.
+"sinker" della libreria. La conversione record→modello sta nel `serializer.go` del package, come nel
+business layer dei microservizi REST — ma il **giro** attorno a quella conversione (record vuoti,
+raccolta dei poison, compaction, coda `DeadLetter`) lo fa `corekafka.Convert`.
 
 ```go
 // app/consumer/handler/consumer.go
@@ -144,32 +145,72 @@ type Handler struct {
 }
 
 func (h *Handler) Handle(ctx context.Context, batch []*corekafka.Record) error {
-    eventi := make([]*model.Evento, 0, len(batch))
-    var poison []*corekafka.Record
-    for _, r := range batch {
-        e, err := convertEvento(r)   // serializer.go — privato al package
-        if err != nil {
-            poison = append(poison, r)
-            continue
-        }
-        if e == nil {
-            continue                 // tombstone/empty
-        }
-        eventi = append(eventi, e)
-    }
+    res := corekafka.Convert(ctx, batch, corekafka.Compact, convertEvento) // serializer.go
 
-    if appErr := h.Data.UpsertEventi(ctx, eventi); appErr != nil {
-        return appErr                                    // transiente → no commit → replay
+    if appErr := h.Data.UpsertEventi(ctx, res.Items); appErr != nil {
+        return appErr           // transiente → no commit → replay
     }
-    if len(poison) > 0 {
-        return corekafka.DeadLetter(errParse, poison...) // → DLQ + commit (serve deadletter-topic)
-    }
-    return nil                                           // → commit
+    return res.DeadLetter()     // nil se non c'è poison → commit; altrimenti DLQ + commit del resto
 }
 ```
 
-Il data layer resta l'unico a parlare col DB e propaga gli errori come negli altri progetti GPA
-(`core.TechnicalErrorWithError`); l'upsert per `_id` rende l'at-least-once effectively-once.
+```go
+// app/consumer/handler/serializer.go — la conversione di UN record: ciò che resta all'app
+func convertEvento(r *corekafka.Record) ([]*model.Evento, error) {
+    var payload map[string]any
+    if err := bson.UnmarshalExtJSON(r.Value, false, &payload); err != nil {
+        return nil, err         // deterministico → poison, con QUESTA causa nell'header del DLQ
+    }
+    return []*model.Evento{{ID: string(r.Key), Payload: payload}}, nil
+}
+```
+
+### `Convert` — la prima passata sul batch
+
+`Convert(ctx, batch, compact, conv)` è il pezzo che ogni handler riscriveva a mano prima di arrivare
+alla propria business logic. All'app resta la conversione di **un** record:
+
+| La conv ritorna | Esito |
+|---|---|
+| `(items, nil)` | gli items finiscono in `res.Items` |
+| `(nil, nil)` | niente da elaborare: `res.Skipped++` |
+| `(_, err)` | `res.Poison`, con `err` come causa **di quel record** |
+
+I record con `Value` vuoto (tombstone) **non arrivano** alla conv: li scarta `Convert`, contandoli in
+`res.Tombstones`. Il `[]T` copre il fan-out 1:N — un record CDC che cambia chiave primaria produce sia
+la cancellazione del vecchio id sia l'upsert del nuovo.
+
+```go
+type Converted[T any] struct {
+    Items      []T            // già compattati, nell'ordine del batch
+    Poison     []PoisonRecord // {Record, Cause}: la causa viaggia col record fino all'header DLQ
+    Tombstones int
+    Skipped    int
+    Compacted  int
+}
+func (c Converted[T]) DeadLetter() error   // nil se non c'è nessun poison
+```
+
+**Compaction (`corekafka.Compact` / `corekafka.NoCompact`).** Con `Compact` sopravvive, per ogni chiave
+Kafka, solo l'**ultimo** record del batch: i suoi items prendono il posto di quelli dei precedenti,
+nella posizione di prima apparizione della chiave. I record senza chiave non sono mai compattati —
+senza chiave non c'è identità, e collassarli insieme li perderebbe.
+
+È un parametro e non un default perché la sua sicurezza dipende da **come scrive** il consumer: se la
+scrittura sovrascrive per intero (upsert / `ReplaceOne`) scartare le versioni superate non perde nulla
+ed è ciò che rende lecita una BulkWrite unordered; se invece due record sulla stessa chiave si
+**compongono** (un update seguito da una cancellazione che tocca solo alcuni campi), tenere l'ultimo
+perde ciò che portava il precedente. Nel dubbio, `NoCompact`.
+
+**Errori deterministici, non transienti.** Quelli della conversione sono per definizione deterministici
+(lavoro in memoria su un payload fisso): rigiocarli non cambierebbe l'esito, quindi vanno al DLQ. Gli
+errori **transienti** — un sink irraggiungibile, una chiamata remota fallita — non passano da `Convert`:
+restano nel corpo di `Handle` e si ritornano come `error`, che è ciò che impedisce il commit e provoca
+il replay del batch.
+
+**Le cause arrivano nel DLQ una per record.** `DeadLetter(cause, recs...)` etichetta tutto il gruppo con
+un'unica causa; `res.DeadLetter()` (che passa da `DeadLetterEach`) conserva quella del singolo record,
+ed è quella che `toDLQ` scrive nell'header `corekafka-dlq-error` di **quel** messaggio.
 
 ## Esempio B — consume-transform-produce EOS (modalità transform, da RegisterTransformer), con mix output + deadletter
 
@@ -186,20 +227,12 @@ type Transformer struct{}   // router puro Kafka→Kafka: nessun data layer né 
 func (t *Transformer) Transform(ctx context.Context, batch []*corekafka.Record) ([]*corekafka.ProducerRecord, error) {
     prefix := corekafka.PropertiesFromContext(ctx).GetString("topic-prefix", "gpa.")
 
-    out := make([]*corekafka.ProducerRecord, 0, len(batch))
-    var poison []*corekafka.Record
-    for _, r := range batch {
-        topic, ok := transformRecord(r, prefix)   // serializer.go — privato al package
-        if !ok {
-            poison = append(poison, r)            // instradato al DLQ dall'engine, nella stessa TX EOS
-            continue
-        }
-        out = append(out, &corekafka.ProducerRecord{Topic: topic, Key: r.Key, Value: r.Value})
-    }
-    if len(poison) > 0 {
-        return out, corekafka.DeadLetter(fmt.Errorf("routing non valido"), poison...)
-    }
-    return out, nil
+    // Stesso Convert dell'handle, con T = *ProducerRecord. NoCompact: un router non deduplica,
+    // ogni record in ingresso deve produrre il suo output.
+    res := corekafka.Convert(ctx, batch, corekafka.NoCompact, func(r *corekafka.Record) ([]*corekafka.ProducerRecord, error) {
+        return routeRecord(r, prefix)   // serializer.go — privato al package
+    })
+    return res.Items, res.DeadLetter()  // i poison finiscono al DLQ nella stessa TX EOS
 }
 ```
 
@@ -609,11 +642,19 @@ Registrate su Prometheus dall'engine (esposte da `core.NewServerMetrics` su `:21
 | `corekafka_batch_duration_seconds` | histogram | `consumer` |
 | `corekafka_consumer_restarts_total` | counter | `consumer`, `severity` |
 | `corekafka_batch_discarded_records_total` | counter | `consumer`, `reason` |
+| `corekafka_convert_records_total` | counter | `consumer`, `outcome` |
 
 `corekafka_consumer_restarts_total` che cresce senza che cresca `consumed_records_total` è il segnale
 che il backoff sta mascherando un guasto stabile — quello che, prima della supervisione, il processo
 rendeva evidente uscendo. `batch_discarded_records_total` misura i duplicati introdotti dagli eventi di
 protocollo (rebalance, abort).
+
+`corekafka_convert_records_total` è la visibilità sulla prima passata, che prima non ne aveva nessuna:
+`outcome` vale `valid`, `tombstone`, `skipped`, `poison` o `compacted`. È complementare a
+`deadlettered_records_total`, che conta l'instradamento **effettivo** al DLQ: un processor senza
+`deadletter-topic` (poison → fail-fast) tiene quella a zero, mentre `outcome="poison"` mostra comunque
+quanti record sono stati rilevati. `outcome="compacted"` dice quanti duplicati per chiave arrivano
+nello stesso batch.
 
 ```bash
 curl -s localhost:2112/metrics | grep corekafka_

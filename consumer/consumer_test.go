@@ -152,8 +152,8 @@ func TestClassify(t *testing.T) {
 			if oc != tc.wantOutcome {
 				t.Errorf("outcome = %v, atteso %v", oc, tc.wantOutcome)
 			}
-			if len(got) != tc.wantPoison {
-				t.Errorf("record poison = %d, attesi %d", len(got), tc.wantPoison)
+			if len(poisonRecords(got)) != tc.wantPoison {
+				t.Errorf("record poison = %d, attesi %d", len(poisonRecords(got)), tc.wantPoison)
 			}
 		})
 	}
@@ -409,7 +409,7 @@ func TestToDLQ_HeaderDiOrigine(t *testing.T) {
 	s.Consumer.DeadletterTopic = ptr("eventi.DLQ")
 	r := &runner{spec: s}
 
-	out := r.toDLQ([]*message.Record{src}, errors.New("boom"))
+	out := r.toDLQ(processor.DeadLetter(errors.New("boom"), src))
 	if len(out) != 1 {
 		t.Fatalf("record prodotti = %d, atteso 1", len(out))
 	}
@@ -454,13 +454,13 @@ func TestToDLQ_IncrementaITentativi(t *testing.T) {
 	r := &runner{spec: s}
 
 	src := &message.Record{Topic: "t", Headers: map[string]string{HeaderDeliveryAttempts: "2"}}
-	if got := r.toDLQ([]*message.Record{src}, nil)[0].Headers[HeaderDeliveryAttempts]; got != "3" {
+	if got := r.toDLQ(processor.DeadLetter(nil, src))[0].Headers[HeaderDeliveryAttempts]; got != "3" {
 		t.Errorf("tentativi = %q, atteso 3", got)
 	}
 
 	// Un contatore illeggibile non deve far esplodere nulla: si riparte da 1.
 	src = &message.Record{Topic: "t", Headers: map[string]string{HeaderDeliveryAttempts: "non-un-numero"}}
-	if got := r.toDLQ([]*message.Record{src}, nil)[0].Headers[HeaderDeliveryAttempts]; got != "1" {
+	if got := r.toDLQ(processor.DeadLetter(nil, src))[0].Headers[HeaderDeliveryAttempts]; got != "1" {
 		t.Errorf("tentativi = %q, atteso 1", got)
 	}
 }
@@ -469,7 +469,7 @@ func TestToDLQ_SenzaCausa(t *testing.T) {
 	s := testSpec()
 	s.Consumer.DeadletterTopic = ptr("dlq")
 	r := &runner{spec: s}
-	if _, present := r.toDLQ([]*message.Record{{Topic: "t"}}, nil)[0].Headers[HeaderDLQError]; present {
+	if _, present := r.toDLQ(processor.DeadLetter(nil, &message.Record{Topic: "t"}))[0].Headers[HeaderDLQError]; present {
 		t.Error("header di errore presente senza causa")
 	}
 }
@@ -517,5 +517,34 @@ func TestBackoff_Reset(t *testing.T) {
 	}
 	if got != time.Second {
 		t.Errorf("attesa dopo reset = %v, atteso l'initial-backoff", got)
+	}
+}
+
+// Prima delle cause per-record, toDLQ etichettava OGNI messaggio con la stessa stringa: chi leggeva il
+// DLQ vedeva la causa del gruppo ("payload non valido"), mai il motivo del singolo record.
+func TestToDLQ_CausaPerRecord(t *testing.T) {
+	uno := &message.Record{Topic: "eventi", Partition: 1, Offset: 10, Value: []byte("a")}
+	due := &message.Record{Topic: "eventi", Partition: 1, Offset: 11, Value: []byte("b")}
+	tre := &message.Record{Topic: "eventi", Partition: 1, Offset: 12, Value: []byte("c")}
+
+	s := testSpec()
+	s.Consumer.DeadletterTopic = ptr("eventi.DLQ")
+	r := &runner{spec: s}
+
+	pr := processor.DeadLetterEach([]processor.PoisonRecord{
+		{Record: uno, Cause: errors.New("CDSERINT non valido")},
+		{Record: due, Cause: errors.New("AUD_ENTTYP non riconosciuto")},
+		{Record: tre, Cause: nil}, // nessuna causa specifica: ricade su quella comune
+	})
+	out := r.toDLQ(pr)
+
+	if got := out[0].Headers[HeaderDLQError]; got != "CDSERINT non valido" {
+		t.Errorf("header d'errore del primo record = %q", got)
+	}
+	if got := out[1].Headers[HeaderDLQError]; got != "AUD_ENTTYP non riconosciuto" {
+		t.Errorf("header d'errore del secondo record = %q", got)
+	}
+	if got := out[2].Headers[HeaderDLQError]; got != pr.Cause.Error() {
+		t.Errorf("senza causa propria il record deve ricadere su quella comune, ha %q", got)
 	}
 }

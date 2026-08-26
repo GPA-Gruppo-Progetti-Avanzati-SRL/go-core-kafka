@@ -276,9 +276,11 @@ const (
 // le due modalità: prima handle valutava ErrFailFast prima di PoisonRecords e transform il contrario,
 // quindi lo stesso errore composito veniva classificato in due modi diversi.
 //
-// Ritorna anche i record da mandare al DLQ e la causa da allegarvi: cambia solo COME i due modi li
-// consegnano (producer condiviso in handle, stessa transazione EOS in transform), non quali siano.
-func classify(err error, batch []*message.Record, onError string) (outcome, []*message.Record, error) {
+// Ritorna anche COSA mandare al DLQ: il *PoisonRecords intero e non la sola lista di record, perché
+// è lì che vivono le cause per-record prodotte da Convert — servono a toDLQ per scrivere un
+// corekafka-dlq-error diverso su ogni messaggio. Cambia solo COME i due modi consegnano (producer
+// condiviso in handle, stessa transazione EOS in transform), non quali siano.
+func classify(err error, batch []*message.Record, onError string) (outcome, *processor.PoisonRecords, error) {
 	switch {
 	case err == nil:
 		return outcomeCommit, nil, nil
@@ -288,13 +290,23 @@ func classify(err error, batch []*message.Record, onError string) (outcome, []*m
 	}
 	// Il processor ha indicato QUALI record sono poison: il resto del batch è stato elaborato.
 	if pr, ok := errors.AsType[*processor.PoisonRecords](err); ok {
-		return outcomeDeadletter, pr.Records, pr.Cause
+		return outcomeDeadletter, pr, pr.Cause
 	}
-	// Errore generico: decide la policy di default dello spec.
+	// Errore generico: decide la policy di default dello spec. Nessuna causa per-record da attribuire:
+	// l'intero batch fallisce per lo stesso motivo.
 	if onError == spec.OnErrorDeadletter {
-		return outcomeDeadletter, batch, err
+		return outcomeDeadletter, &processor.PoisonRecords{Records: batch, Cause: err}, err
 	}
 	return outcomeFail, nil, err
+}
+
+// poisonRecords estrae i record da un esito di classify, tollerando il nil dei rami che non
+// deadletterano.
+func poisonRecords(pr *processor.PoisonRecords) []*message.Record {
+	if pr == nil {
+		return nil
+	}
+	return pr.Records
 }
 
 // absorb gestisce le severità che NON richiedono di ricostruire il client: il batch in volo viene
@@ -318,11 +330,11 @@ func (r *runner) absorb(err error, batch *[]*message.Record) bool {
 
 // sendDeadletter produce i record sul topic DLQ dello spec. Ritorna errore (→ fail-fast) se il DLQ
 // non è configurato, così una richiesta di deadletter senza DLQ non perde silenziosamente i dati.
-func (r *runner) sendDeadletter(ctx context.Context, recs []*message.Record, cause error) error {
+func (r *runner) sendDeadletter(ctx context.Context, pr *processor.PoisonRecords) error {
 	if r.dlq == nil || r.spec.Consumer.Deadletter() == "" {
-		return fmt.Errorf("processor %q: deadletter richiesto ma non configurato (manca deadletter-topic/Producer): %w", r.spec.Name, cause)
+		return fmt.Errorf("processor %q: deadletter richiesto ma non configurato (manca deadletter-topic/Producer): %w", r.spec.Name, pr.Cause)
 	}
-	if appErr := r.dlq.Produce(ctx, r.toDLQ(recs, cause)); appErr != nil {
+	if appErr := r.dlq.Produce(ctx, r.toDLQ(pr)); appErr != nil {
 		return appErr
 	}
 	return nil
@@ -348,12 +360,13 @@ func (r *runner) runHandle(ctx context.Context) error {
 		hErr := r.handler.Handle(ctx, batch)
 		batchDuration.WithLabelValues(r.spec.Name).Observe(time.Since(start).Seconds())
 
-		oc, poison, cause := classify(hErr, batch, r.spec.Consumer.OnError)
+		oc, pr, cause := classify(hErr, batch, r.spec.Consumer.OnError)
+		poison := poisonRecords(pr)
 		switch oc {
 		case outcomeFail:
 			return cause // niente commit → replay
 		case outcomeDeadletter:
-			if err := r.sendDeadletter(ctx, poison, cause); err != nil {
+			if err := r.sendDeadletter(ctx, pr); err != nil {
 				return err // DLQ non configurato/irraggiungibile → replay
 			}
 			deadletteredTotal.WithLabelValues(r.spec.Name).Add(float64(len(poison)))
@@ -448,13 +461,14 @@ func (r *runner) runTransform(ctx context.Context) error {
 		// Stesso modello a esiti della modalità handle (classify è condivisa), ma la consegna DLQ
 		// avviene DENTRO la sessione transazionale (append agli output) così l'EOS resta intatto:
 		// output "buoni" + record DLQ + commit offset sono atomici.
-		oc, poison, cause := classify(tErr, batch, r.spec.Consumer.OnError)
+		oc, pr, cause := classify(tErr, batch, r.spec.Consumer.OnError)
+		poison := poisonRecords(pr)
 		switch oc {
 		case outcomeFail:
 			abort()
 			return cause
 		case outcomeDeadletter:
-			dlq, derr := r.dlqRecords(poison, cause)
+			dlq, derr := r.dlqRecords(pr)
 			if derr != nil {
 				abort()
 				return derr
@@ -516,11 +530,11 @@ func (r *runner) runTransform(ctx context.Context) error {
 // dlqRecords converte i record poison in ProducerRecord verso il deadletter-topic dello spec (usati
 // dalla modalità transform per instradare a DLQ dentro la stessa transazione EOS). Ritorna errore se
 // il topic DLQ non è configurato, così una richiesta di DeadLetter senza DLQ non perde dati.
-func (r *runner) dlqRecords(recs []*message.Record, cause error) ([]*message.ProducerRecord, error) {
+func (r *runner) dlqRecords(pr *processor.PoisonRecords) ([]*message.ProducerRecord, error) {
 	if r.spec.Consumer.Deadletter() == "" {
 		return nil, fmt.Errorf("processor %q: DeadLetter richiesto ma deadletter-topic assente", r.spec.Name)
 	}
-	return r.toDLQ(recs, cause), nil
+	return r.toDLQ(pr), nil
 }
 
 // Header applicati ai record instradati al DLQ. Servono a diagnosticare (da dove veniva il record,
@@ -539,10 +553,11 @@ const (
 )
 
 // toDLQ costruisce i ProducerRecord per il DLQ preservando payload e origine del record poison.
-func (r *runner) toDLQ(recs []*message.Record, cause error) []*message.ProducerRecord {
+func (r *runner) toDLQ(pr *processor.PoisonRecords) []*message.ProducerRecord {
 	at := time.Now().UTC().Format(time.RFC3339Nano)
+	recs := pr.Records
 	out := make([]*message.ProducerRecord, 0, len(recs))
-	for _, rec := range recs {
+	for i, rec := range recs {
 		h := make(map[string]string, len(rec.Headers)+8)
 		maps.Copy(h, rec.Headers)
 		h[HeaderDLQSourceTopic] = rec.Topic
@@ -553,7 +568,9 @@ func (r *runner) toDLQ(recs []*message.Record, cause error) []*message.ProducerR
 		if !rec.Timestamp.IsZero() {
 			h[HeaderDLQSourceTimestamp] = rec.Timestamp.UTC().Format(time.RFC3339Nano)
 		}
-		if cause != nil {
+		// La causa del SINGOLO record quando c'è (Convert la produce per ognuno), altrimenti quella
+		// comune del gruppo: chi legge il DLQ vuole sapere perché è fallito QUESTO messaggio.
+		if cause := pr.CauseFor(i); cause != nil {
 			h[HeaderDLQError] = cause.Error()
 		}
 		// Un record già passato dal DLQ e reimmesso porta il contatore: incrementarlo permette a chi

@@ -31,6 +31,8 @@ type (
 	Transformer = processor.Transformer
 	// PoisonRecords segnala all'engine i record poison da instradare a DLQ.
 	PoisonRecords = processor.PoisonRecords
+	// PoisonRecord è un record scartato dalla conversione con la SUA causa (vedi Convert).
+	PoisonRecord = processor.PoisonRecord
 	// KafkaConfig è la connessione Kafka condivisa più il tuning globale di consumer e producer.
 	KafkaConfig = spec.KafkaServer
 	// ProcessorSpec è la specifica di un singolo processor (una voce di `processors`).
@@ -55,6 +57,34 @@ type (
 // ErrFailFast: ritornalo (anche wrappato) da Handler/Transformer per forzare il fail-fast (no commit,
 // l'app esce → replay), a prescindere dalla policy on-error dello spec.
 var ErrFailFast = processor.ErrFailFast
+
+// Converted è l'esito della prima passata su un batch (vedi Convert).
+type Converted[T any] = processor.Converted[T]
+
+// Compact / NoCompact sono il flag di compaction di Convert, in forma leggibile al sito di chiamata.
+const (
+	Compact   = processor.Compact
+	NoCompact = processor.NoCompact
+)
+
+// Convert è la prima passata su un batch: salta i record vuoti, applica conv a ciascun record,
+// separa i poison (con la LORO causa) dai risultati buoni, compatta opzionalmente per chiave Kafka, e
+// logga/conta ciò che ha scartato. All'app resta la conversione di un singolo record.
+//
+//	func (h *Handler) Handle(ctx context.Context, batch []*corekafka.Record) error {
+//	    res := corekafka.Convert(ctx, batch, corekafka.Compact, convertEvento)
+//	    if err := h.Data.Apply(ctx, res.Items); err != nil {
+//	        return err // transiente: niente commit -> replay
+//	    }
+//	    return res.DeadLetter() // nil se non c'è nessun poison
+//	}
+func Convert[T any](ctx context.Context, batch []*Record, compact bool, conv func(*Record) ([]T, error)) Converted[T] {
+	return processor.Convert(ctx, batch, compact, conv)
+}
+
+// DeadLetterEach è l'equivalente per-record di DeadLetter: ogni record porta la sua causa fino
+// all'header corekafka-dlq-error. È ciò che usa Converted.DeadLetter().
+func DeadLetterEach(poison []PoisonRecord) error { return processor.DeadLetterEach(poison) }
 
 // DeadLetter costruisce l'esito gestito con cui Handler O Transformer chiedono di instradare QUESTI
 // record al DLQ. Da ritornare come error da Handle o da Transform: in sink il resto viene committato,
