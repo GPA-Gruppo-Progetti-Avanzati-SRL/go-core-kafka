@@ -43,11 +43,11 @@ func TestErrFailFast_IsWrappable(t *testing.T) {
 func TestApply_ProvidesOnlyActiveConsumers(t *testing.T) {
 	var provided []string
 	register := func() {
-		provideIfActive("attivo", func(spec.ConsumerSpec) { provided = append(provided, "attivo") })
-		provideIfActive("spento", func(spec.ConsumerSpec) { provided = append(provided, "spento") })
+		provideIfActive("attivo", func(spec.ProcessorSpec) { provided = append(provided, "attivo") })
+		provideIfActive("spento", func(spec.ProcessorSpec) { provided = append(provided, "spento") })
 	}
 
-	Apply(register, map[string]spec.ConsumerSpec{"attivo": {Name: "attivo"}}, nil)
+	Apply(register, map[string]spec.ProcessorSpec{"attivo": {Name: "attivo"}}, nil)
 
 	if len(provided) != 1 || provided[0] != "attivo" {
 		t.Fatalf("atteso solo 'attivo' fornito, ottenuto %v", provided)
@@ -60,7 +60,7 @@ func TestApply_SkipsAllWhenSubsystemModeInactive(t *testing.T) {
 	var called bool
 	register := func() { called = true }
 
-	Apply(register, map[string]spec.ConsumerSpec{"attivo": {Name: "attivo"}}, []string{"modo-non-attivo"})
+	Apply(register, map[string]spec.ProcessorSpec{"attivo": {Name: "attivo"}}, []string{"modo-non-attivo"})
 
 	if called {
 		t.Fatal("Apply non deve invocare register() se il sottosistema non è nel Mode corrente")
@@ -76,7 +76,7 @@ func TestProvideIfActive_PanicsOutsideApply(t *testing.T) {
 			t.Fatal("atteso panic se chiamata fuori dalla funzione passata ad Apply")
 		}
 	}()
-	provideIfActive("x", func(spec.ConsumerSpec) {})
+	provideIfActive("x", func(spec.ProcessorSpec) {})
 }
 
 // --- integrazione col meccanismo di go-core-app -----------------------------------------------------
@@ -115,7 +115,7 @@ func TestRegisterHandler_SynthesizesInsideApply(t *testing.T) {
 	Apply(func() {
 		RegisterHandler[propsHandler]("eventi")
 		RegisterHandler[propsHandler]("spento") // non attivo: non deve nemmeno sintetizzare
-	}, map[string]spec.ConsumerSpec{
+	}, map[string]spec.ProcessorSpec{
 		"eventi": {Name: "eventi", Properties: core.Properties{"collection": "events"}},
 	}, nil)
 }

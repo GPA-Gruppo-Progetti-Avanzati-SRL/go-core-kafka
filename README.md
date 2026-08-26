@@ -23,8 +23,8 @@ CGO_ENABLED=1 go test ./...
 > `RegisterTransformer[T]("nome")` → modalità **transform**. L'engine lo deriva dal gruppo fx in cui è
 > registrato il processore (nome in entrambi → errore; in nessuno → errore). Unica fonte di verità.
 >
-> **L'attivazione è comandata dalla lista `consumers` di config**: un processore registrato ma **non
-> presente** in `consumers` non viene istanziato (solo un log info). Un consumer con **`disabled: true`**
+> **L'attivazione è comandata dalla lista `processors` di config**: un processore registrato ma **non
+> presente** in `processors` non viene istanziato (solo un log info). Un processor con **`disabled: true`**
 > non viene attivato (per spegnerlo senza rimuoverlo dalla config).
 
 
@@ -48,8 +48,7 @@ al posto di `app/api/routes` c'è `app/consumer` (l'ingresso è Kafka, non HTTP)
 
 ```
 gpa-consumer-app/
-├── main.go                     # core.Invoke(...) + core.Run()
-├── app-config.go               # composition root: init() con ReadConfig + TUTTO il wiring (core.Module("mongo", ...) + corekafka.Module)
+├── main.go                     # composition root: core.Boot + TUTTO il wiring (coremongo.Module + corekafka.Module) + core.Run
 ├── config.yml                  # YAML embedded (sezioni services/app)
 ├── app/
 │   ├── config.go               # AppName + app.Config (app-level)
@@ -70,16 +69,16 @@ gpa-consumer-app/
 ```
 
 `services` aggrega solo la **Config**, non il wiring: gli import di business logic (es. `app/consumer`
-per il riferimento a `Register`) devono stare in `app-config.go`, non in `services` — altrimenti
+per il riferimento a `Register`) devono stare in `main.go`, non in `services` — altrimenti
 un'app con più dipendenze rischia di far dipendere l'infra dalla business logic invece del contrario.
 
 Corrispondenze con la skill `gpa-microservice`:
 
 | Microservizio REST | App consumer | Nota |
 |---|---|---|
-| `app/api/routes/router.go` | `app/consumer/register.go` | punto unico di registrazione; il riferimento `Register` si passa a `Module` da `app-config.go` |
+| `app/api/routes/router.go` | `app/consumer/register.go` | punto unico di registrazione; il riferimento `Register` si passa a `Module` da `main.go` |
 | `app/api/routes/<risorsa>/register.go` | `corekafka.RegisterHandler/RegisterTransformer` | un nome consumer per seam |
-| `app/api/business/<risorsa>/` | `app/consumer/<nome>/` | un sub-package per consumer |
+| `app/api/business/<risorsa>/` | `app/consumer/<nome>/` | un sub-package per processor |
 | `serializer.go` (convertXxx privati) | `serializer.go` | identico: le conversioni stanno qui, non nell'handler |
 | `app/data` (`IData`, `core.In`) | `app/data` | identico: unico layer che parla col DB |
 
@@ -87,12 +86,12 @@ Corrispondenze con la skill `gpa-microservice`:
 
 `Module` prende come secondo argomento il **riferimento** a una funzione `func()` dell'app (non il suo
 valore di ritorno, non chiamata dal chiamante) e la invoca lui stesso, sincronamente, quando già
-conosce l'insieme dei consumer attivi da config. `RegisterHandler[T]`/`RegisterTransformer[T]` vanno
+conosce l'insieme dei processor attivi da config. `RegisterHandler[T]`/`RegisterTransformer[T]` vanno
 chiamate **solo dall'interno** di quella funzione — panicano altrimenti.
 
 La convenzione GPA raccoglie tutte le registrazioni dell'app in una funzione `Register()` centralizzata
 (stesso idioma di `routes.NewRouter`/`register.go` dei microservizi REST), che tiene i nomi (devono
-combaciare con `consumers[].name` in config) come costanti accanto alla registrazione:
+combaciare con `processors[].name` in config) come costanti accanto alla registrazione:
 
 ```go
 // app/consumer/register.go
@@ -104,7 +103,7 @@ import (
     "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/gpa-consumer-app/app/consumer/transformer"
 )
 
-const HandlerConsumerName = "handler"         // deve combaciare con consumers[].name in config.yml
+const HandlerConsumerName = "handler"         // deve combaciare con processors[].name in config.yml
 const TransformerConsumerName = "transformer"
 
 func Register() {
@@ -114,7 +113,7 @@ func Register() {
 ```
 
 Il riferimento (`consumer.Register`, **senza parentesi**) si passa a `Module` esattamente dove `Module`
-viene chiamato — nella **composition root** (`app-config.go`), l'unico punto che deve conoscere sia
+viene chiamato — nella **composition root** (`main.go`), l'unico punto che deve conoscere sia
 l'infra sia la business logic (vedi sezione Wiring più sotto). `services` resta infra-only: non importa
 mai `app/consumer`. Nessun registry globale persistente, nessun ordine `init()`/`main()` da rispettare:
 `Register` gira sincronamente dentro `Module`, sempre nello stesso punto. `main.go` non chiama più
@@ -204,24 +203,24 @@ func (t *Transformer) Transform(ctx context.Context, batch []*corekafka.Record) 
 }
 ```
 
-## Wiring — composition root (`app-config.go`)
+## Wiring — composition root (`main.go`)
 
 `Module` richiede il riferimento alla funzione di registrazione dell'app (business logic): per questo
-il wiring del sottosistema Kafka NON va dentro `services.ProvideServices` (che deve restare infra-only,
-senza importare mai business logic), ma nella **composition root** — l'unico punto dell'app che conosce
-sia l'infra sia la business logic, esattamente come `main`/`app-config.go` è l'unico punto che importa
-sia `services` sia `app/api/routes` nei microservizi REST.
+il wiring del sottosistema Kafka NON va nel package `services` (che deve restare infra-only, senza
+importare mai business logic), ma nella **composition root** — l'unico punto dell'app che conosce sia
+l'infra sia la business logic, esattamente come `main.go` è l'unico punto che importa sia `services`
+sia `app/api/routes` nei microservizi REST.
 
 ```go
-// services/services.go — SOLO Config, nessun wiring
+// services/config.go — SOLO Config, nessun wiring
 type Config struct {
-    Kafka corekafka.Config `mapstructure:",squash"`   // campi `kafka` + `consumers` sotto `services`
+    Kafka corekafka.Config `yaml:"kafka" mapstructure:"kafka"`  // sotto: server / processors
     Mongo coremongo.Config `yaml:"mongo" mapstructure:"mongo"`
 }
 ```
 
 ```go
-// app-config.go
+// main.go
 import (
     corekafka "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka"
     coremongo "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-mongo"
@@ -229,12 +228,13 @@ import (
     // ...
 )
 
-func init() {
-    // ... ReadConfig ...
+func main() {
+    svc := core.Boot[app.Config, services.Config](core.App{ /* ... */ })
 
-    coremongo.Module(&applicationConfig.ServicesConfig.Mongo)
+    coremongo.Module(&svc.Mongo)
+    corekafka.Module(&svc.Kafka, consumer.Register) // NB: senza parentesi
 
-    corekafka.Module(&applicationConfig.ServicesConfig.Kafka, consumer.Register) // NB: senza parentesi
+    core.Run(core.WithTracing())
 }
 ```
 
@@ -254,16 +254,16 @@ restano forniti a root: il value group li porta dentro il modulo, e le loro dipe
 sono risolte a root come sempre. Un consumer che deve produrre lo fa con un `Transformer` (EOS
 Kafka→Kafka), che è il seam previsto.
 
-### Solo i consumer attivi entrano nel grafo fx
+### Solo i processor attivi entrano nel grafo fx
 
-`Module` calcola l'insieme dei consumer **attivi** (presenti in `consumers[]` e non `disabled`) e poi
+`Module` calcola l'insieme dei processor **attivi** (presenti in `processors[]` e non `disabled`) e poi
 chiama `register()`: dentro, `RegisterHandler`/`RegisterTransformer` forniscono a fx SOLO il processor
-dei consumer attivi (`processor.Apply`). Le dipendenze di un consumer spento (es. un data layer Mongo)
+dei processor attivi (`processor.Apply`). Le dipendenze di un processor spento (es. un data layer Mongo)
 non entrano quindi nel grafo e **non vengono mai connesse** — altrimenti fx costruirebbe eagerly tutti
 i membri del value group, quindi anche i backend dei consumer disattivati. Un nome registrato ma
-assente da `consumers[]` produce solo un log info ("costruzione saltata"), nessun errore.
+assente da `processors[]` produce solo un log info ("costruzione saltata"), nessun errore.
 
-## Properties per-consumer + esito deciso dall'handler
+## Properties per-processor + esito deciso dall'handler
 
 Ogni `ConsumerSpec` può portare un blocco `properties`. Il modo raccomandato per leggerle è
 **mapparle sui campi della struct dell'Handler/Transformer** con il tag `prop:`: il mapping avviene al
@@ -351,63 +351,277 @@ record indicati + commit (richiede `deadletter-topic`); `corekafka.ErrFailFast` 
 fail-fast; **qualsiasi altro errore** → policy di default dello spec (`on-error`: `fail-fast` default |
 `deadletter`).
 
-## Config YAML (esempio)
+## Config YAML
 
-I nomi in `consumers[].name` sono la chiave di join con `Register()`: devono combaciare esattamente
+I nomi in `processors[].name` sono la chiave di join con `Register()`: devono combaciare esattamente
 con i nomi passati a `RegisterHandler`/`RegisterTransformer`.
+
+La `corekafka.Config` ha **due sole sezioni**, e la forma è **simmetrica sui due livelli**:
+
+- **`server`** — come parliamo con Kafka: la connessione, più tre blocchi globali `restart`,
+  `consumer` e `producer`.
+- **`processors`** — una voce per processor, con la sola **identità**, le properties applicative e i
+  **blocchi omonimi** `consumer`/`producer`/`restart` che sovrascrivono i globali campo per campo.
 
 ```yaml
 services:
-  # connessione Kafka condivisa (spec.KafkaConfig)
   kafka:
-    bootstrap-servers: kafka:9092
-    security-protocol: SASL_SSL
-    sasl: { mechanisms: SCRAM-SHA-512, username: ${KAFKA_USER}, password: ${KAFKA_PASS} }
+    server:
+      # --- connessione, condivisa da tutti i client del processo ---
+      bootstrap-servers: kafka:9092
+      client-id: gpa-consumer-app          # client.id: rende identificabile chi è connesso lato broker
+      security-protocol: SASL_SSL
+      sasl: { mechanisms: SCRAM-SHA-512, username: ${KAFKA_USER}, password: ${KAFKA_PASS} }
+      # ssl:
+      #   ca-location: /etc/ssl/kafka-ca.pem
+      #   certificate-location: /etc/ssl/client.pem   # mTLS: il broker autentica anche il client
+      #   key-location: /etc/ssl/client.key
+      # socket-keepalive-enable: true       # vedi il preset Azure Event Hub più sotto
+      # metadata-max-age-ms: 180000
+      # debug: cgrp,fetch                   # contesti di debug librdkafka (verboso: per la diagnosi)
 
-  # lista consumer (una entry per spooler)
-  consumers:
-    # nessun campo "mode": la modalità è derivata da RegisterHandler/RegisterTransformer
-    - name: handler               # RegisterHandler[handler.Handler]("handler") -> handle
-      # disabled: true            # → non attiva questo consumer (senza rimuoverlo)
-      topics: [gpa.events]
-      group-id: gpa-consumer-app
-      max-batch-size: 500
-      cut-frequency: 1s
-      auto-offset-reset: earliest
-      on-error: fail-fast                 # errore generico -> replay (default)
-      deadletter-topic: gpa.events.DLQ    # abilita il DLQ (l'handler ci instrada i payload non validi)
-      flush-timeout: 60s
-      properties:               # mappate sui campi `prop:` dell'handler (o lette dal ctx)
-        collection: events
-        batch-limit: 200
+      # Supervisione del loop di consumo. Sta qui e NON dentro `consumer` perché non è tuning di un
+      # client: non finisce in nessuna ConfigMap e non descrive come si consuma, ma cosa fa il
+      # processo quando un loop muore. Vedi "Errori e restart".
+      restart:
+        max-attempts: 0                     # 0 = illimitati
+        initial-backoff: 1s
+        max-backoff: 30s
 
-    - name: transformer           # RegisterTransformer[transformer.Transformer]("transformer") -> EOS
-      topics: [gpa.events.in]
-      group-id: gpa-transformer
-      transactional-id: gpa-transformer-tx
-      default-output-topic: gpa.output    # usato se il transformer lascia Topic vuoto
-      deadletter-topic: gpa.routing.DLQ   # dove l'engine produce i record da DeadLetter (in TX EOS)
-      max-batch-size: 200
-      cut-frequency: 1s
-      auto-offset-reset: earliest
-      properties:
-        topic-prefix: "gpa."
+      # Default del client consumer: ogni processor li eredita.
+      consumer:
+        auto-offset-reset: earliest         # earliest | latest | none
+        max-batch-size: 500
+        cut-frequency: 1s
+        session-timeout-ms: 10000
+        heartbeat-interval-ms: 3000
+        on-error: fail-fast                 # errore generico -> replay (default) | deadletter
+        deadletter-topic: gpa.DLQ           # anche il DLQ è ereditabile: i record ci arrivano etichettati
+
+      # Default del client producer.
+      producer:
+        acks: all                           # 0 | 1 | -1 | all
+        compression-type: snappy            # none | gzip | snappy | lz4 | zstd
+        linger-ms: 20                       # 0 esplicito = invia subito (è un *int, vedi sotto)
+        flush-timeout: 60s                  # tempo concesso alla chiusura per svuotare la coda
+        # transaction-timeout-ms: 100000     # oltre questa durata il broker fa fencing del producer
+        # init-transactions-timeout: 60s
+
+    processors:
+      # nessun campo "mode": la modalità è derivata da RegisterHandler/RegisterTransformer
+      - name: handler               # RegisterHandler[handler.Handler]("handler") -> handle
+        # disabled: true            # → non attiva questo processor (senza rimuoverlo)
+        topics: [gpa.events]
+        group-id: gpa-consumer-app
+        consumer:
+          deadletter-topic: gpa.events.DLQ  # override del DLQ comune; il resto del tuning è ereditato
+        properties:               # mappate sui campi `prop:` dell'handler (o lette dal ctx)
+          collection: events
+          batch-limit: 200
+
+      - name: supporto              # un processor che deve reggere un'infra esterna intermittente
+        topics: [cdc.condizioni]
+        group-id: condizioni-supporto
+        consumer:
+          session-timeout-ms: 30000         # override del globale (10000)
+        restart:
+          initial-backoff: 2s               # override di UN campo: gli altri restano dal globale
+          on-business-error: true
+        properties:
+          collection: servizi_bancari
+
+      - name: transformer           # RegisterTransformer[transformer.Transformer]("transformer") -> EOS
+        topics: [gpa.events.in]
+        group-id: gpa-transformer
+        transactional-id: gpa-transformer-tx
+        default-output-topic: gpa.output    # usato se il transformer lascia Topic vuoto
+        consumer:
+          max-batch-size: 200               # le transazioni EOS restano corte
+          deadletter-topic: gpa.routing.DLQ # dove l'engine produce i record da DeadLetter (in TX EOS)
+        producer:
+          linger-ms: 0                      # override del producer TRANSAZIONALE di questo processor
+        properties:
+          topic-prefix: "gpa."
 ```
 
-Default applicati da `ConsumerSpec.WithDefaults`: `max-batch-size: 500`, `cut-frequency: 1s`,
-`auto-offset-reset: earliest`, `on-error: fail-fast`, `flush-timeout: 60s`.
+> La chiave `consumers:` è il nome storico di `processors:` e continua a funzionare con un warning al
+> boot. È stata rinominata perché con l'arrivo di `server.consumer` due parole quasi identiche
+> indicavano due cose diverse. Se sono valorizzate entrambe vince `processors` e l'altra viene
+> segnalata: non si fondono, perché una fusione silenziosa nasconderebbe una migrazione lasciata a metà.
+
+### Eredità e override
+
+**La precedenza è: valore nel blocco del processor → valore nel blocco omonimo di `server` → default
+della libreria.** Un campo lasciato al suo zero significa "eredita"; un campo scritto sul processor
+sovrascrive. I blocchi ai due livelli sono **gli stessi tipi Go**, quindi hanno per costruzione le
+stesse chiavi: non c'è una lista di "campi sovrascrivibili" da tenere allineata a mano.
+
+| Blocco | Cosa contiene | Ereditabile |
+|---|---|---|
+| `consumer` | tuning del client consumer (`auto-offset-reset`, `session-timeout-ms`, `heartbeat-interval-ms`, `fetch-*`, `max-partition-fetch-bytes`, `queued-max-messages-kbytes`, `max-poll-interval-ms`, `partition-assignment-strategy`, `isolation-level`), dell'engine (`max-batch-size`, `cut-frequency`, `poll-timeout`), policy (`on-error`, `deadletter-topic`) e `kafka-properties` | sì, campo per campo |
+| `producer` | tuning del client producer (`acks`, `compression-type`, `linger-ms`, `batch-*`, `max-retries`, `max-in-flight`, `retry-backoff`, `delivery-timeout`, `request-timeout-ms`, `flush-timeout`, `enable-idempotence`), transazioni (`transaction-timeout-ms`, `init-transactions-timeout`) e `kafka-properties` | sì, campo per campo |
+| `restart` | `disabled`, `max-attempts`, `initial-backoff`, `max-backoff`, `multiplier`, `reset-after`, `on-business-error` | sì, campo per campo |
+| _identità_ | `name`, `topics`, `group-id`, `transactional-id`, `default-output-topic`, `properties` | **no**: è ciò che distingue un processor dall'altro |
+
+**`processors[].producer` ha effetto solo in modalità transform.** Il producer transazionale è
+l'unico che appartiene a un processor; in modalità handle il producer è quello **condiviso** del
+processo (serve al DLQ) e un override non avrebbe destinatario — l'engine lo segnala con un warning
+al boot. La modalità è derivata dalla registrazione, quindi chi scrive il YAML non ha modo di
+accorgersene guardando solo la config: per questo è un warning e non un errore.
+
+I blocchi si ereditano **campo per campo**: sovrascriverne uno non azzera gli altri. `restart.disabled`,
+`restart.on-business-error`, `producer.enable-idempotence` e `producer.linger-ms` sono puntatori
+proprio per questo — con un valore semplice, un `true` (o un `20`) globale non sarebbe più
+sovrascrivibile con `false` (o `0`) da un singolo processor.
+
+**Convenzione dei knob di tuning: un campo non valorizzato NON viene scritto nella ConfigMap**, così
+resta il default di librdkafka. Scrivere lo zero al posto di omettere la chiave imporrebbe `0` a
+proprietà dove zero ha un significato del tutto diverso dal default.
+
+Default della libreria (l'ultimo anello della catena) — sono quelli che governano **l'engine**, non il
+client: `consumer.max-batch-size: 500`, `consumer.cut-frequency: 1s`, `consumer.poll-timeout: 100ms`,
+`consumer.auto-offset-reset: earliest`, `consumer.on-error: fail-fast`,
+`producer.flush-timeout: 60s`, `producer.init-transactions-timeout: 60s`, e i default di `restart`
+(`initial-backoff: 1s`, `max-backoff: 30s`, `multiplier: 2`, `reset-after: 2m`).
+
+I valori enumerati sono validati al boot (`validate:"oneof=..."` su `on-error`, `auto-offset-reset`,
+`isolation-level`, `partition-assignment-strategy`, `security-protocol`, `sasl.mechanisms`,
+`producer.acks`, `producer.compression-type`) — ai **due** livelli, perché sono gli stessi tipi:
+**un typo ferma l'avvio** invece di degradare in silenzio.
+
+> **Forma piatta non più supportata.** Le chiavi di tuning scritte direttamente sulla voce del
+> processor (`max-batch-size`, `on-error`, `deadletter-topic`, `session-timeout-ms`, `flush-timeout`…)
+> vanno ora nei blocchi `consumer`/`producer`. Se ne trova una, l'engine **ferma l'avvio** elencando
+> dove spostarla: ignorarle sarebbe peggio, perché una config che credeva di avere `deadletter-topic`
+> e non ce l'ha più manderebbe altrove i record poison senza che nessuno se ne accorga.
+
+### Escape hatch: `kafka-properties`
+
+Le proprietà librdkafka non coperte da un campo tipizzato si passano con le loro chiavi dotted. Sono
+applicate **per ultime** — quindi vincono sui campi tipizzati, con un warning quando lo fanno — e
+seguono la stessa eredità del blocco che le contiene, **fondendosi** chiave per chiave.
+
+```yaml
+server:
+  kafka-properties:                         # comune a consumer e producer
+    ssl.endpoint.identification.algorithm: none
+  consumer:
+    kafka-properties:
+      fetch.error.backoff.ms: "1000"        # comune a tutti i processor
+  producer:
+    kafka-properties:
+      queue.buffering.max.kbytes: "1048576"
+processors:
+  - name: handler
+    consumer:
+      kafka-properties:
+        debug: "cgrp"                       # si FONDE con quelle di server.consumer
+```
+
+Da non confondere con `properties:`, che sono le proprietà **applicative** del processor (i campi
+`prop:` di Handler/Transformer). Cinque chiavi sono **rifiutate al boot** perché non sono default
+sovrascrivibili ma invarianti dell'engine: `bootstrap.servers`, `group.id`, `transactional.id`,
+`enable.auto.commit` (il commit è manuale, sempre) e `isolation.level` (ha un campo tipizzato, e in
+transform vale `read_committed`).
+
+### Preset Azure Event Hub
+
+Il gateway Kafka di Event Hub chiude le connessioni idle in modo aggressivo; questi tre valori
+evitano i timeout spuri (preset ereditato da `tpm-kafka-common`):
+
+```yaml
+server:
+  socket-keepalive-enable: true
+  metadata-max-age-ms: 180000
+  producer:
+    request-timeout-ms: 60000
+```
+
+## Errori e restart
+
+L'engine distingue **errori del client Kafka** — classificati dal driver, che è l'unico a vedere il
+tipo concreto — da **errori della business logic**. Alla prima categoria è assegnata una *severità*,
+che non è una scala di gravità ma un verbo: dice cosa deve fare l'engine.
+
+| Severità | Origine tipica | Azione dell'engine |
+|---|---|---|
+| `permanent` | credenziali errate, SASL non supportato, config rifiutata | **esce**: nessun retry può aiutare, va corretta la config |
+| `fatal` | fencing EOS, epoch invalido, errore `IsFatal()` | **ricostruisce** consumer/sessione dopo il backoff |
+| `retriable` | transport, tutti i broker giù, leader non disponibile | **ricostruisce** consumer/sessione dopo il backoff |
+| `abort` | il broker chiede l'abort della transazione (`TxnRequiresAbort`) | abortisce, **scarta il batch**, prosegue senza ricostruire |
+| `reset` | rebalance in corso, partizioni revocate, generation superata | **scarta il batch**, prosegue senza ricostruire |
+| `business` | errore risalito da `Handle`/`Transform` sotto `fail-fast` | **esce** (salvo `restart.on-business-error`) |
+
+Il restart in-process esiste perché il client non sopravvive a tutto: un fencing EOS o un broker che
+cade richiedono di **ricostruire** consumer e producer, non solo di riprovare la chiamata. Senza
+supervisione l'unico recovery è la morte del processo, che su un rolling restart dei broker diventa un
+CrashLoopBackOff. È per questo che `restart` sta in `server` e non in `consumer`: non è tuning di un
+client, è una decisione di esercizio del processo.
+
+```yaml
+server:
+  restart:
+    disabled: false          # true = comportamento storico: qualunque errore fa uscire il processo
+    max-attempts: 0          # 0 = illimitati
+    initial-backoff: 1s
+    max-backoff: 30s
+    multiplier: 2
+    reset-after: 2m          # un run sano più lungo di così azzera il contatore dei tentativi
+    on-business-error: false # vedi sotto
+processors:
+  - name: supporto
+    restart:
+      initial-backoff: 2s    # override di UN campo: max-attempts, max-backoff… restano dal globale
+      on-business-error: true
+```
+
+`on-business-error` resta **false** per default perché `on-error: fail-fast` documenta "non committa
+ed esce": riprovare in-process un record poison sarebbe un loop senza uscita. Va messo a `true` quando
+la causa attesa è un'infrastruttura applicativa transitoria (il DB irraggiungibile), non un payload
+malformato.
+
+### Offset e rebalance
+
+Il driver registra un rebalance callback sulla sottoscrizione, per una ragione di **correttezza**: alla
+revoca di una partizione gli offset già pollati ma non ancora elaborati vengono scartati e il batch in
+volo invalidato (`reset`). Confermarli significherebbe dichiarare elaborati record che nessuno ha
+elaborato, mentre il nuovo owner li sta rileggendo — cioè **perdere messaggi**. Scartandoli si ottiene
+un replay dal nuovo owner: duplicati, mai buchi. In EOS il batch viene abortito prima del commit.
+
+Il callback non chiama `Assign`/`Unassign`: se non riassegna, il client Kafka lo fa da sé scegliendo il
+protocollo giusto (`incremental_assign` quando il gruppo è `cooperative-sticky`, `assign` altrimenti).
+
+### Header dei record in DLQ
+
+Oltre al payload e agli header originali (la correlazione di trace sopravvive), i record instradati al
+DLQ portano:
+
+| Header | Contenuto |
+|---|---|
+| `corekafka-dlq-source-topic` / `-source-partition` / `-source-offset` | coordinate esatte del record originale |
+| `corekafka-dlq-source-timestamp` | timestamp del record (RFC3339Nano) |
+| `corekafka-dlq-processor` | nome del processor che lo ha scartato |
+| `corekafka-dlq-error` / `-error-at` | causa e istante dello scarto |
+| `Kafka-Delivery-Attempts` | contatore incrementale (nome ereditato da `tpm-kafka-common`): permette a chi riprocessa il DLQ di fermarsi |
 
 ## Metriche
 
 Registrate su Prometheus dall'engine (esposte da `core.NewServerMetrics` su `:2112/metrics`):
 
-| Metrica | Tipo |
-|---|---|
-| `corekafka_consumed_records_total` | counter |
-| `corekafka_processed_records_total` | counter |
-| `corekafka_produced_records_total` | counter |
-| `corekafka_deadlettered_records_total` | counter |
-| `corekafka_batch_duration_seconds` | histogram |
+| Metrica | Tipo | Label |
+|---|---|---|
+| `corekafka_consumed_records_total` | counter | `consumer` |
+| `corekafka_processed_records_total` | counter | `consumer` |
+| `corekafka_produced_records_total` | counter | `consumer` |
+| `corekafka_deadlettered_records_total` | counter | `consumer` |
+| `corekafka_batch_duration_seconds` | histogram | `consumer` |
+| `corekafka_consumer_restarts_total` | counter | `consumer`, `severity` |
+| `corekafka_batch_discarded_records_total` | counter | `consumer`, `reason` |
+
+`corekafka_consumer_restarts_total` che cresce senza che cresca `consumed_records_total` è il segnale
+che il backoff sta mascherando un guasto stabile — quello che, prima della supervisione, il processo
+rendeva evidente uscendo. `batch_discarded_records_total` misura i duplicati introdotti dagli eventi di
+protocollo (rebalance, abort).
 
 ```bash
 curl -s localhost:2112/metrics | grep corekafka_

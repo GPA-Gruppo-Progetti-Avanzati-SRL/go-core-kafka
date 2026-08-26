@@ -132,7 +132,7 @@ func RegisterHandler[T any, PT interface {
 	*T
 	Handler
 }](consumerName string, modes ...string) {
-	provideIfActive(consumerName, func(s spec.ConsumerSpec) {
+	provideIfActive(consumerName, func(s spec.ProcessorSpec) {
 		core.ProvideStruct(func(p *T) HandlerRegistration {
 			return HandlerRegistration{Consumer: consumerName, Handler: PT(p)}
 		}, owner(consumerName), s.Properties, HandlerGroup, modes...)
@@ -144,7 +144,7 @@ func RegisterTransformer[T any, PT interface {
 	*T
 	Transformer
 }](consumerName string, modes ...string) {
-	provideIfActive(consumerName, func(s spec.ConsumerSpec) {
+	provideIfActive(consumerName, func(s spec.ProcessorSpec) {
 		core.ProvideStruct(func(p *T) TransformerRegistration {
 			return TransformerRegistration{Consumer: consumerName, Transformer: PT(p)}
 		}, owner(consumerName), s.Properties, TransformerGroup, modes...)
@@ -174,9 +174,9 @@ func owner(consumerName string) string {
 // punto in cui l'app chiama Module — non prima (init) né dopo (main).
 // activeConsumers mappa nome->spec dei consumer attivi: serve lo spec (non il solo nome) perché il
 // wrapper di registrazione mappa le sue Properties sui campi `prop:` del processor (core.BindProps).
-var activeConsumers map[string]spec.ConsumerSpec // valido solo durante l'esecuzione sincrona di Apply; nil altrimenti
+var activeConsumers map[string]spec.ProcessorSpec // valido solo durante l'esecuzione sincrona di Apply; nil altrimenti
 
-func provideIfActive(consumerName string, provide func(spec.ConsumerSpec)) {
+func provideIfActive(consumerName string, provide func(spec.ProcessorSpec)) {
 	if activeConsumers == nil {
 		panic("corekafka: RegisterHandler/RegisterTransformer chiamata fuori dalla funzione passata a Module")
 	}
@@ -190,7 +190,7 @@ func provideIfActive(consumerName string, provide func(spec.ConsumerSpec)) {
 // Apply chiama register() con l'insieme dei consumer attivi disponibile a RegisterHandler/
 // RegisterTransformer: le chiamate al loro interno forniscono a fx solo i processor attivi. Chiamata
 // una sola volta da corekafka.Module.
-func Apply(register func(), active map[string]spec.ConsumerSpec, modes []string) {
+func Apply(register func(), active map[string]spec.ProcessorSpec, modes []string) {
 	if !core.IsMode(modes...) {
 		return // sottosistema non attivo in questo Mode: non fornire nulla
 	}

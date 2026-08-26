@@ -31,12 +31,25 @@ type (
 	Transformer = processor.Transformer
 	// PoisonRecords segnala all'engine i record poison da instradare a DLQ.
 	PoisonRecords = processor.PoisonRecords
-	// KafkaConfig è la connessione Kafka condivisa.
+	// KafkaConfig è la connessione Kafka condivisa più il tuning globale di consumer e producer.
 	KafkaConfig = spec.KafkaServer
-	// ConsumerSpec è la specifica di un singolo consumer.
-	ConsumerSpec = spec.ConsumerSpec
-	// Properties sono le proprietà applicative per-consumer (valori con il tipo YAML nativo). Il modo
-	// raccomandato per leggerle è il mapping sui campi della struct del consumer via tag `prop:`.
+	// ProcessorSpec è la specifica di un singolo processor (una voce di `processors`).
+	ProcessorSpec = spec.ProcessorSpec
+	// ConsumerSpec è il nome storico di ProcessorSpec.
+	//
+	// Deprecated: usare ProcessorSpec.
+	ConsumerSpec = spec.ProcessorSpec
+	// ConsumerTuning è il blocco `consumer`: si scrive in `server.consumer` e ogni processor può
+	// sovrascriverne i singoli campi nel proprio blocco omonimo.
+	ConsumerTuning = spec.ConsumerTuning
+	// ProducerTuning è il blocco `producer`: `server.producer` per il producer condiviso del
+	// processo, `processors[].producer` per il transazionale di un transform.
+	ProducerTuning = spec.ProducerTuning
+	// RestartSpec è il blocco `restart`: la supervisione del loop di consumo.
+	RestartSpec = spec.RestartSpec
+	// Properties sono le proprietà applicative per-processor (valori con il tipo YAML nativo). Il modo
+	// raccomandato per leggerle è il mapping sui campi della struct del processor via tag `prop:`.
+	// Da non confondere con `kafka-properties`, che sono le proprietà del client librdkafka.
 	// È core.Properties: stesso tipo e stesso meccanismo dei task di go-core-batch.
 	Properties = core.Properties
 	// Configurable è implementata da Handler/Transformer che vogliono le Properties all'avvio.
@@ -55,16 +68,17 @@ func DeadLetter(cause error, recs ...*Record) error {
 	return processor.DeadLetter(cause, recs...)
 }
 
-// BindProps mappa le properties di un consumer sui campi di target taggati `prop:` (con `default:` e
+// BindProps mappa le properties di un processor sui campi di target taggati `prop:` (con `default:` e
 // `validate:` per campo). È il meccanismo usato automaticamente da RegisterHandler/RegisterTransformer
 // sui campi dell'Handler/Transformer: serve solo per il percorso manuale (un Configure scritto a mano o
 // un costruttore passato a ProvideHandler/ProvideTransformer).
 func BindProps(target any, props Properties) error { return core.BindProps(target, props) }
 
-// PropertiesFromContext ritorna le Properties del consumer corrente (dentro Handle/Transform/Mapper).
+// PropertiesFromContext ritorna le Properties del processor corrente (dentro Handle/Transform/Mapper).
 func PropertiesFromContext(ctx context.Context) Properties { return spec.PropertiesFromContext(ctx) }
 
-// ConsumerNameFromContext ritorna il nome del consumer corrente.
+// ConsumerNameFromContext ritorna il nome del processor corrente (la chiave di join con la voce di
+// `processors` e con RegisterHandler/RegisterTransformer).
 func ConsumerNameFromContext(ctx context.Context) string { return spec.ConsumerNameFromContext(ctx) }
 
 // Costanti della policy on-error (la modalità handle/transform è derivata dalla registrazione, non

@@ -3,9 +3,9 @@ package confluentdriver
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
@@ -14,37 +14,46 @@ import (
 // consumer group (auto-commit off, read_committed) e produce con un producer transazionale; Commit
 // invia gli offset consumati e committa la transazione atomicamente.
 type transactSession struct {
-	c       *kafka.Consumer
-	p       *kafka.Producer
-	offsets *offsetTracker
-	inited  bool
+	c           *kafka.Consumer
+	p           *kafka.Producer
+	offsets     *offsetTracker
+	rb          *rebalanceObserver
+	initTimeout time.Duration
+	inited      bool
 }
 
-// Poll ritorna il prossimo messaggio o (nil, nil) allo scadere del timeout.
+// Poll ritorna il prossimo messaggio, (nil, nil) allo scadere del timeout, o SeverityReset dopo un
+// rebalance (stessa semantica di groupConsumer.Poll).
 func (t *transactSession) Poll(_ context.Context, timeout time.Duration) (*message.Record, error) {
 	msg, err := t.c.ReadMessage(timeout)
 	if err != nil {
 		var ke kafka.Error
 		if errors.As(err, &ke) && ke.Code() == kafka.ErrTimedOut {
+			if t.rb.takeRevoked() {
+				return nil, driver.NewError(driver.SeverityReset, "poll", errRebalanced)
+			}
 			return nil, nil
 		}
-		return nil, err
+		return nil, wrap("poll", err)
+	}
+	if t.rb.takeRevoked() {
+		return nil, driver.NewError(driver.SeverityReset, "poll", errRebalanced)
 	}
 	t.offsets.track(msg.TopicPartition)
 	return toRecord(msg), nil
 }
 
-// Begin apre una transazione (init lazy al primo Begin).
+// Begin apre una transazione (init lazy al primo Begin, col timeout dello spec).
 func (t *transactSession) Begin() error {
 	if !t.inited {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), t.initTimeout)
 		defer cancel()
 		if err := t.p.InitTransactions(ctx); err != nil {
-			return fmt.Errorf("confluentdriver: InitTransactions: %w", err)
+			return wrap("init-transactions", err)
 		}
 		t.inited = true
 	}
-	return t.p.BeginTransaction()
+	return wrap("begin-transaction", t.p.BeginTransaction())
 }
 
 // Produce invia i record di output nella transazione corrente e verifica i delivery report prima del
@@ -56,13 +65,13 @@ func (t *transactSession) Produce(_ context.Context, recs []*message.ProducerRec
 	deliveryChan := make(chan kafka.Event, len(recs))
 	for _, r := range recs {
 		if err := t.p.Produce(toMessage(r), deliveryChan); err != nil {
-			return fmt.Errorf("confluentdriver: Produce (tx): %w", err)
+			return wrap("produce", err)
 		}
 	}
 	for range recs {
 		ev := <-deliveryChan
 		if m, ok := ev.(*kafka.Message); ok && m.TopicPartition.Error != nil {
-			return fmt.Errorf("confluentdriver: delivery (tx): %w", m.TopicPartition.Error)
+			return wrap("delivery", m.TopicPartition.Error)
 		}
 	}
 	return nil
@@ -72,15 +81,15 @@ func (t *transactSession) Produce(_ context.Context, recs []*message.ProducerRec
 func (t *transactSession) Commit(ctx context.Context) error {
 	meta, err := t.c.GetConsumerGroupMetadata()
 	if err != nil {
-		return fmt.Errorf("confluentdriver: GetConsumerGroupMetadata: %w", err)
+		return wrap("group-metadata", err)
 	}
 	if !t.offsets.empty() {
 		if err := t.p.SendOffsetsToTransaction(ctx, t.offsets.commitOffsets(), meta); err != nil {
-			return fmt.Errorf("confluentdriver: SendOffsetsToTransaction: %w", err)
+			return wrap("send-offsets", err)
 		}
 	}
 	if err := t.p.CommitTransaction(ctx); err != nil {
-		return fmt.Errorf("confluentdriver: CommitTransaction: %w", err)
+		return wrap("commit-transaction", err)
 	}
 	t.offsets.reset()
 	return nil
@@ -89,7 +98,7 @@ func (t *transactSession) Commit(ctx context.Context) error {
 // Abort annulla la transazione corrente; gli offset non vengono committati (replay).
 func (t *transactSession) Abort(ctx context.Context) error {
 	t.offsets.reset()
-	return t.p.AbortTransaction(ctx)
+	return wrap("abort-transaction", t.p.AbortTransaction(ctx))
 }
 
 func (t *transactSession) Close() error {

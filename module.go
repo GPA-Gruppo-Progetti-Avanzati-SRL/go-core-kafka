@@ -51,7 +51,7 @@ func WithModule(m ...ModuleFunc) Option {
 // i modes.
 //
 // È un core.ModuleClosed: Kafka è un sottosistema chiuso — consuma i seam dell'app (Handler e
-// Transformer) e non le espone nulla in cambio, quindi spec.KafkaServer, []spec.ConsumerSpec,
+// Transformer) e non le espone nulla in cambio, quindi spec.KafkaServer, []spec.ProcessorSpec,
 // driver.Factory, *producer.Producer e *consumer.Consumers sono privati al modulo. Gli Handler
 // restano forniti a root: il value group li porta dentro il modulo (root → discendenti), mentre le
 // loro dipendenze applicative sono risolte a root come sempre.
@@ -61,14 +61,18 @@ func Module(cfg *Config, register func(), opts ...Option) {
 		opt(&o)
 	}
 
-	// Solo i processor dei consumer ATTIVI (presenti nella lista `consumers` e non disabled) vengono
-	// forniti a fx, così le dipendenze di un consumer spento (es. il data layer Mongo) non entrano nel
-	// grafo e non vengono mai connesse. Fatto fuori dallo scope core.ModuleClosed("kafka") perché i processor
-	// sono sempre stati forniti a root e il value group aggrega comunque root + modulo (l'engine li vede
-	// lo stesso). register() gira sincronamente qui dentro: RegisterHandler/RegisterTransformer forniscono
-	// subito a fx solo i consumer attivi, nessuna finestra temporale con l'esterno.
-	active := make(map[string]spec.ConsumerSpec, len(cfg.Consumers))
-	for _, s := range cfg.Consumers {
+	// Solo i processor ATTIVI (presenti nella lista `processors` e non disabled) vengono forniti a fx,
+	// così le dipendenze di un processor spento (es. il data layer Mongo) non entrano nel grafo e non
+	// vengono mai connesse. Fatto fuori dallo scope core.ModuleClosed("kafka") perché i processor sono
+	// sempre stati forniti a root e il value group aggrega comunque root + modulo (l'engine li vede lo
+	// stesso). register() gira sincronamente qui dentro: RegisterHandler/RegisterTransformer forniscono
+	// subito a fx solo i processor attivi, nessuna finestra temporale con l'esterno.
+	//
+	// Qui gli spec servono grezzi: `properties` non è ereditabile, quindi il blocco globale non
+	// aggiungerebbe nulla al binding dei campi `prop:`.
+	specs := cfg.processors()
+	active := make(map[string]spec.ProcessorSpec, len(specs))
+	for _, s := range specs {
 		if !s.Disabled {
 			active[s.Name] = s
 		}
@@ -77,17 +81,24 @@ func Module(cfg *Config, register func(), opts ...Option) {
 
 	core.ModuleClosed("kafka", func() {
 		core.Supply(cfg.Kafka, o.modes...)
-		core.Supply(cfg.Consumers, o.modes...)
+		core.Supply(cfg.Kafka.Producer, o.modes...)
+		core.Supply(specs, o.modes...)
 
 		provideDriver(o.modes...)
 
 		needDLQ := o.producer
-		for _, s := range cfg.Consumers {
+		for _, raw := range specs {
 			// Il Producer condiviso (non transazionale) serve al DLQ della modalità handle. A questo
 			// punto (wiring) la modalità non è ancora nota (dipende dalla registrazione fx), quindi lo
-			// abilitiamo per qualsiasi spec ATTIVO con deadletter-topic: un eventuale consumer transform
-			// lo lascerebbe inutilizzato (il transform produce il DLQ nella sua sessione EOS).
-			if !s.Disabled && s.HasDeadletter() {
+			// abilitiamo per qualsiasi spec ATTIVO con deadletter-topic; un eventuale processor
+			// transform lo lascerebbe inutilizzato (il transform produce il DLQ nella sua sessione EOS).
+			//
+			// Il controllo gira sullo spec RISOLTO perché `deadletter-topic` è ereditabile: un
+			// processor che lo prende da `server.consumer` non lo ha scritto su di sé, ma il Producer
+			// gli serve lo stesso — altrimenti l'engine fallirebbe al boot chiedendolo. È l'unico
+			// punto del wiring che deve guardare i valori ereditati; la risoluzione vera, quella che
+			// l'engine usa, la fa consumer.NewConsumers.
+			if !raw.Disabled && raw.Resolve(cfg.Kafka).HasDeadletter() {
 				needDLQ = true
 			}
 		}

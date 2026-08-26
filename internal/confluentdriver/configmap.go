@@ -1,48 +1,108 @@
 package confluentdriver
 
 import (
+	"sort"
+
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/rs/zerolog/log"
 )
 
-// consumerConfigMap traduce KafkaConfig + ConsumerSpec nella kafka.ConfigMap del consumer.
-// enable.auto.commit è sempre false: il commit degli offset è manuale (dopo l'handle, o dentro la
-// transazione EOS). read_committed per la modalità transform è impostato da NewTransactSession.
-func consumerConfigMap(s spec.ConsumerSpec, k spec.KafkaServer) *kafka.ConfigMap {
+// Regola di tutto questo file: un knob NON valorizzato non viene scritto nella ConfigMap, così resta
+// il default di librdkafka. Scrivere lo zero al posto di omettere la chiave significherebbe imporre
+// "0" a proprietà dove zero è un valore legittimo e molto diverso dal default.
+
+// consumerConfigMap traduce KafkaServer + ProcessorSpec nella kafka.ConfigMap del consumer. Lo spec
+// arriva GIÀ RISOLTO (ProcessorSpec.Resolve): il tuning sta in s.Consumer e qui non si conosce
+// l'eredità. enable.auto.commit è sempre false: il commit degli offset è manuale (dopo l'handle, o
+// dentro la transazione EOS) e non è configurabile — vedi spec.DeniedKafkaProperties.
+func consumerConfigMap(s spec.ProcessorSpec, k spec.KafkaServer) *kafka.ConfigMap {
+	c := s.Consumer
 	cm := &kafka.ConfigMap{
 		"bootstrap.servers":  k.BootstrapServers,
 		"group.id":           s.GroupID,
 		"enable.auto.commit": false,
-		"auto.offset.reset":  s.AutoOffsetReset,
+		"auto.offset.reset":  c.AutoOffsetReset,
 	}
-	if s.SessionTimeoutMs > 0 {
-		_ = cm.SetKey("session.timeout.ms", s.SessionTimeoutMs)
+	typed := map[string]any{
+		"session.timeout.ms":            c.SessionTimeoutMs,
+		"heartbeat.interval.ms":         c.HeartbeatIntervalMs,
+		"fetch.min.bytes":               c.FetchMinBytes,
+		"fetch.max.bytes":               c.FetchMaxBytes,
+		"fetch.wait.max.ms":             c.FetchWaitMaxMs,
+		"max.partition.fetch.bytes":     c.MaxPartitionFetchBytes,
+		"queued.max.messages.kbytes":    c.QueuedMaxMessagesKbytes,
+		"max.poll.interval.ms":          c.MaxPollIntervalMs,
+		"partition.assignment.strategy": c.PartitionAssignmentStrategy,
+		"isolation.level":               c.IsolationLevel,
 	}
-	if s.FetchMinBytes > 0 {
-		_ = cm.SetKey("fetch.min.bytes", s.FetchMinBytes)
-	}
-	if s.FetchMaxBytes > 0 {
-		_ = cm.SetKey("fetch.max.bytes", s.FetchMaxBytes)
-	}
-	if s.MaxPollIntervalMs > 0 {
-		_ = cm.SetKey("max.poll.interval.ms", s.MaxPollIntervalMs)
-	}
+	setIfSet(cm, typed)
+	applyCommon(cm, k)
 	applySecurity(cm, k)
+	// Escape hatch: prima quello della connessione (comune a consumer e producer), poi quello del
+	// processor — già fuso con `server.consumer` da ConsumerTuning.inherit — che è il più specifico
+	// e quindi l'ultimo a scrivere.
+	applyKafkaProperties(cm, "server", k.KafkaProperties)
+	applyKafkaProperties(cm, "processor "+s.Name, c.KafkaProperties)
 	return cm
 }
 
-// producerConfigMap traduce KafkaConfig nella kafka.ConfigMap del producer. Il producer è sempre
-// idempotente; se transactionalID != "" diventa transazionale (EOS).
-func producerConfigMap(transactionalID string, k spec.KafkaServer) *kafka.ConfigMap {
-	cm := &kafka.ConfigMap{
-		"bootstrap.servers":  k.BootstrapServers,
-		"enable.idempotence": true,
-	}
+// producerConfigMap traduce KafkaServer + ProducerTuning nella kafka.ConfigMap del producer. owner
+// identifica la sezione nei log (`server.producer` per quello condiviso, `processor <nome>` per il
+// transazionale di un transform). Se transactionalID != "" il producer è transazionale (EOS) e
+// l'idempotenza è implicita.
+func producerConfigMap(transactionalID, owner string, p spec.ProducerTuning, k spec.KafkaServer) *kafka.ConfigMap {
+	cm := &kafka.ConfigMap{"bootstrap.servers": k.BootstrapServers}
+
 	if transactionalID != "" {
 		_ = cm.SetKey("transactional.id", transactionalID)
+		if p.TransactionTimeoutMs > 0 {
+			_ = cm.SetKey("transaction.timeout.ms", p.TransactionTimeoutMs)
+		}
+	} else {
+		// enable.idempotence forza acks=all e il retry ordinato: è il default storico di
+		// go-core-kafka, disattivabile solo esplicitamente.
+		_ = cm.SetKey("enable.idempotence", p.Idempotent())
 	}
+
+	typed := map[string]any{
+		"acks":                                  p.Acks,
+		"compression.type":                      p.CompressionType,
+		"batch.size":                            p.BatchSize,
+		"batch.num.messages":                    p.BatchNumMessages,
+		"message.max.bytes":                     p.MessageMaxBytes,
+		"message.send.max.retries":              p.MessageSendMaxRetries,
+		"max.in.flight.requests.per.connection": p.MaxInFlight,
+		"request.timeout.ms":                    p.RequestTimeoutMs,
+		"metadata.max.idle.ms":                  p.MetadataMaxIdleMs,
+		"retry.backoff.ms":                      int(p.RetryBackoff.Milliseconds()),
+		"delivery.timeout.ms":                   int(p.DeliveryTimeout.Milliseconds()),
+	}
+	setIfSet(cm, typed)
+	// linger.ms è un *int proprio per poter impostare 0 (invia subito): setIfSet lo scarterebbe.
+	if p.LingerMs != nil {
+		_ = cm.SetKey("linger.ms", *p.LingerMs)
+	}
+
+	applyCommon(cm, k)
 	applySecurity(cm, k)
+	applyKafkaProperties(cm, "server", k.KafkaProperties)
+	applyKafkaProperties(cm, owner, p.KafkaProperties)
 	return cm
+}
+
+// applyCommon imposta le proprietà di connessione comuni a consumer e producer.
+func applyCommon(cm *kafka.ConfigMap, k spec.KafkaServer) {
+	setIfSet(cm, map[string]any{
+		"client.id":               k.ClientID,
+		"debug":                   k.Debug,
+		"metadata.max.age.ms":     k.MetadataMaxAgeMs,
+		"connections.max.idle.ms": k.ConnectionsMaxIdleMs,
+	})
+	// socket.keepalive.enable si imposta solo se true: false è già il default.
+	if k.SocketKeepaliveEnable {
+		_ = cm.SetKey("socket.keepalive.enable", true)
+	}
 }
 
 // applySecurity mappa security-protocol / SASL / TLS sulle chiavi dotted di librdkafka.
@@ -55,10 +115,58 @@ func applySecurity(cm *kafka.ConfigMap, k spec.KafkaServer) {
 		_ = cm.SetKey("sasl.username", k.SASL.Username)
 		_ = cm.SetKey("sasl.password", k.SASL.Password)
 	}
-	if k.SSL.CaLocation != "" {
-		_ = cm.SetKey("ssl.ca.location", k.SSL.CaLocation)
-	}
+	setIfSet(cm, map[string]any{
+		"ssl.ca.location": k.SSL.CaLocation,
+		// mTLS: il broker autentica anche il client tramite questo certificato.
+		"ssl.certificate.location": k.SSL.CertificateLocation,
+		"ssl.key.location":         k.SSL.KeyLocation,
+		"ssl.key.password":         k.SSL.KeyPassword,
+	})
 	if k.SSL.SkipVerify {
 		_ = cm.SetKey("enable.ssl.certificate.verification", false)
+	}
+}
+
+// applyKafkaProperties riversa nella ConfigMap le chiavi dotted date as-is dalla config. È l'ULTIMA
+// scrittura, quindi vince sui campi tipizzati: è l'escape hatch, non un default. Una sovrascrittura è
+// loggata a Warn perché avere lo stesso valore configurato in due posti (il campo tipizzato e la
+// mappa raw) è quasi sempre un residuo, non un'intenzione.
+//
+// Le chiavi riservate non arrivano qui: sono rifiutate al boot da spec.ValidateKafkaProperties. La
+// normalizzazione (lowercase + trim) è quella di spec, la stessa usata dal controllo: se divergessero,
+// una chiave scritta " Group.ID " passerebbe il controllo e verrebbe poi applicata comunque.
+func applyKafkaProperties(cm *kafka.ConfigMap, owner string, props map[string]string) {
+	keys, normalized := spec.NormalizeKafkaProperties(props)
+	for _, key := range keys {
+		if prev, err := cm.Get(key, nil); err == nil && prev != nil {
+			log.Warn().Str("owner", owner).Str("property", key).
+				Interface("overridden", prev).Str("value", normalized[key]).
+				Msg("corekafka: kafka-properties sovrascrive una proprietà già impostata dalla config tipizzata")
+		}
+		_ = cm.SetKey(key, normalized[key])
+	}
+}
+
+// setIfSet scrive solo le chiavi con un valore non-zero: stringa non vuota, int > 0. Uno zero
+// significa "campo non valorizzato" e va lasciato al default di librdkafka (vedi il commento in
+// testa al file).
+func setIfSet(cm *kafka.ConfigMap, values map[string]any) {
+	keys := make([]string, 0, len(values))
+	for k := range values {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	for _, k := range keys {
+		switch v := values[k].(type) {
+		case string:
+			if v != "" {
+				_ = cm.SetKey(k, v)
+			}
+		case int:
+			if v > 0 {
+				_ = cm.SetKey(k, v)
+			}
+		}
 	}
 }
