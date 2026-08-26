@@ -31,8 +31,10 @@ func WithModes(modes ...string) Option {
 	return func(o *options) { o.modes = modes }
 }
 
-// WithProducer abilita esplicitamente il Producer pubblico. Viene comunque abilitato in automatico se
-// almeno un consumer usa on-error=deadletter (serve per il DLQ).
+// WithProducer forza la costruzione del Producer interno anche quando nessuno spec ha un
+// deadletter-topic (in quel caso è già abilitato in automatico, serve per il DLQ). Il Producer è
+// privato al sottosistema — vedi Module — quindi l'Option non lo rende iniettabile dall'app: un
+// consumer che deve produrre lo fa con un Transformer (EOS Kafka→Kafka), che è il seam previsto.
 func WithProducer() Option {
 	return func(o *options) { o.producer = true }
 }
@@ -47,6 +49,12 @@ func WithModule(m ...ModuleFunc) Option {
 // connessione e la lista consumer (core.Supply), la driver.Factory (provideDriver), l'eventuale
 // Producer/DLQ e i backend iniettati, poi registra e avvia l'engine. Il gating è per-registrazione via
 // i modes.
+//
+// È un core.ModuleClosed: Kafka è un sottosistema chiuso — consuma i seam dell'app (Handler e
+// Transformer) e non le espone nulla in cambio, quindi spec.KafkaServer, []spec.ConsumerSpec,
+// driver.Factory, *producer.Producer e *consumer.Consumers sono privati al modulo. Gli Handler
+// restano forniti a root: il value group li porta dentro il modulo (root → discendenti), mentre le
+// loro dipendenze applicative sono risolte a root come sempre.
 func Module(cfg *Config, register func(), opts ...Option) {
 	var o options
 	for _, opt := range opts {
@@ -55,7 +63,7 @@ func Module(cfg *Config, register func(), opts ...Option) {
 
 	// Solo i processor dei consumer ATTIVI (presenti nella lista `consumers` e non disabled) vengono
 	// forniti a fx, così le dipendenze di un consumer spento (es. il data layer Mongo) non entrano nel
-	// grafo e non vengono mai connesse. Fatto fuori dallo scope core.Module("kafka") perché i processor
+	// grafo e non vengono mai connesse. Fatto fuori dallo scope core.ModuleClosed("kafka") perché i processor
 	// sono sempre stati forniti a root e il value group aggrega comunque root + modulo (l'engine li vede
 	// lo stesso). register() gira sincronamente qui dentro: RegisterHandler/RegisterTransformer forniscono
 	// subito a fx solo i consumer attivi, nessuna finestra temporale con l'esterno.
@@ -67,7 +75,7 @@ func Module(cfg *Config, register func(), opts ...Option) {
 	}
 	processor.Apply(register, active, o.modes)
 
-	core.Module("kafka", func() {
+	core.ModuleClosed("kafka", func() {
 		core.Supply(cfg.Kafka, o.modes...)
 		core.Supply(cfg.Consumers, o.modes...)
 

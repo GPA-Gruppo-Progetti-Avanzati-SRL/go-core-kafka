@@ -241,9 +241,18 @@ func init() {
 `Module` ha firma `Module(cfg *Config, register func(), opts ...Option)`: `register` è il riferimento
 alla funzione dell'app, chiamato da `Module` stesso — non un side-effect implicito da qualche `init()`.
 
-Opzioni di `Module`: `WithModes(...)` (gate per `core.Mode`), `WithProducer()` (Producer pubblico
-esplicito — è comunque auto-abilitato se almeno uno spec attivo ha `deadletter-topic`),
-`WithModule(...)` (componenti extra come `ModuleFunc`, gate-ati sugli stessi modes).
+Opzioni di `Module`: `WithModes(...)` (gate per `core.Mode`), `WithProducer()` (forza la costruzione
+del Producer interno anche se nessuno spec attivo ha `deadletter-topic`, caso in cui è già
+auto-abilitato per il DLQ), `WithModule(...)` (componenti extra come `ModuleFunc`, gate-ati sugli
+stessi modes).
+
+Le registrazioni stanno in un `core.ModuleClosed("kafka")`: Kafka è un **sottosistema chiuso** —
+consuma i seam dell'app (`Handler`/`Transformer`) e non le espone nulla in cambio, quindi
+`spec.KafkaServer`, `[]spec.ConsumerSpec`, `driver.Factory`, `*producer.Producer` e
+`*consumer.Consumers` sono privati al modulo e non iniettabili dal grafo dell'app. Gli Handler
+restano forniti a root: il value group li porta dentro il modulo, e le loro dipendenze applicative
+sono risolte a root come sempre. Un consumer che deve produrre lo fa con un `Transformer` (EOS
+Kafka→Kafka), che è il seam previsto.
 
 ### Solo i consumer attivi entrano nel grafo fx
 
