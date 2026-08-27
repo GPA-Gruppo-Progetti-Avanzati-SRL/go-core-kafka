@@ -13,6 +13,7 @@ import (
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/processor"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/producer"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 	"go.uber.org/fx"
 )
@@ -90,7 +91,9 @@ func (f *fakeGroupConsumer) Close() error {
 type fakeFactory struct {
 	mu        sync.Mutex
 	consumers []driver.GroupConsumer
-	errs      []error // errore di creazione per tentativo (prevale sul consumer di pari indice)
+	sessions  []driver.TransactSession // modalità transform
+	producers []driver.Producer        // producer condiviso del DLQ
+	errs      []error                  // errore di creazione per tentativo (prevale sul consumer di pari indice)
 	calls     int
 }
 
@@ -111,11 +114,28 @@ func (f *fakeFactory) NewGroupConsumer(spec.ProcessorSpec, spec.KafkaServer) (dr
 }
 
 func (f *fakeFactory) NewTransactSession(spec.ProcessorSpec, spec.KafkaServer) (driver.TransactSession, error) {
-	return nil, errors.New("non usata in questi test")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	i := f.calls
+	f.calls++
+	if i < len(f.errs) && f.errs[i] != nil {
+		return nil, f.errs[i]
+	}
+	if i < len(f.sessions) {
+		return f.sessions[i], nil
+	}
+	return nil, errFactoryExhausted
 }
 
 func (f *fakeFactory) NewProducer(spec.KafkaServer, spec.ProducerTuning) (driver.Producer, error) {
-	return nil, errors.New("non usata in questi test")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.producers) == 0 {
+		return nil, errors.New("nessun producer configurato in questo test")
+	}
+	p := f.producers[0]
+	f.producers = f.producers[1:]
+	return p, nil
 }
 
 func (f *fakeFactory) callCount() int {
@@ -852,5 +872,463 @@ func TestResolveTopics_SenzaDestinazione(t *testing.T) {
 	// richiede alcun default: pretenderlo al boot vieterebbe il caso d'uso.
 	if err := senzaDefault.resolveTopics([]*message.ProducerRecord{{Topic: "a"}, {Topic: "b"}}); err != nil {
 		t.Errorf("fan-out con Topic su ogni record = %v, atteso nil", err)
+	}
+}
+
+// --- fake sessione EOS -------------------------------------------------------------------------
+//
+// La modalità transform non aveva alcun test: fakeFactory non sapeva costruire una sessione, quindi
+// runTransform, transformFlusher.flush, dlqRecords e resolveTopics erano a copertura zero — cioè
+// tutto il percorso EOS e l'intera consegna al DLQ. È l'asimmetria che la fusione dei due loop di
+// consumo doveva prevenire: le due modalità sono già divergite una volta (l'ordine di valutazione
+// dell'esito, poi unificato in classify), e la protezione contro una nuova divergenza è il test.
+//
+// Ciò che questo fake permette di verificare non è "produce i record giusti" ma l'ORDINE delle
+// operazioni, che in EOS È la garanzia: output, record DLQ e offset consumati devono stare nella
+// STESSA transazione, e un errore in qualunque punto deve abortire senza mai arrivare al commit.
+type fakeTransactSession struct {
+	mu      sync.Mutex
+	events  []pollEvent
+	i       int
+	exhaust error
+
+	// errori iniettabili per fase: è il modo di produrre a comando un fencing o un broker che cade.
+	beginErr, produceErr, commitErr error
+
+	produced []*message.ProducerRecord // tutti i record passati a Produce, in ordine
+	ops      []string                  // begin/produce/commit/abort/discard
+	closed   bool
+}
+
+func (f *fakeTransactSession) Poll(context.Context, time.Duration) (*message.Record, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.i >= len(f.events) {
+		return nil, f.exhaust
+	}
+	e := f.events[f.i]
+	f.i++
+	return e.rec, e.err
+}
+
+func (f *fakeTransactSession) Begin(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = append(f.ops, "begin")
+	return f.beginErr
+}
+
+func (f *fakeTransactSession) Produce(_ context.Context, recs []*message.ProducerRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = append(f.ops, "produce")
+	if f.produceErr != nil {
+		return f.produceErr
+	}
+	f.produced = append(f.produced, recs...)
+	return nil
+}
+
+func (f *fakeTransactSession) Commit(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = append(f.ops, "commit")
+	return f.commitErr
+}
+
+func (f *fakeTransactSession) Abort(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = append(f.ops, "abort")
+	return nil
+}
+
+func (f *fakeTransactSession) Discard(context.Context) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = append(f.ops, "discard")
+}
+
+func (f *fakeTransactSession) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = true
+	return nil
+}
+
+func (f *fakeTransactSession) sequence() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.ops...)
+}
+
+func (f *fakeTransactSession) sent() []*message.ProducerRecord {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*message.ProducerRecord(nil), f.produced...)
+}
+
+// transformerFunc adatta una funzione al contratto Transformer.
+type transformerFunc func(context.Context, []*message.Record) ([]*message.ProducerRecord, error)
+
+func (t transformerFunc) Transform(ctx context.Context, b []*message.Record) ([]*message.ProducerRecord, error) {
+	return t(ctx, b)
+}
+
+// transformSpec: come testSpec ma per la modalità EOS, con la supervisione disattivata perché questi
+// test verificano UN ciclo di flush, non la politica di riavvio (che ha già i suoi test).
+func transformSpec() spec.ProcessorSpec {
+	s := spec.ProcessorSpec{
+		Name: "tx", GroupID: "g", Topics: []string{"in"},
+		TransactionalID: "tx-1", DefaultOutputTopic: "out",
+	}
+	s.Consumer.MaxBatchSize = 2
+	s.Restart = spec.RestartSpec{Disabled: ptr(true)}
+	return s.Resolve(spec.KafkaServer{})
+}
+
+// txRunner costruisce il runner transform e la sessione che gli verrà consegnata. exhaust è
+// l'errore con cui il loop termina in modo controllato dopo aver consumato gli eventi.
+func txRunner(s spec.ProcessorSpec, tr processor.Transformer, events []pollEvent) (*runner, *fakeTransactSession) {
+	sess := &fakeTransactSession{
+		events:  events,
+		exhaust: driver.NewError(driver.SeverityPermanent, "poll", errors.New("fine eventi")),
+	}
+	return &runner{spec: s, factory: &fakeFactory{sessions: []driver.TransactSession{sess}}, transformer: tr}, sess
+}
+
+func opsEqual(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// --- modalità transform (EOS) ------------------------------------------------------------------
+
+func TestRunTransform_OrdineEOS(t *testing.T) {
+	// L'invariante della modalità: Begin PRIMA di produrre, Commit DOPO, e nulla in mezzo che possa
+	// rendere definitivo un pezzo senza l'altro.
+	r, sess := txRunner(transformSpec(),
+		transformerFunc(func(_ context.Context, b []*message.Record) ([]*message.ProducerRecord, error) {
+			out := make([]*message.ProducerRecord, 0, len(b))
+			for _, rr := range b {
+				out = append(out, &message.ProducerRecord{Value: rr.Value}) // senza Topic: prende il default
+			}
+			return out, nil
+		}),
+		[]pollEvent{{rec: rec("in", 0, 1)}, {rec: rec("in", 0, 2)}})
+
+	_ = r.run(context.Background())
+
+	if got := sess.sequence(); !opsEqual(got, []string{"begin", "produce", "commit"}) {
+		t.Errorf("sequenza = %v, attesa [begin produce commit]", got)
+	}
+	sent := sess.sent()
+	if len(sent) != 2 {
+		t.Fatalf("record prodotti = %d, attesi 2", len(sent))
+	}
+	for _, p := range sent {
+		if p.Topic != "out" {
+			t.Errorf("Topic = %q, atteso il default-output-topic", p.Topic)
+		}
+	}
+	if !sess.closed {
+		t.Error("la sessione non è stata chiusa all'uscita dal loop")
+	}
+}
+
+func TestRunTransform_DeadLetterNellaStessaTransazione(t *testing.T) {
+	// È il punto per cui la modalità transform esiste: output "buoni" e record poison finiscono nella
+	// STESSA transazione degli offset. Due Produce separati, o un Commit fra i due, romperebbero
+	// l'esattamente-una-volta senza che nulla lo segnali.
+	s := transformSpec()
+	dlq := "tx.DLQ"
+	s.Consumer.DeadletterTopic = &dlq
+
+	r, sess := txRunner(s,
+		transformerFunc(func(_ context.Context, b []*message.Record) ([]*message.ProducerRecord, error) {
+			// Il primo record è buono, il secondo è poison.
+			return []*message.ProducerRecord{{Topic: "out", Value: b[0].Value}},
+				processor.DeadLetter(errors.New("payload illeggibile"), b[1])
+		}),
+		[]pollEvent{{rec: rec("in", 0, 1)}, {rec: rec("in", 0, 2)}})
+
+	_ = r.run(context.Background())
+
+	if got := sess.sequence(); !opsEqual(got, []string{"begin", "produce", "commit"}) {
+		t.Fatalf("sequenza = %v, attesa [begin produce commit]: il DLQ deve stare nella transazione", got)
+	}
+	sent := sess.sent()
+	if len(sent) != 2 {
+		t.Fatalf("record prodotti = %d, attesi 2 (output + DLQ) in un solo Produce", len(sent))
+	}
+	if sent[0].Topic != "out" || sent[1].Topic != dlq {
+		t.Errorf("topic prodotti = [%q %q], attesi [out %s]", sent[0].Topic, sent[1].Topic, dlq)
+	}
+	// La causa del record poison deve arrivare a chi legge il DLQ.
+	if got := sent[1].Headers.Get(HeaderDLQError); got != "payload illeggibile" {
+		t.Errorf("header %s = %q, attesa la causa del record", HeaderDLQError, got)
+	}
+	if got := sent[1].Headers.Get(HeaderDLQProcessor); got != "tx" {
+		t.Errorf("header %s = %q, atteso il nome del processor", HeaderDLQProcessor, got)
+	}
+}
+
+func TestRunTransform_DeadLetterSenzaTopicAbortisce(t *testing.T) {
+	// DeadLetter richiesto ma nessun deadletter-topic: i record non hanno dove andare. Committare
+	// sarebbe una perdita silenziosa, quindi si abortisce e l'errore risale (replay).
+	r, sess := txRunner(transformSpec(),
+		transformerFunc(func(_ context.Context, b []*message.Record) ([]*message.ProducerRecord, error) {
+			return nil, processor.DeadLetter(errors.New("poison"), b[0])
+		}),
+		[]pollEvent{{rec: rec("in", 0, 1)}, {rec: rec("in", 0, 2)}})
+
+	err := r.run(context.Background())
+	if err == nil {
+		t.Fatal("atteso errore: un DeadLetter senza topic non deve committare")
+	}
+	if got := sess.sequence(); !opsEqual(got, []string{"begin", "abort"}) {
+		t.Errorf("sequenza = %v, attesa [begin abort]: niente produce, niente commit", got)
+	}
+}
+
+// Ogni fase può fallire, e in tutte l'esito deve essere lo stesso: abortire senza mai committare.
+// Tabellato perché è UNA regola, e tre rami che la implementano tre volte sono tre modi di sbagliarla.
+func TestRunTransform_OgniErroreAbortisceSenzaCommit(t *testing.T) {
+	boom := errors.New("broker giù")
+	tests := []struct {
+		name    string
+		inject  func(*fakeTransactSession)
+		tErr    error
+		wantOps []string
+	}{
+		{"Transform fallisce", nil, boom, []string{"begin", "abort"}},
+		{"Produce fallisce", func(s *fakeTransactSession) { s.produceErr = boom }, nil, []string{"begin", "produce", "abort"}},
+		{"Commit fallisce", func(s *fakeTransactSession) { s.commitErr = boom }, nil, []string{"begin", "produce", "commit", "abort"}},
+		// Begin fallito non apre nulla: abortire darebbe un errore di stato invalido al posto di un no-op.
+		{"Begin fallisce", func(s *fakeTransactSession) { s.beginErr = boom }, nil, []string{"begin"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r, sess := txRunner(transformSpec(),
+				transformerFunc(func(_ context.Context, b []*message.Record) ([]*message.ProducerRecord, error) {
+					return []*message.ProducerRecord{{Topic: "out", Value: b[0].Value}}, tc.tErr
+				}),
+				[]pollEvent{{rec: rec("in", 0, 1)}, {rec: rec("in", 0, 2)}})
+			if tc.inject != nil {
+				tc.inject(sess)
+			}
+
+			if err := r.run(context.Background()); err == nil {
+				t.Fatal("atteso errore risalito")
+			}
+			got := sess.sequence()
+			if !opsEqual(got, tc.wantOps) {
+				t.Errorf("sequenza = %v, attesa %v", got, tc.wantOps)
+			}
+			for i, op := range got {
+				if op == "commit" && i != len(got)-2 {
+					t.Errorf("commit in posizione %d: non deve mai precedere un errore non abortito", i)
+				}
+			}
+		})
+	}
+}
+
+func TestRunTransform_RecordSenzaDestinazioneAbortisce(t *testing.T) {
+	// resolveTopics ha il suo test unitario; qui conta che il suo errore attraversi il flush
+	// abortendo, invece di lasciar produrre verso il topic vuoto.
+	s := transformSpec()
+	s.DefaultOutputTopic = ""
+
+	r, sess := txRunner(s,
+		transformerFunc(func(_ context.Context, b []*message.Record) ([]*message.ProducerRecord, error) {
+			return []*message.ProducerRecord{{Value: b[0].Value}}, nil // nessun Topic, nessun default
+		}),
+		[]pollEvent{{rec: rec("in", 0, 1)}, {rec: rec("in", 0, 2)}})
+
+	err := r.run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "default-output-topic") {
+		t.Fatalf("errore = %v, atteso quello che nomina la config mancante", err)
+	}
+	if got := sess.sequence(); !opsEqual(got, []string{"begin", "abort"}) {
+		t.Errorf("sequenza = %v, attesa [begin abort]", got)
+	}
+}
+
+func TestRunTransform_ResetScartaIlBatchEAbortisce(t *testing.T) {
+	// In EOS scartare un batch non è troncare una slice: Discard abortisce anche la transazione, che
+	// altrimenti resterebbe aperta fino al transaction.timeout.ms del broker — e nel frattempo i
+	// consumatori read_committed a valle restano fermi su quelle partizioni.
+	reset := driver.NewError(driver.SeverityReset, "poll", errors.New("rebalance"))
+	r, sess := txRunner(transformSpec(),
+		transformerFunc(func(_ context.Context, b []*message.Record) ([]*message.ProducerRecord, error) {
+			return []*message.ProducerRecord{{Topic: "out"}}, nil
+		}),
+		[]pollEvent{{rec: rec("in", 0, 1)}, {err: reset}})
+
+	_ = r.run(context.Background())
+
+	got := sess.sequence()
+	if len(got) == 0 || got[0] != "discard" {
+		t.Errorf("sequenza = %v, attesa una discard prima di qualunque altra operazione", got)
+	}
+	for _, op := range got {
+		if op == "commit" {
+			t.Error("commit dopo un reset: gli offset del batch scartato verrebbero confermati")
+		}
+	}
+}
+
+// --- consegna al DLQ in modalità handle --------------------------------------------------------
+//
+// toDLQ (la COSTRUZIONE dei record) aveva quattro test; sendDeadletter (la loro CONSEGNA) nessuno,
+// in nessuna delle due modalità. Qui il DLQ passa dal Producer condiviso, che è un tipo concreto:
+// costruirlo sul fake driver copre insieme il ramo dell'engine e il package producer, che era a zero.
+
+type fakeDriverProducer struct {
+	mu       sync.Mutex
+	produced []*message.ProducerRecord
+	err      error
+	closed   bool
+}
+
+func (f *fakeDriverProducer) Produce(_ context.Context, recs []*message.ProducerRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	f.produced = append(f.produced, recs...)
+	return nil
+}
+
+func (f *fakeDriverProducer) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = true
+	return nil
+}
+
+// newDLQ costruisce il Producer condiviso vero (non un fake) sopra un driver fake: è il percorso di
+// produzione, compresa la validazione che NewProducer fa della sezione `server`.
+func newDLQ(t *testing.T, d *fakeDriverProducer) *producer.Producer {
+	t.Helper()
+	p, err := producer.NewProducer(
+		&fakeLifecycle{},
+		&fakeFactory{producers: []driver.Producer{d}},
+		spec.KafkaServer{BootstrapServers: "broker:9092"},
+		spec.ProducerTuning{},
+	)
+	if err != nil {
+		t.Fatalf("producer.NewProducer: %v", err)
+	}
+	return p
+}
+
+// handleSpec: modalità handle con un DLQ configurato.
+func handleSpec(dlqTopic string) spec.ProcessorSpec {
+	s := spec.ProcessorSpec{Name: "h", GroupID: "g", Topics: []string{"in"}}
+	s.Consumer.MaxBatchSize = 2
+	s.Consumer.OnError = spec.OnErrorDeadletter
+	if dlqTopic != "" {
+		s.Consumer.DeadletterTopic = &dlqTopic
+	}
+	s.Restart = spec.RestartSpec{Disabled: ptr(true)}
+	return s.Resolve(spec.KafkaServer{})
+}
+
+func TestSendDeadletter_SenzaConfigurazioneNonPerdeIRecord(t *testing.T) {
+	// Un deadletter richiesto senza DLQ configurato deve fallire, non committare in silenzio: è la
+	// differenza fra un replay e una perdita.
+	for _, tc := range []struct {
+		name string
+		r    *runner
+	}{
+		{"nessun Producer", &runner{spec: handleSpec("h.DLQ")}},
+		{"nessun deadletter-topic", &runner{spec: handleSpec(""), dlq: newDLQ(t, &fakeDriverProducer{})}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.r.sendDeadletter(context.Background(),
+				processor.DeadLetter(errors.New("poison"), rec("in", 0, 1)))
+			if err == nil {
+				t.Fatal("atteso errore: senza DLQ i record non hanno dove andare")
+			}
+			if !strings.Contains(err.Error(), "deadletter") {
+				t.Errorf("errore = %q, atteso che nomini il deadletter mancante", err)
+			}
+		})
+	}
+}
+
+func TestRunHandle_DeadletterConsegnatoPoiCommit(t *testing.T) {
+	// L'ordine conta: i poison vanno consegnati PRIMA di committare gli offset del batch, altrimenti
+	// un crash fra le due operazioni li perde.
+	dp := &fakeDriverProducer{}
+	fc := &fakeGroupConsumer{
+		events:  []pollEvent{{rec: rec("in", 3, 7)}, {rec: rec("in", 3, 8)}},
+		exhaust: driver.NewError(driver.SeverityPermanent, "poll", errors.New("fine")),
+	}
+	r := &runner{
+		spec:    handleSpec("h.DLQ"),
+		factory: &fakeFactory{consumers: []driver.GroupConsumer{fc}},
+		dlq:     newDLQ(t, dp),
+		handler: handlerFunc(func(_ context.Context, b []*message.Record) error {
+			return processor.DeadLetter(errors.New("payload illeggibile"), b[0])
+		}),
+	}
+
+	_ = r.run(context.Background())
+
+	if len(dp.produced) != 1 {
+		t.Fatalf("record nel DLQ = %d, atteso 1 (solo il poison)", len(dp.produced))
+	}
+	got := dp.produced[0]
+	if got.Topic != "h.DLQ" {
+		t.Errorf("Topic = %q, atteso il deadletter-topic", got.Topic)
+	}
+	if got.Headers.Get(HeaderDLQSourceTopic) != "in" || got.Headers.Get(HeaderDLQSourceOffset) != "7" {
+		t.Errorf("header di origine = %v, attesi topic/offset del record consumato", got.Headers)
+	}
+	if got.Headers.Get(HeaderDLQError) != "payload illeggibile" {
+		t.Errorf("header %s = %q", HeaderDLQError, got.Headers.Get(HeaderDLQError))
+	}
+	// Il resto del batch è stato elaborato: gli offset vanno committati.
+	if fc.commits != 1 {
+		t.Errorf("commit = %d, atteso 1 dopo la consegna al DLQ", fc.commits)
+	}
+	if !opsEqual(fc.ops, []string{"commit"}) {
+		t.Errorf("operazioni = %v, atteso il solo commit", fc.ops)
+	}
+}
+
+func TestRunHandle_DLQIrraggiungibileNonCommitta(t *testing.T) {
+	// Se il DLQ non accetta i record, committare li perderebbe. L'errore risale e il batch è replayato
+	// — con i duplicati nel DLQ che il contratto della modalità ammette.
+	dp := &fakeDriverProducer{err: errors.New("broker del DLQ giù")}
+	fc := &fakeGroupConsumer{
+		events:  []pollEvent{{rec: rec("in", 0, 1)}, {rec: rec("in", 0, 2)}},
+		exhaust: driver.NewError(driver.SeverityPermanent, "poll", errors.New("fine")),
+	}
+	r := &runner{
+		spec:    handleSpec("h.DLQ"),
+		factory: &fakeFactory{consumers: []driver.GroupConsumer{fc}},
+		dlq:     newDLQ(t, dp),
+		handler: handlerFunc(func(_ context.Context, b []*message.Record) error {
+			return processor.DeadLetter(errors.New("poison"), b[0])
+		}),
+	}
+
+	if err := r.run(context.Background()); err == nil {
+		t.Fatal("atteso errore risalito dal DLQ irraggiungibile")
+	}
+	if fc.commits != 0 {
+		t.Errorf("commit = %d, atteso 0: senza consegna al DLQ il batch va replayato", fc.commits)
 	}
 }

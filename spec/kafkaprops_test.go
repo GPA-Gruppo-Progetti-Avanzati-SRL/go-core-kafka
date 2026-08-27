@@ -108,3 +108,28 @@ func TestValidateProcessor(t *testing.T) {
 		})
 	}
 }
+
+// La normalizzazione DEVE essere la stessa che usa il controllo delle chiavi riservate: se
+// divergessero, una chiave scritta " Group.ID " passerebbe ValidateKafkaProperties e verrebbe poi
+// applicata comunque al client, sovrascrivendo un'invariante dell'engine.
+func TestNormalizeKafkaProperties(t *testing.T) {
+	keys, norm := NormalizeKafkaProperties(map[string]string{
+		"  Fetch.Min.Bytes ": "1024",
+		"ACKS":               "all",
+	})
+	if len(keys) != 2 || keys[0] != "acks" || keys[1] != "fetch.min.bytes" {
+		t.Fatalf("chiavi = %v, attese normalizzate e ordinate", keys)
+	}
+	if norm["fetch.min.bytes"] != "1024" {
+		t.Errorf("valore perso nella normalizzazione: %v", norm)
+	}
+	// L'ordine deterministico è la ragione per cui la funzione ritorna anche le chiavi: iterando la
+	// mappa, l'ultima scrittura nella ConfigMap cambierebbe da un avvio all'altro.
+	if k, n := NormalizeKafkaProperties(nil); k != nil || n != nil {
+		t.Errorf("mappa vuota = (%v, %v), attesi nil", k, n)
+	}
+	// La stessa forma che il controllo rifiuta deve essere quella che il driver applicherebbe.
+	if err := ValidateKafkaProperties("test", map[string]string{" Group.ID ": "x"}); err == nil {
+		t.Error("chiave riservata scritta con spazi e maiuscole: deve essere rifiutata")
+	}
+}

@@ -3,6 +3,7 @@ package processor
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
@@ -118,4 +119,37 @@ func TestRegisterHandler_SynthesizesInsideApply(t *testing.T) {
 	}, map[string]spec.ProcessorSpec{
 		"eventi": {Name: "eventi", Properties: core.Properties{"collection": "events"}},
 	}, nil)
+}
+
+// propsTransformer è il gemello EOS di propsHandler: stessi tag, altro seam.
+type propsTransformer struct {
+	Topic string `prop:"topic" validate:"required"`
+}
+
+func (t *propsTransformer) Transform(context.Context, []*message.Record) ([]*message.ProducerRecord, error) {
+	return nil, nil
+}
+
+// Il gemello di TestRegisterHandler_SynthesizesInsideApply. Mancava, ed è la stessa asimmetria che
+// lasciava senza test tutta la modalità transform: i due seam sono in dualità dichiarata, quindi una
+// verifica su uno solo lascia scoperta metà del contratto.
+func TestRegisterTransformer_SynthesizesInsideApply(t *testing.T) {
+	Apply(func() {
+		RegisterTransformer[propsTransformer]("routing")
+		RegisterTransformer[propsTransformer]("spento") // non attivo: non deve nemmeno sintetizzare
+	}, map[string]spec.ProcessorSpec{
+		"routing": {Name: "routing", Properties: core.Properties{"topic": "out"}},
+	}, nil)
+}
+
+// Il messaggio di PoisonRecords è ciò che un operatore legge nei log quando un batch finisce al DLQ:
+// senza la causa non direbbe nulla di utile.
+func TestPoisonRecords_Error(t *testing.T) {
+	cause := errors.New("json non decodificabile")
+	if got := DeadLetter(cause).Error(); !strings.Contains(got, cause.Error()) {
+		t.Errorf("Error() = %q, atteso contenga la causa", got)
+	}
+	if got := (&PoisonRecords{}).Error(); got == "" {
+		t.Error("Error() senza causa non deve essere vuoto")
+	}
 }
