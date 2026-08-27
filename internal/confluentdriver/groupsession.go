@@ -23,6 +23,11 @@ type groupSession struct {
 
 // Poll ritorna il prossimo messaggio, (nil, nil) allo scadere del timeout senza messaggi, o un errore
 // SeverityReset se nel frattempo è avvenuto un rebalance (vedi rebalance.go).
+//
+// Il context non è osservato QUI di proposito: ReadMessage è una chiamata CGo bloccante che non lo
+// accetta, e il suo bound è `timeout` (consumer.poll-timeout, 100ms di default). È il loop chiamante
+// a osservare la cancellazione, fra un poll e il successivo. Il parametro resta nella firma perché
+// appartiene al seam driver.Session, e un driver puramente Go (franz-go) potrà onorarlo.
 func (g *groupSession) Poll(_ context.Context, timeout time.Duration) (*message.Record, error) {
 	msg, err := g.c.ReadMessage(timeout)
 	if err != nil {

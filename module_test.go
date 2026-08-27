@@ -14,24 +14,32 @@ func dlqSpec(name, dlq string, disabled bool) spec.ProcessorSpec {
 	return s
 }
 
-// ActiveSpecs è la passata unica sulla lista `processors` da cui il wiring prende le sue due
-// decisioni. Risolve, perché deadletter-topic è ereditabile: un processor che lo prende dal globale
-// non lo ha scritto su di sé, ma il Producer gli serve lo stesso.
-func TestActiveSpecs(t *testing.T) {
+// ActiveProcessors è l'UNICO punto in cui la lista `processors` viene filtrata: se il filtro tornasse
+// a esistere anche a valle (nell'engine, come prima) le due copie potrebbero divergere.
+func TestActiveProcessors(t *testing.T) {
+	cfg := Config{
+		Processors: []spec.ProcessorSpec{dlqSpec("a", "", false), dlqSpec("b", "", true), dlqSpec("c", "", false)},
+	}
+	got := cfg.ActiveProcessors()
+	if len(got) != 2 || got[0].Name != "a" || got[1].Name != "c" {
+		t.Fatalf("attivi = %v, attesi i due non disabilitati nell'ordine di config", got)
+	}
+}
+
+// Gli spec ritornati sono GREZZI: l'engine ha bisogno dei blocchi non risolti per attribuire errori e
+// avvisi a chi li ha scritti, e la risoluzione la rifà lui. Risolverli qui gliela toglierebbe.
+func TestActiveProcessors_NonRisolve(t *testing.T) {
 	comune := "comune.DLQ"
 	cfg := Config{
-		Kafka:      spec.KafkaServer{Consumer: spec.ConsumerTuning{DeadletterTopic: &comune}},
-		Processors: []spec.ProcessorSpec{dlqSpec("a", "", false), dlqSpec("b", "", true)},
+		Server:     spec.KafkaServer{Consumer: spec.ConsumerTuning{DeadletterTopic: &comune}},
+		Processors: []spec.ProcessorSpec{dlqSpec("a", "", false)},
 	}
-	got := cfg.ActiveSpecs()
-	if len(got) != 1 || got[0].Name != "a" {
-		t.Fatalf("attivi = %v, atteso il solo processor non disabilitato", got)
+	got := cfg.ActiveProcessors()
+	if got[0].Consumer.MaxBatchSize != 0 {
+		t.Errorf("MaxBatchSize = %d, atteso 0: gli spec non devono essere risolti", got[0].Consumer.MaxBatchSize)
 	}
-	if got[0].Consumer.Deadletter() != comune {
-		t.Errorf("deadletter-topic = %q, atteso quello ereditato dal globale", got[0].Consumer.Deadletter())
-	}
-	if got[0].Consumer.MaxBatchSize != spec.DefaultMaxBatchSize {
-		t.Error("gli spec ritornati devono essere risolti (default applicati)")
+	if got[0].Consumer.DeadletterTopic != nil {
+		t.Error("il deadletter-topic ereditato non deve comparire su uno spec grezzo")
 	}
 }
 
@@ -53,18 +61,33 @@ func TestNeedsDeadletterProducer(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := needsDeadletterProducer(tc.active, tc.force); got != tc.want {
+			if got := needsDeadletterProducer(tc.active, spec.KafkaServer{}, tc.force); got != tc.want {
 				t.Errorf("needsDeadletterProducer = %v, atteso %v", got, tc.want)
 			}
 		})
 	}
 }
 
+// Il caso per cui needsDeadletterProducer risolve invece di leggere il campo grezzo: un processor che
+// eredita il DLQ da `server.consumer` non lo ha scritto su di sé, ma il Producer gli serve lo stesso.
+func TestNeedsDeadletterProducer_DeadletterEreditato(t *testing.T) {
+	comune := "comune.DLQ"
+	server := spec.KafkaServer{Consumer: spec.ConsumerTuning{DeadletterTopic: &comune}}
+	active := []spec.ProcessorSpec{dlqSpec("a", "", false)}
+
+	if needsDeadletterProducer(active, spec.KafkaServer{}, false) {
+		t.Fatal("senza globale non c'è alcun DLQ: il Producer non serve")
+	}
+	if !needsDeadletterProducer(active, server, false) {
+		t.Error("il deadletter-topic ereditato dal globale deve far costruire il Producer")
+	}
+}
+
 // Un processor disabilitato non deve tirarsi dietro il Producer: non consumerà nulla, e il suo
-// deadletter-topic non ha destinatario. Il filtro sta in ActiveSpecs, quindi va verificato insieme.
+// deadletter-topic non ha destinatario. Il filtro sta in ActiveProcessors, quindi va verificato insieme.
 func TestNeedsDeadletterProducer_IgnoraIDisabilitati(t *testing.T) {
 	cfg := Config{Processors: []spec.ProcessorSpec{dlqSpec("spento", "spento.DLQ", true)}}
-	if needsDeadletterProducer(cfg.ActiveSpecs(), false) {
+	if needsDeadletterProducer(cfg.ActiveProcessors(), cfg.Server, false) {
 		t.Error("il DLQ di un processor disabilitato non deve far costruire il Producer")
 	}
 }

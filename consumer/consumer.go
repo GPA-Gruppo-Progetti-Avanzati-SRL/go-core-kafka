@@ -43,7 +43,7 @@ type params struct {
 	LC           fx.Lifecycle
 	Shutdowner   fx.Shutdowner
 	Specs        []spec.ProcessorSpec
-	Kafka        spec.KafkaServer
+	Server       spec.KafkaServer
 	Factory      driver.Factory
 	Handlers     []processor.HandlerRegistration     `group:"kafka_handlers"`
 	Transformers []processor.TransformerRegistration `group:"kafka_transformers"`
@@ -53,7 +53,7 @@ type params struct {
 // runner incapsula uno spec e il suo processor; apre il proprio client a ogni tentativo di run.
 type runner struct {
 	spec        spec.ProcessorSpec
-	kafka       spec.KafkaServer
+	server      spec.KafkaServer
 	factory     driver.Factory
 	handler     processor.Handler
 	transformer processor.Transformer
@@ -125,26 +125,22 @@ func NewConsumers(p params) (*Consumers, error) {
 
 	// Le chiavi riservate in kafka-properties fermano l'avvio: sono invarianti dell'engine, non
 	// default sovrascrivibili (vedi spec.DeniedKafkaProperties).
-	if err := spec.ValidateServerProperties(p.Kafka); err != nil {
+	if err := spec.ValidateServerProperties(p.Server); err != nil {
 		return nil, err
 	}
 
+	// Gli spec arrivano già FILTRATI da Config.ActiveProcessors — che è l'unico punto in cui la
+	// regola di attivazione è scritta — quindi qui non si ri-decide chi è attivo: si costruisce.
 	runners := make([]*runner, 0, len(p.Specs))
 	for _, raw := range p.Specs {
-		// È la lista `processors` di config a comandare l'attivazione; disabled=true la salta. Lo
-		// skip sta QUI e non in newRunner: è una decisione di attivazione, non di costruzione.
-		if raw.Disabled {
-			log.Info().Str("processor", raw.Name).Msg("corekafka: processor disabilitato (disabled=true), non attivato")
-			continue
-		}
-		r, err := newRunner(raw, p.Kafka, sm, p.Factory, p.DLQ)
+		r, err := newRunner(raw, p.Server, sm, p.Factory, p.DLQ)
 		if err != nil {
 			return nil, err
 		}
 		runners = append(runners, r)
 	}
 
-	// Nota: i processor dei consumer non attivi non arrivano nemmeno qui — la costruzione lazy
+	// Nota: nemmeno i processor dei consumer non attivi arrivano qui — la costruzione lazy
 	// (processor.Configure) fornisce a fx solo i processor dei consumer attivi, quindi i due value group
 	// contengono già solo quelli attivati. Lo skip è loggato dal registry al momento della registrazione.
 
@@ -235,7 +231,7 @@ func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Fa
 			Msg("corekafka: restart.max-attempts negativo = riavvii ILLIMITATI: un guasto stabile verrà mascherato indefinitamente invece di far uscire il processo. Guardare corekafka_consumer_restarts_total: una crescita continua senza record consumati è quel caso")
 	}
 
-	r := &runner{spec: s, kafka: k, factory: f, dlq: dlq}
+	r := &runner{spec: s, server: k, factory: f, dlq: dlq}
 
 	// La modalità è DERIVATA dalla registrazione: nome nel gruppo kafka_handlers -> handle, in
 	// kafka_transformers -> transform. In entrambi -> ambiguo; in nessuno -> non registrato.
@@ -537,7 +533,7 @@ func (r *runner) consume(ctx context.Context, s driver.Session, f flusher) error
 
 // runHandle: modalità at-least-once. poll -> accumula -> (cut size/tempo) -> Handle -> commit dopo il ritorno.
 func (r *runner) runHandle(ctx context.Context) error {
-	gc, err := r.factory.NewGroupConsumer(r.spec, r.kafka)
+	gc, err := r.factory.NewGroupConsumer(r.spec, r.server)
 	if err != nil {
 		return err
 	}
@@ -577,7 +573,7 @@ func (h handleFlusher) flush(ctx context.Context, batch []*message.Record) error
 // runTransform: modalità EOS Kafka->Kafka. poll -> accumula -> Begin -> Transform -> Produce -> Commit
 // (atomico) o Abort. Un errore abortisce e forza il replay.
 func (r *runner) runTransform(ctx context.Context) error {
-	sess, err := r.factory.NewTransactSession(r.spec, r.kafka)
+	sess, err := r.factory.NewTransactSession(r.spec, r.server)
 	if err != nil {
 		return err
 	}
@@ -602,7 +598,7 @@ func (t transformFlusher) flush(ctx context.Context, batch []*message.Record) er
 		}
 	}
 
-	if err := t.sess.Begin(); err != nil {
+	if err := t.sess.Begin(ctx); err != nil {
 		return err
 	}
 	out, tErr := r.transformer.Transform(ctx, batch)

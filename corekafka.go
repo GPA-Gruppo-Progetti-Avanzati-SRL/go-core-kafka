@@ -33,8 +33,6 @@ type (
 	PoisonRecords = processor.PoisonRecords
 	// PoisonRecord è un record scartato dalla conversione con la SUA causa (vedi Convert).
 	PoisonRecord = processor.PoisonRecord
-	// KafkaConfig è la connessione Kafka condivisa più il tuning globale di consumer e producer.
-	KafkaConfig = spec.KafkaServer
 	// ProcessorSpec è la specifica di un singolo processor (una voce di `processors`).
 	ProcessorSpec = spec.ProcessorSpec
 	// ConsumerTuning è il blocco `consumer`: si scrive in `server.consumer` e ogni processor può

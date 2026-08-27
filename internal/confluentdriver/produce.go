@@ -51,10 +51,10 @@ func produceAndAwait(ctx context.Context, p *kafka.Producer, recs []*message.Pro
 // limitato — e un timer. Senza di esse un report che non arriva (broker partizionato, delivery
 // timeout non configurato) blocca la goroutine del consumer per sempre, e con lei l'OnStop che la
 // attende: l'intero processo resta appeso a un SIGTERM.
+// `wait` arriva sempre da reportWait, che è l'unico posto in cui il default di delivery-timeout è
+// applicato: ri-applicarlo qui era una seconda copia dello stesso invariante, e due copie di un
+// default sono due posti da cambiare quando cambia.
 func awaitReports(ctx context.Context, ch <-chan kafka.Event, n int, wait time.Duration) error {
-	if wait <= 0 {
-		wait = spec.DefaultDeliveryTimeout + reportWaitMargin
-	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 

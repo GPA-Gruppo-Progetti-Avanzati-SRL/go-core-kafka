@@ -25,11 +25,16 @@ type transactSession struct {
 }
 
 // Begin apre una transazione (init lazy al primo Begin, col timeout dello spec).
-func (t *transactSession) Begin() error {
+//
+// La init è legata al context dell'engine E al proprio timeout: prima partiva da un
+// context.Background(), quindi un arresto che cadesse durante la InitTransactions non poteva
+// interromperla e teneva il processo appeso fino a init-transactions-timeout (60s di default) —
+// la stessa classe di problema chiusa sull'attesa dei delivery report.
+func (t *transactSession) Begin(ctx context.Context) error {
 	if !t.inited {
-		ctx, cancel := context.WithTimeout(context.Background(), t.initTimeout)
+		ictx, cancel := context.WithTimeout(ctx, t.initTimeout)
 		defer cancel()
-		if err := t.p.InitTransactions(ctx); err != nil {
+		if err := t.p.InitTransactions(ictx); err != nil {
 			return wrap("init-transactions", err)
 		}
 		t.inited = true

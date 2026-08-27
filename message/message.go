@@ -5,7 +5,10 @@
 // possibile un futuro switch a franz-go senza toccare le app.
 package message
 
-import "time"
+import (
+	"bytes"
+	"time"
+)
 
 // Header è una coppia header di un messaggio Kafka. Il valore è []byte e non string perché nel
 // protocollo un header è opaco: può portare un payload binario (un id compresso, un timestamp
@@ -87,12 +90,19 @@ func (h *Headers) Add(key, value string) {
 
 // Clone ritorna una copia indipendente: modificarla non tocca l'originale. Serve a chi deriva un
 // messaggio da un altro (l'instradamento al DLQ) senza mutare il record consumato.
+//
+// La copia è PROFONDA anche sui Value. Un `copy` dello slice condividerebbe i []byte, e allora
+// l'indipendenza reggerebbe solo per chi passa da Set — che rimpiazza l'intero campo — e non per chi
+// scrive dentro il valore: il contratto varrebbe per l'uso in tree, non per quello dichiarato. Il
+// costo è confinato al percorso DLQ, che non è quello caldo.
 func (h Headers) Clone() Headers {
 	if h == nil {
 		return nil
 	}
 	out := make(Headers, len(h))
-	copy(out, h)
+	for i, hd := range h {
+		out[i] = Header{Key: hd.Key, Value: bytes.Clone(hd.Value)}
+	}
 	return out
 }
 

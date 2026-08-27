@@ -1,6 +1,10 @@
-// Package producer espone un Producer Kafka pubblico (idempotente / transazionale), usato dall'engine
-// per il DLQ della modalità handle e disponibile alle app. È sottile: incapsula un driver.Producer, così
-// nessun tipo del client concreto compare nella firma pubblica.
+// Package producer incapsula il producer Kafka non transazionale (idempotente) con cui l'engine
+// alimenta il DLQ della modalità handle. È sottile: avvolge un driver.Producer, così nessun tipo del
+// client concreto compare nella firma.
+//
+// NON è iniettabile dall'app: corekafka.Module registra questo Module dentro un core.ModuleClosed,
+// che rende privati i suoi Provide. È deliberato — un consumer che deve produrre lo fa con un
+// Transformer (EOS Kafka→Kafka), che è il seam previsto e l'unico con garanzie transazionali.
 package producer
 
 import (
@@ -13,7 +17,7 @@ import (
 	"go.uber.org/fx"
 )
 
-// Producer è il servizio di produzione pubblico.
+// Producer è il servizio di produzione usato dall'engine (vedi il doc del package).
 type Producer struct {
 	d driver.Producer
 }

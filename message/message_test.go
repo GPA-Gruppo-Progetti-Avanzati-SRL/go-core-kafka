@@ -97,3 +97,16 @@ func TestHeaders_CloneÈIndipendente(t *testing.T) {
 		t.Error("il clone di header nil deve essere nil")
 	}
 }
+
+// Il caso che una copia superficiale NON copre: Set e Add rimpiazzano l'intero campo Value, quindi
+// passavano anche condividendo i []byte. Chi scrive DENTRO il valore no — ed è l'indipendenza che il
+// doc-comment promette.
+func TestHeaders_CloneCopiaAncheIValori(t *testing.T) {
+	orig := Headers{{Key: "a", Value: []byte("originale")}}
+	c := orig.Clone()
+	c[0].Value[0] = 'X'
+
+	if got := orig.Get("a"); got != "originale" {
+		t.Errorf("il valore dell'originale = %q: il clone ne condivide il backing array", got)
+	}
+}

@@ -63,7 +63,7 @@ type GroupConsumer interface {
 // ricostruirla.
 type TransactSession interface {
 	Session
-	Begin() error
+	Begin(ctx context.Context) error
 	Produce(ctx context.Context, recs []*message.ProducerRecord) error
 	Commit(ctx context.Context) error
 	Abort(ctx context.Context) error
