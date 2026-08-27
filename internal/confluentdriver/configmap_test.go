@@ -182,9 +182,13 @@ func TestProducerConfigMap_NonTransazionale(t *testing.T) {
 	// Default storico: il producer è idempotente se non lo si disattiva esplicitamente.
 	mustEqual(t, cm, "enable.idempotence", true)
 	mustAbsent(t, cm, "transactional.id")
-	for _, k := range []string{"acks", "compression.type", "linger.ms", "batch.size", "delivery.timeout.ms"} {
+	for _, k := range []string{"acks", "compression.type", "linger.ms", "batch.size"} {
 		mustAbsent(t, cm, k)
 	}
+	// delivery.timeout.ms è l'ECCEZIONE alla regola "un knob non valorizzato resta al default di
+	// librdkafka": WithDefaults lo riempie, perché è ciò che garantisce che un delivery report arrivi
+	// — chi lo attende non deve poter restare appeso per una config incompleta.
+	mustEqual(t, cm, "delivery.timeout.ms", int(spec.DefaultDeliveryTimeout.Milliseconds()))
 }
 
 func TestProducerConfigMap_IdempotenzaDisattivabile(t *testing.T) {

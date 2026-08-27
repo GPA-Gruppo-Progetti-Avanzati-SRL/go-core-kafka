@@ -51,11 +51,16 @@ const (
 	DefaultFlushTimeout            = 60 * time.Second
 	DefaultPollTimeout             = 100 * time.Millisecond
 	DefaultInitTransactionsTimeout = 60 * time.Second
-	DefaultMaxAttempts             = 5
-	DefaultRestartInitialBackoff   = time.Second
-	DefaultRestartMaxBackoff       = 30 * time.Second
-	DefaultRestartMultiplier       = 2.0
-	DefaultRestartResetAfter       = 2 * time.Minute
+	// DefaultDeliveryTimeout ha un default — a differenza degli altri knob del producer, che
+	// restano al valore di librdkafka — perché è ciò che garantisce che un delivery report ARRIVI:
+	// senza, un record accodato verso un broker partizionato può non produrre alcun esito, e chi lo
+	// attende resta appeso. Va imposto al client, non solo atteso lato Go.
+	DefaultDeliveryTimeout       = 2 * time.Minute
+	DefaultMaxAttempts           = 5
+	DefaultRestartInitialBackoff = time.Second
+	DefaultRestartMaxBackoff     = 30 * time.Second
+	DefaultRestartMultiplier     = 2.0
+	DefaultRestartResetAfter     = 2 * time.Minute
 )
 
 // KafkaServer è tutto ciò che riguarda "come parliamo con Kafka": la connessione condivisa da tutti i
@@ -341,6 +346,9 @@ func (p ProducerTuning) inherit(g ProducerTuning) ProducerTuning {
 func (p ProducerTuning) WithDefaults() ProducerTuning {
 	if p.FlushTimeout <= 0 {
 		p.FlushTimeout = DefaultFlushTimeout
+	}
+	if p.DeliveryTimeout <= 0 {
+		p.DeliveryTimeout = DefaultDeliveryTimeout
 	}
 	if p.InitTransactionsTimeout <= 0 {
 		p.InitTransactionsTimeout = DefaultInitTransactionsTimeout

@@ -13,6 +13,7 @@ import (
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/processor"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
+	"go.uber.org/fx"
 )
 
 // --- fake driver -----------------------------------------------------------------------------
@@ -35,6 +36,11 @@ type fakeGroupConsumer struct {
 	commits int
 	batches [][]*message.Record
 	closed  bool
+	// discards conta le Discard ricevute e ops registra la sequenza delle operazioni: è su
+	// quest'ordine che poggia la garanzia "duplicati, mai buchi" (uno scarto DEVE precedere il
+	// commit successivo, altrimenti quel commit conferma gli offset del batch buttato).
+	discards int
+	ops      []string
 }
 
 func (f *fakeGroupConsumer) Poll(context.Context, time.Duration) (*message.Record, error) {
@@ -52,7 +58,23 @@ func (f *fakeGroupConsumer) Commit(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commits++
+	f.ops = append(f.ops, "commit")
 	return nil
+}
+
+// progress dice quanti eventi programmati sono già stati consumati: serve ai test che devono
+// sincronizzarsi col loop prima di cancellare il context.
+func (f *fakeGroupConsumer) progress() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.i
+}
+
+func (f *fakeGroupConsumer) Discard(context.Context) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.discards++
+	f.ops = append(f.ops, "discard")
 }
 
 func (f *fakeGroupConsumer) Close() error {
@@ -380,10 +402,16 @@ func TestAbsorb(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &runner{spec: testSpec()}
+			fc := &fakeGroupConsumer{}
 			batch := []*message.Record{rec("t", 0, 1), rec("t", 0, 2)}
-			got := r.absorb(tc.err, &batch)
+			got := r.absorb(context.Background(), tc.err, fc, &batch)
 			if got != tc.wantAbsorb {
 				t.Fatalf("absorb = %v, atteso %v", got, tc.wantAbsorb)
+			}
+			// Troncare la slice non basta: gli offset stanno nel driver, e restarci significa che il
+			// prossimo commit li conferma senza che nessuno li abbia elaborati.
+			if want := map[bool]int{true: 1, false: 0}[tc.wantAbsorb]; fc.discards != want {
+				t.Errorf("Discard chiamata %d volte, attese %d", fc.discards, want)
 			}
 			if tc.wantAbsorb && len(batch) != 0 {
 				t.Errorf("batch non svuotato: %d record residui", len(batch))
@@ -402,7 +430,7 @@ func TestToDLQ_HeaderDiOrigine(t *testing.T) {
 	src := &message.Record{
 		Topic: "eventi", Partition: 3, Offset: 42,
 		Key: []byte("k"), Value: []byte("payload"),
-		Headers:   map[string]string{"traceparent": "abc"},
+		Headers:   message.Headers{{Key: "traceparent", Value: []byte("abc")}},
 		Timestamp: ts,
 	}
 	s := testSpec()
@@ -422,7 +450,7 @@ func TestToDLQ_HeaderDiOrigine(t *testing.T) {
 		t.Error("chiave o payload alterati: il DLQ deve preservare il record originale")
 	}
 	// Gli header originali sopravvivono: la correlazione di trace non deve rompersi nel DLQ.
-	if got.Headers["traceparent"] != "abc" {
+	if got.Headers.Get("traceparent") != "abc" {
 		t.Error("header originali non propagati")
 	}
 	want := map[string]string{
@@ -434,14 +462,14 @@ func TestToDLQ_HeaderDiOrigine(t *testing.T) {
 		HeaderDeliveryAttempts:   "1",
 	}
 	for k, v := range want {
-		if got.Headers[k] != v {
-			t.Errorf("header %s = %q, atteso %q", k, got.Headers[k], v)
+		if got.Headers.Get(k) != v {
+			t.Errorf("header %s = %q, atteso %q", k, got.Headers.Get(k), v)
 		}
 	}
-	if got.Headers[HeaderDLQSourceTimestamp] != ts.Format(time.RFC3339Nano) {
-		t.Errorf("timestamp di origine = %q", got.Headers[HeaderDLQSourceTimestamp])
+	if got.Headers.Get(HeaderDLQSourceTimestamp) != ts.Format(time.RFC3339Nano) {
+		t.Errorf("timestamp di origine = %q", got.Headers.Get(HeaderDLQSourceTimestamp))
 	}
-	if got.Headers[HeaderDLQErrorAt] == "" {
+	if got.Headers.Get(HeaderDLQErrorAt) == "" {
 		t.Error("manca l'istante dell'errore")
 	}
 }
@@ -453,14 +481,14 @@ func TestToDLQ_IncrementaITentativi(t *testing.T) {
 	s.Consumer.DeadletterTopic = ptr("dlq")
 	r := &runner{spec: s}
 
-	src := &message.Record{Topic: "t", Headers: map[string]string{HeaderDeliveryAttempts: "2"}}
-	if got := r.toDLQ(processor.DeadLetter(nil, src))[0].Headers[HeaderDeliveryAttempts]; got != "3" {
+	src := &message.Record{Topic: "t", Headers: message.Headers{{Key: HeaderDeliveryAttempts, Value: []byte("2")}}}
+	if got := r.toDLQ(processor.DeadLetter(nil, src))[0].Headers.Get(HeaderDeliveryAttempts); got != "3" {
 		t.Errorf("tentativi = %q, atteso 3", got)
 	}
 
 	// Un contatore illeggibile non deve far esplodere nulla: si riparte da 1.
-	src = &message.Record{Topic: "t", Headers: map[string]string{HeaderDeliveryAttempts: "non-un-numero"}}
-	if got := r.toDLQ(processor.DeadLetter(nil, src))[0].Headers[HeaderDeliveryAttempts]; got != "1" {
+	src = &message.Record{Topic: "t", Headers: message.Headers{{Key: HeaderDeliveryAttempts, Value: []byte("non-un-numero")}}}
+	if got := r.toDLQ(processor.DeadLetter(nil, src))[0].Headers.Get(HeaderDeliveryAttempts); got != "1" {
 		t.Errorf("tentativi = %q, atteso 1", got)
 	}
 }
@@ -469,7 +497,7 @@ func TestToDLQ_SenzaCausa(t *testing.T) {
 	s := testSpec()
 	s.Consumer.DeadletterTopic = ptr("dlq")
 	r := &runner{spec: s}
-	if _, present := r.toDLQ(processor.DeadLetter(nil, &message.Record{Topic: "t"}))[0].Headers[HeaderDLQError]; present {
+	if r.toDLQ(processor.DeadLetter(nil, &message.Record{Topic: "t"}))[0].Headers.Has(HeaderDLQError) {
 		t.Error("header di errore presente senza causa")
 	}
 }
@@ -538,13 +566,249 @@ func TestToDLQ_CausaPerRecord(t *testing.T) {
 	})
 	out := r.toDLQ(pr)
 
-	if got := out[0].Headers[HeaderDLQError]; got != "CDSERINT non valido" {
+	if got := out[0].Headers.Get(HeaderDLQError); got != "CDSERINT non valido" {
 		t.Errorf("header d'errore del primo record = %q", got)
 	}
-	if got := out[1].Headers[HeaderDLQError]; got != "AUD_ENTTYP non riconosciuto" {
+	if got := out[1].Headers.Get(HeaderDLQError); got != "AUD_ENTTYP non riconosciuto" {
 		t.Errorf("header d'errore del secondo record = %q", got)
 	}
-	if got := out[2].Headers[HeaderDLQError]; got != pr.Cause.Error() {
+	if got := out[2].Headers.Get(HeaderDLQError); got != pr.Cause.Error() {
 		t.Errorf("senza causa propria il record deve ricadere su quella comune, ha %q", got)
+	}
+}
+
+// --- §7.1: lo scarto del batch deve scartare anche gli offset nel driver -----------------------
+
+func TestRunHandle_ResetSenzaRevocaScartaGliOffsetDelDriver(t *testing.T) {
+	// Il caso che sfuggiva alla protezione del rebalance callback: un SeverityReset può risalire da
+	// Poll/Commit SENZA che una revoca sia avvenuta — resetCodes include ErrIllegalGeneration,
+	// ErrUnknownMemberID, ErrMemberIDRequired, ErrMaxPollExceeded. Lì il tracker del driver resta
+	// pieno, quindi il PRIMO commit successivo conferma anche gli offset del batch buttato: record
+	// dichiarati elaborati che nessuno ha elaborato, cioè un buco.
+	reset := driver.NewError(driver.SeverityReset, "poll", errors.New("illegal generation"))
+	fc := &fakeGroupConsumer{
+		events: []pollEvent{
+			{rec: rec("t", 0, 1)}, // accumulato (MaxBatchSize=2: nessun flush)
+			{err: reset},          // scarto, senza che il callback di revoca sia girato
+			{rec: rec("t", 0, 5)}, // nuovo batch...
+			{rec: rec("t", 0, 6)}, // ...pieno: flush + commit
+		},
+		exhaust: driver.NewError(driver.SeverityPermanent, "poll", errors.New("stop")),
+	}
+	f := &fakeFactory{consumers: []driver.GroupConsumer{fc}}
+	r := &runner{spec: testSpec(), factory: f, handler: handlerFunc(func(context.Context, []*message.Record) error { return nil })}
+
+	_ = r.run(context.Background())
+
+	if fc.discards != 1 {
+		t.Errorf("Discard chiamata %d volte, attesa 1: senza, gli offset del batch scartato sopravvivono", fc.discards)
+	}
+	if len(fc.ops) < 2 || fc.ops[0] != "discard" {
+		t.Errorf("sequenza delle operazioni = %v, atteso lo scarto PRIMA del commit", fc.ops)
+	}
+	if fc.commits != 1 {
+		t.Errorf("commit = %d, atteso 1 (il solo batch valido)", fc.commits)
+	}
+}
+
+// --- §7.2: il flush finale gira sul context dell'arresto, non su quello del loop ---------------
+
+// waitFor attende una condizione con un bound: un test non deve poter appendersi.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("condizione non verificata entro il timeout")
+}
+
+func TestConsume_FlushFinaleUsaIlContextDellArresto(t *testing.T) {
+	// Prima il flush finale girava sul context appena cancellato da OnStop: Handle, sendDeadletter e
+	// Commit abortivano immediatamente, quindi a ogni SIGTERM si riprocessava un batch intero — con i
+	// side-effect già eseguiti dall'handler nel tentativo precedente.
+	fc := &fakeGroupConsumer{events: []pollEvent{{rec: rec("t", 0, 1)}}} // exhaust nil: poi Poll è a vuoto
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopCancel()
+	sd := &shutdown{}
+	sd.set(stopCtx)
+
+	var mu sync.Mutex
+	var seen error
+	r := &runner{spec: testSpec(), stop: sd, handler: handlerFunc(func(ctx context.Context, _ []*message.Record) error {
+		mu.Lock()
+		defer mu.Unlock()
+		seen = ctx.Err() // nil = il context del flush finale è vivo
+		return nil
+	})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.consume(ctx, fc, handleFlusher{r: r, gc: fc}) }()
+	waitFor(t, func() bool { return fc.progress() >= 1 }) // il record è nel batch
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("consume ha ritornato errore in arresto: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("consume non è tornata dopo la cancellazione")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if seen != nil {
+		t.Errorf("il flush finale ha girato su un context già cancellato (%v): l'handler non può fare nulla e il commit non parte", seen)
+	}
+	if fc.commits != 1 {
+		t.Errorf("commit = %d, atteso 1: il batch elaborato in arresto va confermato, altrimenti è riprocessato al riavvio", fc.commits)
+	}
+}
+
+func TestConsume_FlushFinaleConArrestoGiaScadutoNonBlocca(t *testing.T) {
+	// Se la deadline dell'arresto è già passata il flush fallisce: l'esito va loggato e il loop deve
+	// uscire comunque (i record saranno riconsumati). Ciò che non deve fare è appendersi.
+	fc := &fakeGroupConsumer{events: []pollEvent{{rec: rec("t", 0, 1)}}}
+	expired, cancelExpired := context.WithCancel(context.Background())
+	cancelExpired()
+	sd := &shutdown{}
+	sd.set(expired)
+
+	r := &runner{spec: testSpec(), stop: sd, handler: handlerFunc(func(ctx context.Context, _ []*message.Record) error {
+		return ctx.Err() // un handler reale fallisce così: la chiamata al DB non parte
+	})}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- r.consume(ctx, fc, handleFlusher{r: r, gc: fc}) }()
+	waitFor(t, func() bool { return fc.progress() >= 1 })
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("consume deve uscire pulita anche se il flush finale fallisce, ha ritornato %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("consume non è tornata")
+	}
+	if fc.commits != 0 {
+		t.Errorf("commit = %d, atteso 0: un flush fallito non deve committare", fc.commits)
+	}
+}
+
+func TestShutdown_FlushContextHaSempreUnaDeadline(t *testing.T) {
+	// Un flush finale senza bound terrebbe il processo in piedi a tempo indefinito, che è l'opposto
+	// di ciò che un SIGTERM chiede.
+	for _, tc := range []struct {
+		name string
+		set  func(*shutdown)
+	}{
+		{"arresto non depositato", func(*shutdown) {}},
+		{"hook senza deadline (fx.StopTimeout non impostato)", func(s *shutdown) { s.set(context.Background()) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sd := &shutdown{}
+			tc.set(sd)
+			ctx, cancel := sd.flushContext()
+			defer cancel()
+			if _, ok := ctx.Deadline(); !ok {
+				t.Error("il context del flush finale non ha deadline")
+			}
+		})
+	}
+}
+
+// --- OnStart / OnStop ------------------------------------------------------------------------
+
+type fakeLifecycle struct{ hooks []fx.Hook }
+
+func (l *fakeLifecycle) Append(h fx.Hook) { l.hooks = append(l.hooks, h) }
+
+type fakeShutdowner struct{}
+
+func (fakeShutdowner) Shutdown(...fx.ShutdownOption) error { return nil }
+
+// hangingConsumer ignora la cancellazione: modella un client CGo bloccato dentro ReadMessage, il
+// caso in cui l'attesa dei runner in OnStop non tornava mai.
+type hangingConsumer struct{ block chan struct{} }
+
+func (h *hangingConsumer) Poll(context.Context, time.Duration) (*message.Record, error) {
+	<-h.block
+	return nil, nil
+}
+func (h *hangingConsumer) Commit(context.Context) error { return nil }
+func (h *hangingConsumer) Discard(context.Context)      {}
+func (h *hangingConsumer) Close() error                 { return nil }
+
+func newEngine(t *testing.T, gc driver.GroupConsumer) *fakeLifecycle {
+	t.Helper()
+	lc := &fakeLifecycle{}
+	s := spec.ProcessorSpec{Name: "test", GroupID: "g", Topics: []string{"t"}}
+	_, err := NewConsumers(params{
+		LC:         lc,
+		Shutdowner: fakeShutdowner{},
+		Specs:      []spec.ProcessorSpec{s},
+		Factory:    &fakeFactory{consumers: []driver.GroupConsumer{gc}},
+		Handlers: []processor.HandlerRegistration{{
+			Consumer: "test",
+			Handler:  handlerFunc(func(context.Context, []*message.Record) error { return nil }),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("NewConsumers: %v", err)
+	}
+	if len(lc.hooks) != 1 {
+		t.Fatalf("hook registrati = %d, atteso 1", len(lc.hooks))
+	}
+	return lc
+}
+
+func TestOnStop_SenzaOnStartNonSiBlocca(t *testing.T) {
+	// OnStop gira anche quando OnStart non è mai stato eseguito (un costruttore successivo che
+	// fallisce). Il canale dei runner era allocato dentro OnStart: attenderci sopra a nil era un
+	// deadlock, non un no-op.
+	lc := newEngine(t, &fakeGroupConsumer{})
+	done := make(chan error, 1)
+	go func() { done <- lc.hooks[0].OnStop(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("OnStop = %v, atteso nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnStop bloccata senza un OnStart precedente")
+	}
+}
+
+func TestOnStop_ConsumerAppesoNonImpedisceLArresto(t *testing.T) {
+	// Un runner che non torna (client bloccato, delivery report mai arrivato) non deve tenere in
+	// piedi l'intera applicazione: l'attesa è limitata dalla deadline dell'hook.
+	hc := &hangingConsumer{block: make(chan struct{})}
+	defer close(hc.block)
+	lc := newEngine(t, hc)
+
+	if err := lc.hooks[0].OnStart(context.Background()); err != nil {
+		t.Fatalf("OnStart: %v", err)
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- lc.hooks[0].OnStop(stopCtx) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("OnStop = %v, atteso nil (arresto forzato, non errore)", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnStop non è tornata: l'arresto dipende ancora dal fatto che ogni runner termini")
 	}
 }

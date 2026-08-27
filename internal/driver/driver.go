@@ -22,33 +22,51 @@ import (
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 )
 
-// GroupConsumer è un consumer di consumer-group per la modalità handle (at-least-once). Il driver tiene
-// traccia internamente degli offset dei record ritornati da Poll dall'ultimo Commit; Commit li
-// conferma (offset+1). Poll ritorna (nil, nil) allo scadere del timeout senza messaggi.
+// Session è ciò che l'engine usa in ENTRAMBE le modalità: consuma record, e sa buttare via quelli
+// consumati senza confermarli. Il driver tiene traccia internamente degli offset dei record ritornati
+// da Poll dall'ultimo Commit; Poll ritorna (nil, nil) allo scadere del timeout senza messaggi.
 //
-// Poll può ritornare un errore SeverityReset dopo un rebalance: gli offset tracciati sono stati
-// scartati dal driver (le partizioni potrebbero non essere più assegnate) e l'engine deve scartare il
-// batch in volo senza committare. Il consumer resta valido e il loop continua.
-type GroupConsumer interface {
+// Poll può ritornare un errore SeverityReset (rebalance) o SeverityAbort: l'engine scarta il batch in
+// volo e chiama Discard. Il client resta valido e il loop continua.
+type Session interface {
 	Poll(ctx context.Context, timeout time.Duration) (*message.Record, error)
-	Commit(ctx context.Context) error
+
+	// Discard scarta gli offset tracciati e non ancora committati — e in EOS abortisce la
+	// transazione eventualmente aperta.
+	//
+	// È l'altra metà dello scarto di un batch: l'engine tronca la sua slice di record, ma se gli
+	// offset restassero nel driver il Commit successivo li confermerebbe, dichiarando elaborati
+	// record che nessuno ha elaborato. Il rebalance callback fa già questo azzeramento alla revoca,
+	// ma un SeverityReset può risalire da Poll/Commit SENZA revoca (ErrIllegalGeneration,
+	// ErrUnknownMemberID, ErrMaxPollExceeded): è per quei casi che l'engine deve poterlo chiedere.
+	//
+	// Non ritorna errore: non esiste un'alternativa che l'engine possa scegliere se lo scarto
+	// fallisce, e un errore qui maschererebbe quello che ha reso necessario lo scarto.
+	Discard(ctx context.Context)
+
 	Close() error
+}
+
+// GroupConsumer è un consumer di consumer-group per la modalità handle (at-least-once). Commit
+// conferma (offset+1) i record ritornati da Poll dall'ultimo Commit.
+type GroupConsumer interface {
+	Session
+	Commit(ctx context.Context) error
 }
 
 // TransactSession è la sessione EOS Kafka->Kafka: consuma, produce e committa gli offset consumati in
 // un'unica transazione. L'engine chiama Begin all'inizio di ogni batch, Produce per i record di
 // output e Commit (atomico: record prodotti + offset consumati) o Abort in caso di errore.
 //
-// Vale lo stesso contratto di Poll di GroupConsumer. Un errore SeverityAbort chiede di abortire la
-// transazione mantenendo la sessione; un SeverityFatal (tipicamente il fencing del producer dopo un
-// rebalance) richiede di chiudere la sessione e ricostruirla.
+// Un errore SeverityAbort chiede di abortire la transazione mantenendo la sessione; un SeverityFatal
+// (tipicamente il fencing del producer dopo un rebalance) richiede di chiudere la sessione e
+// ricostruirla.
 type TransactSession interface {
-	Poll(ctx context.Context, timeout time.Duration) (*message.Record, error)
+	Session
 	Begin() error
 	Produce(ctx context.Context, recs []*message.ProducerRecord) error
 	Commit(ctx context.Context) error
 	Abort(ctx context.Context) error
-	Close() error
 }
 
 // Producer è un producer non transazionale, usato per il DLQ (modalità handle) e come servizio pubblico.

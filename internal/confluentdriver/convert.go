@@ -19,10 +19,12 @@ func toRecord(m *kafka.Message) *message.Record {
 	if m.TopicPartition.Topic != nil {
 		r.Topic = *m.TopicPartition.Topic
 	}
+	// Copia 1:1, chiavi ripetute incluse: message.Headers è una lista proprio per non perderle
+	// (una mappa collasserebbe qui, prima che la business logic possa vederle).
 	if len(m.Headers) > 0 {
-		r.Headers = make(map[string]string, len(m.Headers))
+		r.Headers = make(message.Headers, 0, len(m.Headers))
 		for _, h := range m.Headers {
-			r.Headers[h.Key] = string(h.Value)
+			r.Headers = append(r.Headers, message.Header{Key: h.Key, Value: h.Value})
 		}
 	}
 	return r
@@ -36,8 +38,8 @@ func toMessage(r *message.ProducerRecord) *kafka.Message {
 		Key:            r.Key,
 		Value:          r.Value,
 	}
-	for k, v := range r.Headers {
-		m.Headers = append(m.Headers, kafka.Header{Key: k, Value: []byte(v)})
+	for _, h := range r.Headers {
+		m.Headers = append(m.Headers, kafka.Header{Key: h.Key, Value: h.Value})
 	}
 	return m
 }

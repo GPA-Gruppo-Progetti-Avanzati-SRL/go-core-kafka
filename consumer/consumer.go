@@ -12,9 +12,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"runtime/pprof"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
@@ -29,6 +29,11 @@ import (
 // LabelConsumer è l'etichetta pprof applicata alla goroutine di ogni consumer.
 const LabelConsumer = "kafka_consumer"
 
+// DefaultFinalFlushTimeout è il bound del flush finale quando il context dell'OnStop non ne ha uno
+// (fx.StopTimeout non impostato). Un flush senza bound terrebbe il processo in piedi a tempo
+// indefinito, che è esattamente ciò che un SIGTERM chiede di non fare.
+const DefaultFinalFlushTimeout = 15 * time.Second
+
 // Consumers è il valore fx che tiene vivo l'engine (nessuna API pubblica: la sua costruzione avvia i
 // consumer via lifecycle).
 type Consumers struct{}
@@ -39,7 +44,6 @@ type params struct {
 	Shutdowner   fx.Shutdowner
 	Specs        []spec.ProcessorSpec
 	Kafka        spec.KafkaServer
-	Producer     spec.ProducerTuning
 	Factory      driver.Factory
 	Handlers     []processor.HandlerRegistration     `group:"kafka_handlers"`
 	Transformers []processor.TransformerRegistration `group:"kafka_transformers"`
@@ -54,6 +58,48 @@ type runner struct {
 	handler     processor.Handler
 	transformer processor.Transformer
 	dlq         *producer.Producer
+	// stop porta al flush finale il context dell'arresto (vedi shutdown); è condiviso da tutti i
+	// runner dello stesso engine.
+	stop *shutdown
+}
+
+// shutdown consegna al flush finale il context dell'OnStop di fx — quello con la deadline
+// dell'arresto — al posto del context del loop, che a quel punto è cancellato per costruzione.
+//
+// Il passaggio avviene per riferimento condiviso e non per parametro perché i due lati stanno su
+// goroutine diverse: OnStop lo deposita e poi cancella, il loop lo raccoglie quando osserva la
+// cancellazione. Il mutex rende l'ordine evidente senza doverlo dedurre dalla cancellazione.
+type shutdown struct {
+	mu  sync.Mutex
+	ctx context.Context
+}
+
+func (s *shutdown) set(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ctx = ctx
+}
+
+// flushContext ritorna il context per il flush finale: quello dell'OnStop se depositato, altrimenti
+// (arresto non passato dal lifecycle) uno nuovo con DefaultFinalFlushTimeout. La cancel va sempre
+// invocata dal chiamante.
+func (s *shutdown) flushContext() (context.Context, context.CancelFunc) {
+	if s == nil {
+		// Runner costruito fuori dall'engine (test, wiring manuale): non c'è un arresto da cui
+		// ereditare la deadline, ma il flush finale deve comunque averne una.
+		return context.WithTimeout(context.Background(), DefaultFinalFlushTimeout)
+	}
+	s.mu.Lock()
+	ctx := s.ctx
+	s.mu.Unlock()
+
+	if ctx == nil {
+		return context.WithTimeout(context.Background(), DefaultFinalFlushTimeout)
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		return context.WithTimeout(ctx, DefaultFinalFlushTimeout)
+	}
+	return context.WithCancel(ctx)
 }
 
 // NewConsumers valida gli spec contro i processor registrati (fail-fast dal costruttore) e registra
@@ -160,11 +206,18 @@ func NewConsumers(p params) (*Consumers, error) {
 	// contengono già solo quelli attivati. Lo skip è loggato dal registry al momento della registrazione.
 
 	ctx, cancel := context.WithCancel(context.Background())
-	var done chan struct{}
+	sd := &shutdown{}
+	for _, r := range runners {
+		r.stop = sd
+	}
+	// done è allocato QUI e non dentro OnStart: OnStop gira anche quando OnStart non è mai stato
+	// eseguito (un costruttore successivo che fallisce), e attendere su un canale nil sarebbe un
+	// deadlock invece di un no-op.
+	done := make(chan struct{}, len(runners))
+	started := 0
 
 	p.LC.Append(fx.Hook{
 		OnStart: func(context.Context) error {
-			done = make(chan struct{}, len(runners))
 			for _, r := range runners {
 				// pprof.Do etichetta la goroutine col nome del consumer: da Go 1.27 la
 				// label compare anche nei traceback e rende leggibili i profili
@@ -177,12 +230,25 @@ func NewConsumers(p params) (*Consumers, error) {
 					}
 				})
 			}
+			started = len(runners)
 			return nil
 		},
-		OnStop: func(context.Context) error {
+		OnStop: func(stopCtx context.Context) error {
+			// Il context dell'hook va depositato PRIMA della cancellazione: è la cancellazione che
+			// sveglia i loop, ed è lì che lo raccolgono per il flush finale.
+			sd.set(stopCtx)
 			cancel()
-			for range runners {
-				<-done
+			for i := 0; i < started; i++ {
+				select {
+				case <-done:
+				case <-stopCtx.Done():
+					// Un consumer appeso non deve impedire al processo di terminare: si registra
+					// quanti non hanno chiuso e si prosegue. Senza questo bound l'arresto
+					// dell'intera applicazione dipendeva dal fatto che ogni runner tornasse.
+					log.Error().Str("consumer", "*").Int("pending", started-i).
+						Msg("corekafka: arresto forzato, alcuni consumer non hanno terminato entro il timeout")
+					return nil
+				}
 			}
 			return nil
 		},
@@ -315,11 +381,18 @@ func poisonRecords(pr *processor.PoisonRecords) []*message.Record {
 // È il caso del rebalance (SeverityReset): i record accumulati vengono da partizioni che potrebbero
 // non essere più nostre, quindi vanno riletti dal nuovo owner — duplicati, non buchi. E dell'abort
 // transazionale richiesto dal broker (SeverityAbort), dopo il quale la sessione resta utilizzabile.
-func (r *runner) absorb(err error, batch *[]*message.Record) bool {
+func (r *runner) absorb(ctx context.Context, err error, s driver.Session, batch *[]*message.Record) bool {
 	sev := driver.SeverityOf(err)
 	if sev != driver.SeverityReset && sev != driver.SeverityAbort {
 		return false
 	}
+	// Scartare il batch non è solo troncare la slice: gli offset di quei record sono tracciati DENTRO
+	// il driver, e senza Discard il Commit successivo li confermerebbe — record dichiarati elaborati
+	// che nessuno ha elaborato, cioè un buco, l'opposto di quello che questa funzione promette.
+	// Il rebalance callback azzera già il tracker alla revoca, ma un SeverityReset può risalire da
+	// Poll/Commit SENZA revoca (ErrIllegalGeneration, ErrUnknownMemberID, ErrMaxPollExceeded); in EOS
+	// Discard abortisce anche la transazione, che altrimenti resterebbe aperta.
+	s.Discard(ctx)
 	n := len(*batch)
 	*batch = (*batch)[:0]
 	batchDiscardedTotal.WithLabelValues(r.spec.Name, sev.String()).Add(float64(n))
@@ -340,42 +413,33 @@ func (r *runner) sendDeadletter(ctx context.Context, pr *processor.PoisonRecords
 	return nil
 }
 
-// runHandle: modalità at-least-once. poll -> accumula -> (cut size/tempo) -> Handle -> commit dopo il ritorno.
-func (r *runner) runHandle(ctx context.Context) error {
-	gc, err := r.factory.NewGroupConsumer(r.spec, r.kafka)
-	if err != nil {
-		return err
-	}
-	defer gc.Close()
+// flusher è ciò che distingue le due modalità: elabora il batch e lo rende definitivo — commit degli
+// offset in handle, transazione atomica in transform. Ritorna l'errore da far risalire; nil significa
+// batch consumato, e il loop lo tronca.
+type flusher interface {
+	flush(ctx context.Context, batch []*message.Record) error
+}
 
+// consume è il loop di consumo, UNICO per le due modalità: poll, accumula, chiudi il batch a
+// dimensione o a tempo, assorbi gli eventi di protocollo, arrestati in modo cooperativo.
+//
+// Prima erano due loop copiati (uno in runHandle, uno in runTransform) identici tranne il corpo del
+// flush: ogni correzione andava applicata due volte, ed è già così che le due modalità sono divergite
+// una volta — l'ordine di valutazione dell'esito, poi unificato in classify.
+func (r *runner) consume(ctx context.Context, s driver.Session, f flusher) error {
 	ticker := time.NewTicker(r.spec.Consumer.CutFrequency)
 	defer ticker.Stop()
 	batch := make([]*message.Record, 0, r.spec.Consumer.MaxBatchSize)
 
-	flush := func() error {
+	// flush misura, delega al flusher e tronca il batch SOLO se è stato reso definitivo.
+	flush := func(fctx context.Context) error {
 		if len(batch) == 0 {
 			return nil
 		}
 		start := time.Now()
-		hErr := r.handler.Handle(ctx, batch)
+		err := f.flush(fctx, batch)
 		batchDuration.WithLabelValues(r.spec.Name).Observe(time.Since(start).Seconds())
-
-		oc, pr, cause := classify(hErr, batch, r.spec.Consumer.OnError)
-		poison := poisonRecords(pr)
-		switch oc {
-		case outcomeFail:
-			return cause // niente commit → replay
-		case outcomeDeadletter:
-			if err := r.sendDeadletter(ctx, pr); err != nil {
-				return err // DLQ non configurato/irraggiungibile → replay
-			}
-			deadletteredTotal.WithLabelValues(r.spec.Name).Add(float64(len(poison)))
-			processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch) - len(poison)))
-		case outcomeCommit:
-			processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch)))
-		}
-
-		if err := gc.Commit(ctx); err != nil {
+		if err != nil {
 			return err
 		}
 		batch = batch[:0]
@@ -385,24 +449,33 @@ func (r *runner) runHandle(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			// Ultimo flush: sono record già elaborati, non committarli significherebbe rielaborarli
-			// al riavvio. Se fallisce non c'è più nulla da fare se non renderlo visibile.
-			if err := flush(); err != nil {
+			// Ultimo flush col context dell'ARRESTO, non con quello del loop: quest'ultimo è appena
+			// stato cancellato, quindi un Handle che tocchi un DB o un HTTP abortirebbe subito e il
+			// commit non partirebbe nemmeno — il flush finale era destinato a fallire sempre, e ogni
+			// SIGTERM riprocessava un batch intero (con i side-effect parziali già eseguiti).
+			//
+			// Vale anche in transform: il flush EOS è atomico, quindi committarlo qui è preferibile a
+			// replayarlo, e se la deadline dell'arresto scade la transazione abortisce da sé — si
+			// torna esattamente al replay di prima, senza un ramo di shutdown per modalità.
+			fctx, cancel := r.stop.flushContext()
+			err := flush(fctx)
+			cancel()
+			if err != nil {
 				log.Error().Err(err).Str("consumer", r.spec.Name).
 					Msg("corekafka: flush finale fallito in arresto, i record del batch saranno riconsumati")
 			}
 			return nil
 		case <-ticker.C:
-			if err := flush(); err != nil {
-				if r.absorb(err, &batch) {
+			if err := flush(ctx); err != nil {
+				if r.absorb(ctx, err, s, &batch) {
 					continue
 				}
 				return err
 			}
 		default:
-			rec, err := gc.Poll(ctx, r.spec.Consumer.PollTimeout)
+			rec, err := s.Poll(ctx, r.spec.Consumer.PollTimeout)
 			if err != nil {
-				if r.absorb(err, &batch) {
+				if r.absorb(ctx, err, s, &batch) {
 					continue
 				}
 				return err
@@ -413,8 +486,8 @@ func (r *runner) runHandle(ctx context.Context) error {
 			consumedTotal.WithLabelValues(r.spec.Name).Inc()
 			batch = append(batch, rec)
 			if len(batch) >= r.spec.Consumer.MaxBatchSize {
-				if err := flush(); err != nil {
-					if r.absorb(err, &batch) {
+				if err := flush(ctx); err != nil {
+					if r.absorb(ctx, err, s, &batch) {
 						continue
 					}
 					return err
@@ -422,6 +495,44 @@ func (r *runner) runHandle(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// runHandle: modalità at-least-once. poll -> accumula -> (cut size/tempo) -> Handle -> commit dopo il ritorno.
+func (r *runner) runHandle(ctx context.Context) error {
+	gc, err := r.factory.NewGroupConsumer(r.spec, r.kafka)
+	if err != nil {
+		return err
+	}
+	defer gc.Close()
+	return r.consume(ctx, gc, handleFlusher{r: r, gc: gc})
+}
+
+// handleFlusher rende definitivo il batch in modalità handle: Handle, eventuale DLQ col producer
+// condiviso, poi commit degli offset.
+type handleFlusher struct {
+	r  *runner
+	gc driver.GroupConsumer
+}
+
+func (h handleFlusher) flush(ctx context.Context, batch []*message.Record) error {
+	r := h.r
+	hErr := r.handler.Handle(ctx, batch)
+
+	oc, pr, cause := classify(hErr, batch, r.spec.Consumer.OnError)
+	poison := poisonRecords(pr)
+	switch oc {
+	case outcomeFail:
+		return cause // niente commit → replay
+	case outcomeDeadletter:
+		if err := r.sendDeadletter(ctx, pr); err != nil {
+			return err // DLQ non configurato/irraggiungibile → replay
+		}
+		deadletteredTotal.WithLabelValues(r.spec.Name).Add(float64(len(poison)))
+		processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch) - len(poison)))
+	case outcomeCommit:
+		processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch)))
+	}
+	return h.gc.Commit(ctx)
 }
 
 // runTransform: modalità EOS Kafka->Kafka. poll -> accumula -> Begin -> Transform -> Produce -> Commit
@@ -432,99 +543,62 @@ func (r *runner) runTransform(ctx context.Context) error {
 		return err
 	}
 	defer sess.Close()
+	return r.consume(ctx, sess, transformFlusher{r: r, sess: sess})
+}
 
-	ticker := time.NewTicker(r.spec.Consumer.CutFrequency)
-	defer ticker.Stop()
-	batch := make([]*message.Record, 0, r.spec.Consumer.MaxBatchSize)
+// transformFlusher rende definitivo il batch in modalità transform: tutto dentro una transazione —
+// record di output, eventuale DLQ e offset consumati sono atomici.
+type transformFlusher struct {
+	r    *runner
+	sess driver.TransactSession
+}
 
+func (t transformFlusher) flush(ctx context.Context, batch []*message.Record) error {
+	r := t.r
 	// abort annulla la transazione in corso. L'esito è loggato e non ritornato: stiamo già gestendo
 	// l'errore che ha reso necessario l'abort, ed è quello che deve risalire.
 	abort := func() {
-		if err := sess.Abort(ctx); err != nil {
+		if err := t.sess.Abort(ctx); err != nil {
 			log.Warn().Err(err).Str("consumer", r.spec.Name).Msg("corekafka: abort della transazione fallito")
 		}
 	}
 
-	flush := func() error {
-		if len(batch) == 0 {
-			return nil
-		}
-		start := time.Now()
-		defer func() { batchDuration.WithLabelValues(r.spec.Name).Observe(time.Since(start).Seconds()) }()
+	if err := t.sess.Begin(); err != nil {
+		return err
+	}
+	out, tErr := r.transformer.Transform(ctx, batch)
+	resolveTopics(out, r.spec.DefaultOutputTopic)
 
-		if err := sess.Begin(); err != nil {
-			return err
-		}
-		out, tErr := r.transformer.Transform(ctx, batch)
-		resolveTopics(out, r.spec.DefaultOutputTopic)
-
-		// Stesso modello a esiti della modalità handle (classify è condivisa), ma la consegna DLQ
-		// avviene DENTRO la sessione transazionale (append agli output) così l'EOS resta intatto:
-		// output "buoni" + record DLQ + commit offset sono atomici.
-		oc, pr, cause := classify(tErr, batch, r.spec.Consumer.OnError)
-		poison := poisonRecords(pr)
-		switch oc {
-		case outcomeFail:
+	// Stesso modello a esiti della modalità handle (classify è condivisa), ma la consegna DLQ
+	// avviene DENTRO la sessione transazionale (append agli output) così l'EOS resta intatto:
+	// output "buoni" + record DLQ + commit offset sono atomici.
+	oc, pr, cause := classify(tErr, batch, r.spec.Consumer.OnError)
+	poison := poisonRecords(pr)
+	switch oc {
+	case outcomeFail:
+		abort()
+		return cause
+	case outcomeDeadletter:
+		dlq, derr := r.dlqRecords(pr)
+		if derr != nil {
 			abort()
-			return cause
-		case outcomeDeadletter:
-			dlq, derr := r.dlqRecords(pr)
-			if derr != nil {
-				abort()
-				return derr
-			}
-			out = append(out, dlq...)
-			deadletteredTotal.WithLabelValues(r.spec.Name).Add(float64(len(poison)))
+			return derr
 		}
-
-		if err := sess.Produce(ctx, out); err != nil {
-			abort()
-			return err
-		}
-		if err := sess.Commit(ctx); err != nil {
-			abort()
-			return err
-		}
-		producedTotal.WithLabelValues(r.spec.Name).Add(float64(len(out)))
-		processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch) - len(poison)))
-		batch = batch[:0]
-		return nil
+		out = append(out, dlq...)
+		deadletteredTotal.WithLabelValues(r.spec.Name).Add(float64(len(poison)))
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil // in EOS non si committa un batch parziale in shutdown: replay pulito
-		case <-ticker.C:
-			if err := flush(); err != nil {
-				if r.absorb(err, &batch) {
-					continue
-				}
-				return err
-			}
-		default:
-			rec, err := sess.Poll(ctx, r.spec.Consumer.PollTimeout)
-			if err != nil {
-				if r.absorb(err, &batch) {
-					continue
-				}
-				return err
-			}
-			if rec == nil {
-				continue
-			}
-			consumedTotal.WithLabelValues(r.spec.Name).Inc()
-			batch = append(batch, rec)
-			if len(batch) >= r.spec.Consumer.MaxBatchSize {
-				if err := flush(); err != nil {
-					if r.absorb(err, &batch) {
-						continue
-					}
-					return err
-				}
-			}
-		}
+	if err := t.sess.Produce(ctx, out); err != nil {
+		abort()
+		return err
 	}
+	if err := t.sess.Commit(ctx); err != nil {
+		abort()
+		return err
+	}
+	producedTotal.WithLabelValues(r.spec.Name).Add(float64(len(out)))
+	processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch) - len(poison)))
+	return nil
 }
 
 // dlqRecords converte i record poison in ProducerRecord verso il deadletter-topic dello spec (usati
@@ -558,32 +632,33 @@ func (r *runner) toDLQ(pr *processor.PoisonRecords) []*message.ProducerRecord {
 	recs := pr.Records
 	out := make([]*message.ProducerRecord, 0, len(recs))
 	for i, rec := range recs {
-		h := make(map[string]string, len(rec.Headers)+8)
-		maps.Copy(h, rec.Headers)
-		h[HeaderDLQSourceTopic] = rec.Topic
-		h[HeaderDLQSourcePartition] = strconv.Itoa(int(rec.Partition))
-		h[HeaderDLQSourceOffset] = strconv.FormatInt(rec.Offset, 10)
-		h[HeaderDLQProcessor] = r.spec.Name
-		h[HeaderDLQErrorAt] = at
+		// Gli header di origine sono CLONATI: il record consumato non va mutato (l'handler può
+		// averlo ancora in mano) e Set scrive in place. Il clone conserva le chiavi ripetute.
+		h := rec.Headers.Clone()
+		h.Set(HeaderDLQSourceTopic, rec.Topic)
+		h.Set(HeaderDLQSourcePartition, strconv.Itoa(int(rec.Partition)))
+		h.Set(HeaderDLQSourceOffset, strconv.FormatInt(rec.Offset, 10))
+		h.Set(HeaderDLQProcessor, r.spec.Name)
+		h.Set(HeaderDLQErrorAt, at)
 		if !rec.Timestamp.IsZero() {
-			h[HeaderDLQSourceTimestamp] = rec.Timestamp.UTC().Format(time.RFC3339Nano)
+			h.Set(HeaderDLQSourceTimestamp, rec.Timestamp.UTC().Format(time.RFC3339Nano))
 		}
 		// La causa del SINGOLO record quando c'è (Convert la produce per ognuno), altrimenti quella
 		// comune del gruppo: chi legge il DLQ vuole sapere perché è fallito QUESTO messaggio.
 		if cause := pr.CauseFor(i); cause != nil {
-			h[HeaderDLQError] = cause.Error()
+			h.Set(HeaderDLQError, cause.Error())
 		}
 		// Un record già passato dal DLQ e reimmesso porta il contatore: incrementarlo permette a chi
 		// riprocessa di fermarsi invece di girare all'infinito.
-		h[HeaderDeliveryAttempts] = strconv.Itoa(attempts(rec.Headers) + 1)
+		h.Set(HeaderDeliveryAttempts, strconv.Itoa(attempts(rec.Headers)+1))
 		out = append(out, &message.ProducerRecord{Topic: r.spec.Consumer.Deadletter(), Key: rec.Key, Value: rec.Value, Headers: h})
 	}
 	return out
 }
 
 // attempts legge il contatore dei tentativi da un record; 0 se assente o illeggibile.
-func attempts(headers map[string]string) int {
-	n, err := strconv.Atoi(headers[HeaderDeliveryAttempts])
+func attempts(headers message.Headers) int {
+	n, err := strconv.Atoi(headers.Get(HeaderDeliveryAttempts))
 	if err != nil || n < 0 {
 		return 0
 	}

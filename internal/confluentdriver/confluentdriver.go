@@ -25,12 +25,11 @@ func New() driver.Factory { return Factory{} }
 
 // NewGroupConsumer crea un consumer di consumer-group per la modalità handle (at-least-once).
 func (Factory) NewGroupConsumer(s spec.ProcessorSpec, k spec.KafkaServer) (driver.GroupConsumer, error) {
-	offsets := newOffsetTracker()
-	c, rb, err := newSubscribedConsumer(s, k, offsets)
+	gs, err := newGroupSession(s, k)
 	if err != nil {
 		return nil, err
 	}
-	return &groupConsumer{c: c, offsets: offsets, rb: rb}, nil
+	return &groupConsumer{groupSession: gs}, nil
 }
 
 // NewTransactSession crea la sessione EOS Kafka->Kafka (consumer + producer transazionale). Il
@@ -44,19 +43,20 @@ func (Factory) NewTransactSession(s spec.ProcessorSpec, k spec.KafkaServer) (dri
 	// leggere record non ancora committati romperebbe l'esattamente-una-volta a valle.
 	s.Consumer.IsolationLevel = "read_committed"
 
-	offsets := newOffsetTracker()
-	c, rb, err := newSubscribedConsumer(s, k, offsets)
+	gs, err := newGroupSession(s, k)
 	if err != nil {
 		return nil, err
 	}
 	prod, err := kafka.NewProducer(producerConfigMap(s.TransactionalID, "processor "+s.Name, s.Producer, k))
 	if err != nil {
-		_ = c.Close()
+		_ = gs.c.Close()
 		return nil, fmt.Errorf("confluentdriver: NewProducer (tx) %q: %w", s.Name, err)
 	}
 	return &transactSession{
-		c: c, p: prod, offsets: offsets, rb: rb,
-		initTimeout: s.Producer.InitTransactionsTimeout,
+		groupSession: gs,
+		p:            prod,
+		initTimeout:  s.Producer.InitTransactionsTimeout,
+		reportWait:   reportWait(s.Producer),
 	}, nil
 }
 
@@ -68,21 +68,22 @@ func (Factory) NewProducer(k spec.KafkaServer, p spec.ProducerTuning) (driver.Pr
 	if err != nil {
 		return nil, fmt.Errorf("confluentdriver: NewProducer: %w", err)
 	}
-	return &producer{p: prod, flushTimeout: int(p.FlushTimeout.Milliseconds())}, nil
+	return &producer{p: prod, flushTimeout: int(p.FlushTimeout.Milliseconds()), reportWait: reportWait(p)}, nil
 }
 
-// newSubscribedConsumer crea il consumer e lo iscrive ai topic con il rebalance callback che protegge
-// gli offset (vedi rebalance.go). È condiviso dalle due modalità: la sottoscrizione e la disciplina
-// sugli offset sono identiche, cambia solo cosa ci si fa sopra.
-func newSubscribedConsumer(s spec.ProcessorSpec, k spec.KafkaServer, offsets *offsetTracker) (*kafka.Consumer, *rebalanceObserver, error) {
+// newGroupSession crea il consumer, lo iscrive ai topic con il rebalance callback che protegge gli
+// offset (vedi rebalance.go) e ne compone la groupSession. È condivisa dalle due modalità: la
+// sottoscrizione e la disciplina sugli offset sono identiche, cambia solo come li si conferma.
+func newGroupSession(s spec.ProcessorSpec, k spec.KafkaServer) (groupSession, error) {
+	offsets := newOffsetTracker()
 	c, err := kafka.NewConsumer(consumerConfigMap(s, k))
 	if err != nil {
-		return nil, nil, fmt.Errorf("confluentdriver: NewConsumer %q: %w", s.Name, err)
+		return groupSession{}, fmt.Errorf("confluentdriver: NewConsumer %q: %w", s.Name, err)
 	}
 	rb := &rebalanceObserver{name: s.Name, offsets: offsets}
 	if err := c.SubscribeTopics(s.Topics, rb.callback); err != nil {
 		_ = c.Close()
-		return nil, nil, fmt.Errorf("confluentdriver: SubscribeTopics %q: %w", s.Name, err)
+		return groupSession{}, fmt.Errorf("confluentdriver: SubscribeTopics %q: %w", s.Name, err)
 	}
-	return c, rb, nil
+	return groupSession{name: s.Name, c: c, offsets: offsets, rb: rb}, nil
 }

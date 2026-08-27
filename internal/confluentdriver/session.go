@@ -2,45 +2,26 @@ package confluentdriver
 
 import (
 	"context"
-	"errors"
 	"time"
 
-	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/rs/zerolog/log"
 )
 
-// transactSession implementa driver.TransactSession (modalità EOS Kafka->Kafka). Consuma con un
-// consumer group (auto-commit off, read_committed) e produce con un producer transazionale; Commit
-// invia gli offset consumati e committa la transazione atomicamente.
+// transactSession implementa driver.TransactSession (modalità EOS Kafka->Kafka). Consuma con il
+// consumer group di groupSession (auto-commit off, read_committed) e produce con un producer
+// transazionale; Commit invia gli offset consumati e committa la transazione atomicamente.
 type transactSession struct {
-	c           *kafka.Consumer
+	groupSession
 	p           *kafka.Producer
-	offsets     *offsetTracker
-	rb          *rebalanceObserver
 	initTimeout time.Duration
+	reportWait  time.Duration
 	inited      bool
-}
-
-// Poll ritorna il prossimo messaggio, (nil, nil) allo scadere del timeout, o SeverityReset dopo un
-// rebalance (stessa semantica di groupConsumer.Poll).
-func (t *transactSession) Poll(_ context.Context, timeout time.Duration) (*message.Record, error) {
-	msg, err := t.c.ReadMessage(timeout)
-	if err != nil {
-		var ke kafka.Error
-		if errors.As(err, &ke) && ke.Code() == kafka.ErrTimedOut {
-			if t.rb.takeRevoked() {
-				return nil, driver.NewError(driver.SeverityReset, "poll", errRebalanced)
-			}
-			return nil, nil
-		}
-		return nil, wrap("poll", err)
-	}
-	if t.rb.takeRevoked() {
-		return nil, driver.NewError(driver.SeverityReset, "poll", errRebalanced)
-	}
-	t.offsets.track(msg.TopicPartition)
-	return toRecord(msg), nil
+	// txnOpen dice se c'è una transazione da abortire. Serve perché Abort/Discard sono chiamate
+	// anche su percorsi in cui nessuna transazione è stata aperta (un errore risalito da Poll prima
+	// del primo Begin): abortire lì darebbe un errore di stato invalido al posto di un no-op.
+	txnOpen bool
 }
 
 // Begin apre una transazione (init lazy al primo Begin, col timeout dello spec).
@@ -53,28 +34,19 @@ func (t *transactSession) Begin() error {
 		}
 		t.inited = true
 	}
-	return wrap("begin-transaction", t.p.BeginTransaction())
+	if err := wrap("begin-transaction", t.p.BeginTransaction()); err != nil {
+		return err
+	}
+	t.txnOpen = true
+	return nil
 }
 
 // Produce invia i record di output nella transazione corrente e verifica i delivery report prima del
 // commit (così un errore di produzione è rilevato e la transazione può essere abortita dall'engine).
-func (t *transactSession) Produce(_ context.Context, recs []*message.ProducerRecord) error {
-	if len(recs) == 0 {
-		return nil
-	}
-	deliveryChan := make(chan kafka.Event, len(recs))
-	for _, r := range recs {
-		if err := t.p.Produce(toMessage(r), deliveryChan); err != nil {
-			return wrap("produce", err)
-		}
-	}
-	for range recs {
-		ev := <-deliveryChan
-		if m, ok := ev.(*kafka.Message); ok && m.TopicPartition.Error != nil {
-			return wrap("delivery", m.TopicPartition.Error)
-		}
-	}
-	return nil
+// L'attesa dei report è la stessa del producer condiviso — vedi produceAndAwait: ha un bound, quindi
+// un report che non arriva non appende più la goroutine del consumer.
+func (t *transactSession) Produce(ctx context.Context, recs []*message.ProducerRecord) error {
+	return produceAndAwait(ctx, t.p, recs, t.reportWait)
 }
 
 // Commit invia gli offset consumati alla transazione e la committa (atomico: output + offset).
@@ -91,18 +63,37 @@ func (t *transactSession) Commit(ctx context.Context) error {
 	if err := t.p.CommitTransaction(ctx); err != nil {
 		return wrap("commit-transaction", err)
 	}
+	t.txnOpen = false
 	t.offsets.reset()
 	return nil
 }
 
-// Abort annulla la transazione corrente; gli offset non vengono committati (replay).
+// Abort annulla la transazione corrente; gli offset non vengono committati (replay). È un no-op se
+// nessuna transazione è aperta.
 func (t *transactSession) Abort(ctx context.Context) error {
 	t.offsets.reset()
+	if !t.txnOpen {
+		return nil
+	}
+	t.txnOpen = false
 	return wrap("abort-transaction", t.p.AbortTransaction(ctx))
 }
 
+// Discard scarta gli offset E abortisce la transazione aperta: in EOS le due cose sono la stessa
+// operazione, perché sono gli offset dentro la transazione a dover restare non committati. L'esito
+// dell'abort è loggato e non ritornato — vedi il contratto di driver.Session.Discard.
+func (t *transactSession) Discard(ctx context.Context) {
+	if err := t.Abort(ctx); err != nil {
+		log.Warn().Err(err).Str("consumer", t.name).
+			Msg("corekafka: abort della transazione fallito durante lo scarto del batch")
+	}
+}
+
+// Close chiude la sessione. Abortisce prima una transazione eventualmente aperta: chiudere il
+// producer lasciandola in volo la tiene aperta fino al transaction.timeout.ms del broker, e nel
+// frattempo i consumatori read_committed a valle restano bloccati su quelle partizioni.
 func (t *transactSession) Close() error {
-	t.offsets.reset()
+	t.Discard(context.Background())
 	t.p.Close()
 	return t.c.Close()
 }
