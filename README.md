@@ -417,7 +417,7 @@ services:
       # client: non finisce in nessuna ConfigMap e non descrive come si consuma, ma cosa fa il
       # processo quando un loop muore. Vedi "Errori e restart".
       restart:
-        max-attempts: 0                     # 0 = illimitati
+        max-attempts: 5                     # default; -1 = illimitati (con cautela), 0 = RIFIUTATO
         initial-backoff: 1s
         max-backoff: 30s
 
@@ -587,11 +587,12 @@ client, è una decisione di esercizio del processo.
 server:
   restart:
     disabled: false          # true = comportamento storico: qualunque errore fa uscire il processo
-    max-attempts: 0          # 0 = illimitati
+    max-attempts: 5          # default FINITO; -1 = illimitati (vedi sotto); 0 = errore di avvio
     initial-backoff: 1s
     max-backoff: 30s
-    multiplier: 2
+    multiplier: 2            # >= 1 (1 = backoff costante)
     reset-after: 2m          # un run sano più lungo di così azzera il contatore dei tentativi
+                             # deve essere > max-backoff, altrimenti il budget si ricarica sempre
     on-business-error: false # vedi sotto
 processors:
   - name: supporto
@@ -604,6 +605,32 @@ processors:
 ed esce": riprovare in-process un record poison sarebbe un loop senza uscita. Va messo a `true` quando
 la causa attesa è un'infrastruttura applicativa transitoria (il DB irraggiungibile), non un payload
 malformato.
+
+#### Il budget dei tentativi è finito, e l'illimitato è esplicito
+
+`max-attempts` assente vale **5** (≈31s di insistenza con i backoff di default: 1+2+4+8+16). Esaurito
+il budget l'errore risale, il processo esce e il recovery passa all'orchestratore — che è il livello
+che sa se ha senso continuare a insistere.
+
+Prima il default era `0` = *illimitati*, cioè: l'opzione più pericolosa era quella che si otteneva
+**non scrivendo nulla**, perché 0 è lo zero value del campo. Un riavvio senza limite maschera
+indefinitamente un guasto stabile, che è esattamente il loop infinito che questo knob esiste per
+evitare. Da qui tre conseguenze:
+
+- **`max-attempts: -1`** = illimitati, scelta esplicita. All'avvio compare un `Warn`: il segnale da
+  guardare è `corekafka_consumer_restarts_total`, e una sua crescita continua senza record consumati è
+  il guasto stabile che la supervisione sta coprendo.
+- **`max-attempts: 0`** = **errore di avvio**, con un messaggio che indica `-1` (illimitati) o
+  `restart.disabled: true` (nessun riavvio). Chi l'aveva scritto intendeva "illimitati": meglio
+  fermarlo che dargli in silenzio l'opposto.
+- **`reset-after` deve essere maggiore di `max-backoff`**, altrimenti l'avvio fallisce. È l'altra
+  strada verso lo stesso loop: un run che dura almeno `reset-after` azzera il contatore, quindi con
+  `reset-after: 1s` un consumer che muore dopo due secondi ricarica il budget ogni volta e
+  `max-attempts` finito diventa illimitato di fatto. Un run più breve di una singola attesa di backoff
+  non può essere prova di salute.
+
+Con `restart.disabled: true` nessuno di questi controlli si applica: la politica non ha effetto, e far
+cadere un'app per un knob inerte sarebbe severità senza scopo.
 
 ### Offset e rebalance
 

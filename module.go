@@ -1,8 +1,11 @@
 // Package corekafka è l'orchestratore e la superficie pubblica di go-core-kafka: espone Config e
 // Module (mirror di batch.Module) e ri-esporta i tipi neutri e gli helper di registrazione dei
-// sub-package (vedi corekafka.go), così l'app importa un solo package. Il backend sink è iniettato
-// come ModuleFunc (WithSink), quindi corekafka non importa alcun backend: un'app non-Mongo non
-// trascina mongo-driver.
+// sub-package (vedi corekafka.go), così l'app importa un solo package.
+//
+// corekafka non importa NESSUN backend di persistenza, e non perché li inietti: perché non ne ha
+// bisogno. La business logic di un Handler è libera e sta nell'app — è l'app a portarsi il proprio
+// data layer — quindi un'app non-Mongo non trascina mongo-driver semplicemente perché qui non ne
+// esiste traccia.
 package corekafka
 
 import (
@@ -13,8 +16,8 @@ import (
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 )
 
-// ModuleFunc è la firma comune dei Module() componibili (backend sink e componenti extra): modes-only,
-// il config è iniettato da fx. Si passano per riferimento diretto (niente closure), come in go-core-batch.
+// ModuleFunc è la firma comune dei Module() componibili passati a WithModule: modes-only, il config è
+// iniettato da fx. Si passano per riferimento diretto (niente closure), come in go-core-batch.
 type ModuleFunc func(modes ...string)
 
 // Option configura Module.
@@ -39,7 +42,11 @@ func WithProducer() Option {
 	return func(o *options) { o.producer = true }
 }
 
-// WithModule aggiunge componenti extra (accumula), gate-ati sugli stessi modes dei consumer.
+// WithModule aggiunge componenti opzionali al sottosistema (accumula), gate-ati sugli stessi modes dei
+// consumer: è il punto di estensione per un Module() di terze parti che debba vivere e spegnersi con
+// l'engine. Nessun componente in-tree lo usa oggi — i backend che lo giustificavano non esistono più —
+// e resta perché è l'unico modo, per un'app, di agganciare qualcosa al ciclo di vita di questo
+// sottosistema chiuso.
 func WithModule(m ...ModuleFunc) Option {
 	return func(o *options) { o.modules = append(o.modules, m...) }
 }
@@ -67,42 +74,24 @@ func Module(cfg *Config, register func(), opts ...Option) {
 	// sempre stati forniti a root e il value group aggrega comunque root + modulo (l'engine li vede lo
 	// stesso). register() gira sincronamente qui dentro: RegisterHandler/RegisterTransformer forniscono
 	// subito a fx solo i processor attivi, nessuna finestra temporale con l'esterno.
-	//
-	// Qui gli spec servono grezzi: `properties` non è ereditabile, quindi il blocco globale non
-	// aggiungerebbe nulla al binding dei campi `prop:`.
-	specs := cfg.Processors
-	active := make(map[string]spec.ProcessorSpec, len(specs))
-	for _, s := range specs {
-		if !s.Disabled {
-			active[s.Name] = s
-		}
+	activeSpecs := cfg.ActiveSpecs()
+	active := make(map[string]spec.ProcessorSpec, len(activeSpecs))
+	for _, s := range activeSpecs {
+		active[s.Name] = s
 	}
 	processor.Apply(register, active, o.modes)
 
 	core.ModuleClosed("kafka", func() {
 		core.Supply(cfg.Kafka, o.modes...)
 		core.Supply(cfg.Kafka.Producer, o.modes...)
-		core.Supply(specs, o.modes...)
+		// La lista GREZZA: l'engine ispeziona i blocchi non risolti (le kafka-properties scritte dal
+		// processor, il blocco `producer` scritto o assente) per attribuire errori e avvisi a chi li
+		// ha scritti. La risoluzione la rifà lui, ed è idempotente.
+		core.Supply(cfg.Processors, o.modes...)
 
 		provideDriver(o.modes...)
 
-		needDLQ := o.producer
-		for _, raw := range specs {
-			// Il Producer condiviso (non transazionale) serve al DLQ della modalità handle. A questo
-			// punto (wiring) la modalità non è ancora nota (dipende dalla registrazione fx), quindi lo
-			// abilitiamo per qualsiasi spec ATTIVO con deadletter-topic; un eventuale processor
-			// transform lo lascerebbe inutilizzato (il transform produce il DLQ nella sua sessione EOS).
-			//
-			// Il controllo gira sullo spec RISOLTO perché `deadletter-topic` è ereditabile: un
-			// processor che lo prende da `server.consumer` non lo ha scritto su di sé, ma il Producer
-			// gli serve lo stesso — altrimenti l'engine fallirebbe al boot chiedendolo. È l'unico
-			// punto del wiring che deve guardare i valori ereditati; la risoluzione vera, quella che
-			// l'engine usa, la fa consumer.NewConsumers.
-			if !raw.Disabled && raw.Resolve(cfg.Kafka).HasDeadletter() {
-				needDLQ = true
-			}
-		}
-		if needDLQ {
+		if needsDeadletterProducer(activeSpecs, o.producer) {
 			producer.Module(o.modes...)
 		}
 
@@ -113,4 +102,26 @@ func Module(cfg *Config, register func(), opts ...Option) {
 		core.Provide(consumer.NewConsumers, o.modes...)
 		core.Invoke(func(*consumer.Consumers) {}, o.modes...)
 	})
+}
+
+// needsDeadletterProducer dice se serve il Producer condiviso (non transazionale), che alimenta il DLQ
+// della modalità handle. Al momento del wiring la modalità non è ancora nota — dipende dalla
+// registrazione fx — quindi basta UN processor attivo con deadletter-topic: un eventuale processor
+// transform lo lascerebbe inutilizzato (produce il proprio DLQ dentro la sessione EOS), ed è un costo
+// molto minore di un engine che al boot lo chiede e non lo trova.
+//
+// force è WithProducer(): lo abilita anche senza alcun deadletter-topic.
+//
+// È una funzione e non due righe dentro la closure del wiring perché è l'unica decisione condizionale
+// del Module, quindi la sola parte testabile senza costruire un grafo fx.
+func needsDeadletterProducer(active []spec.ProcessorSpec, force bool) bool {
+	if force {
+		return true
+	}
+	for _, s := range active {
+		if s.HasDeadletter() {
+			return true
+		}
+	}
+	return false
 }

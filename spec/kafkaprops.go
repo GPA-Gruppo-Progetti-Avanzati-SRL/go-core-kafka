@@ -44,6 +44,27 @@ func ValidateKafkaProperties(owner string, props map[string]string) error {
 	return fmt.Errorf("%s: kafka-properties contiene chiavi riservate: %s", owner, strings.Join(bad, ", "))
 }
 
+// ValidateServerProperties applica ValidateKafkaProperties ai tre blocchi di `server`, con le
+// etichette giuste e in ORDINE FISSO. L'ordine conta: iterando una mappa di blocchi, con due sezioni
+// entrambe sbagliate quale errore comparisse cambiava da un avvio all'altro. È una funzione e non tre
+// chiamate al call site perché i due percorsi che devono farla — l'engine e il Producer condiviso —
+// non devono tenere allineate due liste di etichette scritte a mano.
+func ValidateServerProperties(k KafkaServer) error {
+	for _, blk := range []struct {
+		owner string
+		props map[string]string
+	}{
+		{"server", k.KafkaProperties},
+		{"server.consumer", k.Consumer.KafkaProperties},
+		{"server.producer", k.Producer.KafkaProperties},
+	} {
+		if err := ValidateKafkaProperties(blk.owner, blk.props); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // normalizeKey porta una chiave nella forma con cui è confrontata e scritta nella ConfigMap. È
 // esportata attraverso l'uso che ne fa il driver: senza la stessa normalizzazione qui e là, una
 // chiave scritta " Group.ID " passerebbe il controllo e verrebbe poi applicata comunque.

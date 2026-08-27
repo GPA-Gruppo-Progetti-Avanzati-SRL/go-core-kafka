@@ -29,7 +29,9 @@ func (p *Producer) Produce(ctx context.Context, recs []*message.ProducerRecord) 
 // NewProducer costruisce il Producer dalla Factory iniettata e registra la chiusura nel lifecycle fx.
 // Una chiave riservata in kafka-properties fa fallire l'avvio (vedi spec.DeniedKafkaProperties).
 func NewProducer(lc fx.Lifecycle, f driver.Factory, k spec.KafkaServer, p spec.ProducerTuning) (*Producer, error) {
-	if err := spec.ValidateKafkaProperties("server.producer", p.KafkaProperties); err != nil {
+	// Stessa validazione dell'engine, dalla stessa funzione: il Producer è registrabile anche da solo
+	// (senza consumer), quindi non può appoggiarsi al fatto che qualcun altro l'abbia già fatta.
+	if err := spec.ValidateServerProperties(k); err != nil {
 		return nil, err
 	}
 	d, err := f.NewProducer(k, p.WithDefaults())

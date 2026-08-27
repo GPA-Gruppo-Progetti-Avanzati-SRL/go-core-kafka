@@ -87,7 +87,7 @@ func Convert[T any](ctx context.Context, batch []*Record, compact bool, conv fun
 func DeadLetterEach(poison []PoisonRecord) error { return processor.DeadLetterEach(poison) }
 
 // DeadLetter costruisce l'esito gestito con cui Handler O Transformer chiedono di instradare QUESTI
-// record al DLQ. Da ritornare come error da Handle o da Transform: in sink il resto viene committato,
+// record al DLQ. Da ritornare come error da Handle o da Transform: in handle il resto viene committato,
 // in transform i record DLQ sono prodotti nella stessa transazione EOS degli output. Richiede un
 // deadletter-topic configurato sullo spec.
 func DeadLetter(cause error, recs ...*Record) error {

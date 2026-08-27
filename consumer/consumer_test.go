@@ -134,7 +134,7 @@ func (h handlerFunc) Handle(ctx context.Context, b []*message.Record) error { re
 func testSpec() spec.ProcessorSpec {
 	s := spec.ProcessorSpec{Name: "test", GroupID: "g", Topics: []string{"t"}}
 	s.Consumer.MaxBatchSize = 2
-	s.Restart = spec.RestartSpec{InitialBackoff: time.Millisecond, MaxBackoff: 2 * time.Millisecond, Multiplier: 2, ResetAfter: time.Hour}
+	s.Restart = spec.RestartSpec{InitialBackoff: time.Millisecond, MaxBackoff: 2 * time.Millisecond, Multiplier: ptr(2.0), ResetAfter: time.Hour}
 	return s.Resolve(spec.KafkaServer{})
 }
 
@@ -226,7 +226,7 @@ func TestRun_RetriableRiavviaFinoAMaxAttempts(t *testing.T) {
 	retriable := driver.NewError(driver.SeverityRetriable, "connect", errors.New("broker giù"))
 	f := &fakeFactory{errs: []error{retriable, retriable, retriable, retriable, retriable}}
 	s := testSpec()
-	s.Restart.MaxAttempts = 3
+	s.Restart.MaxAttempts = ptr(3)
 	r := &runner{spec: s, factory: f, handler: handlerFunc(func(context.Context, []*message.Record) error { return nil })}
 
 	err := r.run(context.Background())
@@ -284,7 +284,7 @@ func TestRun_ErroreDiBusinessRiavviaSeRichiesto(t *testing.T) {
 	}}
 	s := testSpec()
 	s.Restart.OnBusinessError = ptr(true)
-	s.Restart.MaxAttempts = 1
+	s.Restart.MaxAttempts = ptr(1)
 	r := &runner{spec: s, factory: f, handler: handlerFunc(func(context.Context, []*message.Record) error { return business })}
 
 	if err := r.run(context.Background()); err == nil {
@@ -505,13 +505,15 @@ func TestToDLQ_SenzaCausa(t *testing.T) {
 // --- backoff ---------------------------------------------------------------------------------
 
 func TestBackoff_Esponenziale(t *testing.T) {
-	b := newBackoff(spec.RestartSpec{InitialBackoff: time.Second, MaxBackoff: 8 * time.Second, Multiplier: 2})
+	// max-attempts: -1 = illimitati, esplicito: il budget di default è finito (5), quindi la
+	// sequenza sotto va oltre e senza l'opt-in i tentativi finirebbero.
+	b := newBackoff(spec.RestartSpec{InitialBackoff: time.Second, MaxBackoff: 8 * time.Second, Multiplier: ptr(2.0), MaxAttempts: ptr(-1)})
 
 	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 8 * time.Second}
 	for i, w := range want {
 		got, ok := b.next()
 		if !ok {
-			t.Fatalf("tentativo %d rifiutato con MaxAttempts=0 (illimitati)", i)
+			t.Fatalf("tentativo %d rifiutato con max-attempts=-1 (illimitati)", i)
 		}
 		if got != w {
 			t.Errorf("attesa %d = %v, attesa %v", i, got, w)
@@ -520,7 +522,7 @@ func TestBackoff_Esponenziale(t *testing.T) {
 }
 
 func TestBackoff_MaxAttempts(t *testing.T) {
-	b := newBackoff(spec.RestartSpec{InitialBackoff: time.Millisecond, MaxBackoff: time.Second, Multiplier: 2, MaxAttempts: 2})
+	b := newBackoff(spec.RestartSpec{InitialBackoff: time.Millisecond, MaxBackoff: time.Second, Multiplier: ptr(2.0), MaxAttempts: ptr(2)})
 
 	for i := range 2 {
 		if _, ok := b.next(); !ok {
@@ -533,7 +535,7 @@ func TestBackoff_MaxAttempts(t *testing.T) {
 }
 
 func TestBackoff_Reset(t *testing.T) {
-	b := newBackoff(spec.RestartSpec{InitialBackoff: time.Second, MaxBackoff: time.Minute, Multiplier: 2, MaxAttempts: 2})
+	b := newBackoff(spec.RestartSpec{InitialBackoff: time.Second, MaxBackoff: time.Minute, Multiplier: ptr(2.0), MaxAttempts: ptr(2)})
 	b.next()
 	b.next()
 

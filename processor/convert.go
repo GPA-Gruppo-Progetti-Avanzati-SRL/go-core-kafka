@@ -3,6 +3,7 @@ package processor
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
@@ -105,11 +106,10 @@ func Convert[T any](ctx context.Context, batch []*message.Record, compact bool, 
 	name := spec.ConsumerNameFromContext(ctx)
 	res := Converted[T]{}
 
-	// Un gruppo per record sopravvissuto alla conversione: la compaction sostituisce gli items del
-	// gruppo, così l'ordine è quello di PRIMA apparizione della chiave ma il contenuto è dell'ULTIMO
-	// record — la stessa semantica del "last write wins" del log compattato di Kafka.
-	type group struct{ items []T }
-	groups := make([]group, 0, len(batch))
+	// Un gruppo di items per record sopravvissuto alla conversione: la compaction SOSTITUISCE gli
+	// items del gruppo, così l'ordine è quello di PRIMA apparizione della chiave ma il contenuto è
+	// dell'ULTIMO record — la stessa semantica del "last write wins" del log compattato di Kafka.
+	groups := make([][]T, 0, len(batch))
 	var byKey map[string]int
 
 	for _, r := range batch {
@@ -139,7 +139,7 @@ func Convert[T any](ctx context.Context, batch []*message.Record, compact bool, 
 		convertTotal.WithLabelValues(name, ConvertValid).Inc()
 
 		if !compact || len(r.Key) == 0 {
-			groups = append(groups, group{items: items})
+			groups = append(groups, items)
 			continue
 		}
 		if byKey == nil {
@@ -149,20 +149,13 @@ func Convert[T any](ctx context.Context, batch []*message.Record, compact bool, 
 		if i, seen := byKey[k]; seen {
 			res.Compacted++
 			convertTotal.WithLabelValues(name, ConvertCompacted).Inc()
-			groups[i].items = items
+			groups[i] = items
 			continue
 		}
 		byKey[k] = len(groups)
-		groups = append(groups, group{items: items})
+		groups = append(groups, items)
 	}
 
-	n := 0
-	for _, g := range groups {
-		n += len(g.items)
-	}
-	res.Items = make([]T, 0, n)
-	for _, g := range groups {
-		res.Items = append(res.Items, g.items...)
-	}
+	res.Items = slices.Concat(groups...)
 	return res
 }

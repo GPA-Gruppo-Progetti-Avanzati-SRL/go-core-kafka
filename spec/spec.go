@@ -26,7 +26,7 @@ package spec
 
 import (
 	"context"
-	"maps"
+	"fmt"
 	"time"
 
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
@@ -55,12 +55,26 @@ const (
 	// restano al valore di librdkafka — perché è ciò che garantisce che un delivery report ARRIVI:
 	// senza, un record accodato verso un broker partizionato può non produrre alcun esito, e chi lo
 	// attende resta appeso. Va imposto al client, non solo atteso lato Go.
-	DefaultDeliveryTimeout       = 2 * time.Minute
-	DefaultMaxAttempts           = 5
+	//
+	// Il valore è VINCOLATO da DefaultFlushTimeout e deve restare <= di quello: flush-timeout è
+	// quanto Close attende alla chiusura del producer, quindi un delivery-timeout più lungo
+	// significa che allo shutdown ci sono record ancora legittimamente in volo che Close abbandona
+	// (li riporta come "flush incompleto", ma sono persi). 30s di retry interni coprono
+	// un'indisponibilità transitoria; oltre, il batch fallisce, non viene committato e viene
+	// replayato — che è il recovery corretto, non una perdita.
+	DefaultDeliveryTimeout       = 30 * time.Second
 	DefaultRestartInitialBackoff = time.Second
-	DefaultRestartMaxBackoff     = 30 * time.Second
-	DefaultRestartMultiplier     = 2.0
-	DefaultRestartResetAfter     = 2 * time.Minute
+	// DefaultRestartMaxBackoff è il TETTO dell'attesa: con DefaultRestartMaxAttempts tentativi la
+	// sequenza è 1+2+4+8+16 e questo tetto non viene raggiunto. Serve a chi alza max-attempts o
+	// abbassa il multiplier — non è un valore inerte.
+	DefaultRestartMaxBackoff = 30 * time.Second
+	DefaultRestartMultiplier = 2.0
+	DefaultRestartResetAfter = 2 * time.Minute
+	// DefaultRestartMaxAttempts è FINITO di proposito: esaurito il budget il processo esce e il
+	// recovery passa all'orchestratore, che è il livello che sa se ha senso continuare. Cinque
+	// tentativi con i backoff di default sono ~31s di insistenza (1+2+4+8+16), e un run che dura
+	// almeno ResetAfter ricarica il budget — quindi un consumer sano non lo consuma mai.
+	DefaultRestartMaxAttempts = 5
 )
 
 // KafkaServer è tutto ciò che riguarda "come parliamo con Kafka": la connessione condivisa da tutti i
@@ -166,56 +180,12 @@ type ConsumerTuning struct {
 }
 
 // inherit riempie i campi non valorizzati con quelli del blocco globale `server.consumer`.
+//
+// La regola campo per campo sta in core.Inherit (go-core-app): è la stessa per tutti e tre i blocchi
+// — "non valorizzato ⇒ prendi il valore globale" — e scriverla qui per ognuno dei 17 campi aggiungeva
+// solo la possibilità di dimenticarne uno, con un campo che silenziosamente non eredita.
 func (t ConsumerTuning) inherit(g ConsumerTuning) ConsumerTuning {
-	if t.MaxBatchSize <= 0 {
-		t.MaxBatchSize = g.MaxBatchSize
-	}
-	if t.CutFrequency <= 0 {
-		t.CutFrequency = g.CutFrequency
-	}
-	if t.PollTimeout <= 0 {
-		t.PollTimeout = g.PollTimeout
-	}
-	if t.AutoOffsetReset == "" {
-		t.AutoOffsetReset = g.AutoOffsetReset
-	}
-	if t.SessionTimeoutMs <= 0 {
-		t.SessionTimeoutMs = g.SessionTimeoutMs
-	}
-	if t.HeartbeatIntervalMs <= 0 {
-		t.HeartbeatIntervalMs = g.HeartbeatIntervalMs
-	}
-	if t.FetchMinBytes <= 0 {
-		t.FetchMinBytes = g.FetchMinBytes
-	}
-	if t.FetchMaxBytes <= 0 {
-		t.FetchMaxBytes = g.FetchMaxBytes
-	}
-	if t.FetchWaitMaxMs <= 0 {
-		t.FetchWaitMaxMs = g.FetchWaitMaxMs
-	}
-	if t.MaxPartitionFetchBytes <= 0 {
-		t.MaxPartitionFetchBytes = g.MaxPartitionFetchBytes
-	}
-	if t.QueuedMaxMessagesKbytes <= 0 {
-		t.QueuedMaxMessagesKbytes = g.QueuedMaxMessagesKbytes
-	}
-	if t.MaxPollIntervalMs <= 0 {
-		t.MaxPollIntervalMs = g.MaxPollIntervalMs
-	}
-	if t.PartitionAssignmentStrategy == "" {
-		t.PartitionAssignmentStrategy = g.PartitionAssignmentStrategy
-	}
-	if t.IsolationLevel == "" {
-		t.IsolationLevel = g.IsolationLevel
-	}
-	if t.OnError == "" {
-		t.OnError = g.OnError
-	}
-	if t.DeadletterTopic == nil {
-		t.DeadletterTopic = g.DeadletterTopic
-	}
-	t.KafkaProperties = mergeProps(g.KafkaProperties, t.KafkaProperties)
+	core.Inherit(&t, &g)
 	return t
 }
 
@@ -290,55 +260,7 @@ type ProducerTuning struct {
 
 // inherit riempie i campi non valorizzati con quelli del blocco globale `server.producer`.
 func (p ProducerTuning) inherit(g ProducerTuning) ProducerTuning {
-	if p.Acks == "" {
-		p.Acks = g.Acks
-	}
-	if p.CompressionType == "" {
-		p.CompressionType = g.CompressionType
-	}
-	if p.LingerMs == nil {
-		p.LingerMs = g.LingerMs
-	}
-	if p.BatchSize <= 0 {
-		p.BatchSize = g.BatchSize
-	}
-	if p.BatchNumMessages <= 0 {
-		p.BatchNumMessages = g.BatchNumMessages
-	}
-	if p.MessageMaxBytes <= 0 {
-		p.MessageMaxBytes = g.MessageMaxBytes
-	}
-	if p.MessageSendMaxRetries <= 0 {
-		p.MessageSendMaxRetries = g.MessageSendMaxRetries
-	}
-	if p.MaxInFlight <= 0 {
-		p.MaxInFlight = g.MaxInFlight
-	}
-	if p.RetryBackoff <= 0 {
-		p.RetryBackoff = g.RetryBackoff
-	}
-	if p.DeliveryTimeout <= 0 {
-		p.DeliveryTimeout = g.DeliveryTimeout
-	}
-	if p.RequestTimeoutMs <= 0 {
-		p.RequestTimeoutMs = g.RequestTimeoutMs
-	}
-	if p.MetadataMaxIdleMs <= 0 {
-		p.MetadataMaxIdleMs = g.MetadataMaxIdleMs
-	}
-	if p.EnableIdempotence == nil {
-		p.EnableIdempotence = g.EnableIdempotence
-	}
-	if p.FlushTimeout <= 0 {
-		p.FlushTimeout = g.FlushTimeout
-	}
-	if p.TransactionTimeoutMs <= 0 {
-		p.TransactionTimeoutMs = g.TransactionTimeoutMs
-	}
-	if p.InitTransactionsTimeout <= 0 {
-		p.InitTransactionsTimeout = g.InitTransactionsTimeout
-	}
-	p.KafkaProperties = mergeProps(g.KafkaProperties, p.KafkaProperties)
+	core.Inherit(&p, &g)
 	return p
 }
 
@@ -364,26 +286,13 @@ func (p ProducerTuning) Idempotent() bool {
 // IsZero indica che il blocco non è stato scritto affatto. Serve a distinguere "il processor non ha
 // un blocco producer" da "ne ha uno con tutti i campi al default", per poter segnalare un override
 // che non avrà effetto (vedi l'avviso in modalità handle).
-func (p ProducerTuning) IsZero() bool {
-	return p.Acks == "" && p.CompressionType == "" && p.LingerMs == nil && p.BatchSize == 0 &&
-		p.BatchNumMessages == 0 && p.MessageMaxBytes == 0 && p.MessageSendMaxRetries == 0 &&
-		p.MaxInFlight == 0 && p.RetryBackoff == 0 && p.DeliveryTimeout == 0 &&
-		p.RequestTimeoutMs == 0 && p.MetadataMaxIdleMs == 0 && p.EnableIdempotence == nil &&
-		p.FlushTimeout == 0 && p.TransactionTimeoutMs == 0 && p.InitTransactionsTimeout == 0 &&
-		len(p.KafkaProperties) == 0
-}
+// Delega a isZeroStruct: ri-elencare i campi a mano era una seconda lista da tenere allineata, e
+// dimenticarne uno faceva sparire l'avviso.
+func (p ProducerTuning) IsZero() bool { return core.IsZeroStruct(p) }
 
-// mergeProps fonde due mappe di proprietà: `over` vince sulle chiavi comuni. Ritorna sempre una
-// mappa nuova, così l'eredità non muta il blocco globale condiviso da tutti i processor.
-func mergeProps(base, over map[string]string) map[string]string {
-	if len(base) == 0 && len(over) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(base)+len(over))
-	maps.Copy(out, base)
-	maps.Copy(out, over)
-	return out
-}
+// ptr è l'indirizzo di un valore costante: serve ai default dei campi puntatore, dove `&Costante`
+// non è scrivibile.
+func ptr[T any](v T) *T { return &v }
 
 // RestartSpec è il blocco `restart`: cosa fare quando il loop di consumo di un processor termina con
 // errore. La classificazione dell'errore la fa il driver (vedi internal/driver.Severity); qui c'è
@@ -401,11 +310,24 @@ type RestartSpec struct {
 	// (recovery delegata all'orchestratore). È *bool per poter essere disattivato da un processor
 	// quando il blocco globale lo attiva (e viceversa).
 	Disabled *bool `yaml:"disabled" mapstructure:"disabled" json:"disabled"`
-	// MaxAttempts: 0 = illimitati (default). Superato il limite l'errore risale e il processo esce.
-	MaxAttempts    int           `yaml:"max-attempts" mapstructure:"max-attempts" json:"max-attempts"`
+	// MaxAttempts è il numero di riavvii consecutivi concessi prima che l'errore risalga e il
+	// processo esca. Assente = DefaultRestartMaxAttempts.
+	//
+	// Un valore NEGATIVO (per convenzione -1) significa illimitati, ed è deliberatamente scomodo da
+	// scrivere: un riavvio senza limite maschera indefinitamente un guasto stabile — il loop infinito
+	// che questo knob esiste per evitare — e prima era ciò che si otteneva NON scrivendo nulla, perché
+	// 0 valeva "illimitati" ed è lo zero value. Ora **0 è rifiutato all'avvio**: chi l'ha scritto
+	// intendeva "illimitati" e va indirizzato a -1, o a `restart.disabled` se non vuole riavvii.
+	//
+	// È *int per due ragioni che coincidono: distinguere "assente" (eredita) da "scritto", e
+	// permettere a un processor di imporre un valore che cade nella soglia del non valorizzato.
+	MaxAttempts    *int          `yaml:"max-attempts" mapstructure:"max-attempts" json:"max-attempts"`
 	InitialBackoff time.Duration `yaml:"initial-backoff" mapstructure:"initial-backoff" json:"initial-backoff"`
 	MaxBackoff     time.Duration `yaml:"max-backoff" mapstructure:"max-backoff" json:"max-backoff"`
-	Multiplier     float64       `yaml:"multiplier" mapstructure:"multiplier" json:"multiplier"`
+	// Multiplier è *float64 perché 1 (backoff costante) è un valore legittimo che con un float
+	// semplice sarebbe indistinguibile da "assente". `gte=1`: sotto 1 il backoff si RIDURREBBE a ogni
+	// tentativo, che non è mai l'intenzione.
+	Multiplier *float64 `yaml:"multiplier" mapstructure:"multiplier" json:"multiplier" validate:"omitempty,gte=1"`
 	// ResetAfter: un run durato almeno questo tempo prima di fallire azzera il contatore dei
 	// tentativi. Senza, un processor che gira bene per giorni e poi fallisce erediterebbe i tentativi
 	// consumati mesi prima.
@@ -420,27 +342,7 @@ type RestartSpec struct {
 
 // inherit riempie i campi non valorizzati con quelli del blocco globale `server.restart`.
 func (r RestartSpec) inherit(g RestartSpec) RestartSpec {
-	if r.Disabled == nil {
-		r.Disabled = g.Disabled
-	}
-	if r.MaxAttempts < 1 {
-		r.MaxAttempts = g.MaxAttempts
-	}
-	if r.InitialBackoff <= 0 {
-		r.InitialBackoff = g.InitialBackoff
-	}
-	if r.MaxBackoff <= 0 {
-		r.MaxBackoff = g.MaxBackoff
-	}
-	if r.Multiplier <= 1 {
-		r.Multiplier = g.Multiplier
-	}
-	if r.ResetAfter <= 0 {
-		r.ResetAfter = g.ResetAfter
-	}
-	if r.OnBusinessError == nil {
-		r.OnBusinessError = g.OnBusinessError
-	}
+	core.Inherit(&r, &g)
 	return r
 }
 
@@ -452,17 +354,63 @@ func (r RestartSpec) WithDefaults() RestartSpec {
 	if r.MaxBackoff <= 0 {
 		r.MaxBackoff = DefaultRestartMaxBackoff
 	}
-	if r.Multiplier <= 1 {
-		r.Multiplier = DefaultRestartMultiplier
+	if r.Multiplier == nil {
+		r.Multiplier = new(DefaultRestartMultiplier)
 	}
 	if r.ResetAfter <= 0 {
 		r.ResetAfter = DefaultRestartResetAfter
 	}
-	if r.MaxAttempts <= 0 {
-		r.MaxAttempts = DefaultMaxAttempts
+	if r.MaxAttempts == nil {
+		r.MaxAttempts = new(DefaultRestartMaxAttempts)
 	}
-
 	return r
+}
+
+// Attempts è il numero di riavvii concessi; un valore negativo significa illimitati. Sul nil ritorna
+// il default, così l'accessor è usabile anche su uno spec non passato da Resolve.
+func (r RestartSpec) Attempts() int {
+	if r.MaxAttempts == nil {
+		return DefaultRestartMaxAttempts
+	}
+	return *r.MaxAttempts
+}
+
+// Unlimited: i riavvii sono illimitati solo per scelta esplicita (max-attempts negativo).
+func (r RestartSpec) Unlimited() bool { return r.Attempts() < 0 }
+
+// BackoffMultiplier: assente = DefaultRestartMultiplier.
+func (r RestartSpec) BackoffMultiplier() float64 {
+	if r.Multiplier == nil {
+		return DefaultRestartMultiplier
+	}
+	return *r.Multiplier
+}
+
+// Validate verifica la coerenza interna della politica su uno spec RISOLTO: le combinazioni che
+// rendono INEFFICACE il limite dei tentativi fermano l'avvio invece di passare inosservate. Salta
+// tutto se la supervisione è disattivata — lì la politica non ha effetto, e far cadere un'app per un
+// knob inerte sarebbe severità senza scopo.
+func (r RestartSpec) Validate(owner string) error {
+	if r.IsDisabled() {
+		return nil
+	}
+	if r.MaxAttempts != nil && *r.MaxAttempts == 0 {
+		return fmt.Errorf("%s: restart.max-attempts=0 non è ammesso usare -1 per riavvii davvero illimitati, oppure restart.disabled=true per non  tentare riavvi del consumer", owner)
+	}
+	if m := r.BackoffMultiplier(); m < 1 {
+		return fmt.Errorf("%s: restart.multiplier=%v < 1: il backoff si ridurrebbe a ogni tentativo", owner, m)
+	}
+	if r.MaxBackoff > 0 && r.InitialBackoff > r.MaxBackoff {
+		return fmt.Errorf("%s: restart.initial-backoff (%s) > restart.max-backoff (%s): la prima attesa sarebbe più lunga di tutte le successive", owner, r.InitialBackoff, r.MaxBackoff)
+	}
+	// reset-after è l'altra strada verso il riavvio senza fine: un run che dura almeno reset-after
+	// azzera il contatore, quindi con un valore piccolo un consumer che muore dopo pochi secondi
+	// ricarica il budget ogni volta e max-attempts diventa illimitato di fatto. Un run più breve di
+	// una singola attesa di backoff non può essere prova di salute.
+	if !r.Unlimited() && r.ResetAfter > 0 && r.ResetAfter <= r.MaxBackoff {
+		return fmt.Errorf("%s: restart.reset-after (%s) <= restart.max-backoff (%s): un run più breve di una singola attesa azzererebbe il contatore, rendendo inefficace max-attempts", owner, r.ResetAfter, r.MaxBackoff)
+	}
+	return nil
 }
 
 // IsDisabled: assente = false (supervisione attiva).

@@ -20,15 +20,16 @@ func newBackoff(cfg spec.RestartSpec) *backoff {
 	return &backoff{cfg: cfg, current: cfg.InitialBackoff}
 }
 
-// next ritorna l'attesa prima del prossimo tentativo. ok=false quando MaxAttempts è esaurito: a quel
-// punto l'errore risale e il processo termina.
+// next ritorna l'attesa prima del prossimo tentativo. ok=false quando il budget dei tentativi è
+// esaurito: a quel punto l'errore risale e il processo termina, lasciando il recovery
+// all'orchestratore. Il budget è illimitato solo su scelta esplicita (max-attempts negativo).
 func (b *backoff) next() (time.Duration, bool) {
-	if b.cfg.MaxAttempts > 0 && b.attempts >= b.cfg.MaxAttempts {
+	if !b.cfg.Unlimited() && b.attempts >= b.cfg.Attempts() {
 		return 0, false
 	}
 	b.attempts++
 	d := b.current
-	b.current = min(time.Duration(float64(b.current)*b.cfg.Multiplier), b.cfg.MaxBackoff)
+	b.current = min(time.Duration(float64(b.current)*b.cfg.BackoffMultiplier()), b.cfg.MaxBackoff)
 	return d, true
 }
 

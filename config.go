@@ -17,3 +17,22 @@ type Config struct {
 	// Transformer registrato.
 	Processors []spec.ProcessorSpec `yaml:"processors" mapstructure:"processors" json:"processors"`
 }
+
+// ActiveSpecs ritorna i processor ATTIVI (presenti nella lista e non disabled) già RISOLTI, nell'ordine
+// di config. È una passata sola su `processors`, usata dal wiring per due decisioni che prima ne
+// facevano due: quali processor fornire a fx e se serve il Producer condiviso del DLQ.
+//
+// Risolti perché `deadletter-topic` è EREDITABILE: un processor che lo prende da `server.consumer` non
+// lo ha scritto su di sé, ma il Producer gli serve lo stesso. L'engine rifà la risoluzione per conto
+// suo — Resolve è idempotente — e i campi che gli servono grezzi (kafka-properties del processor,
+// blocco producer scritto o assente) li legge dalla lista non risolta.
+func (c Config) ActiveSpecs() []spec.ProcessorSpec {
+	out := make([]spec.ProcessorSpec, 0, len(c.Processors))
+	for _, s := range c.Processors {
+		if s.Disabled {
+			continue
+		}
+		out = append(out, s.Resolve(c.Kafka))
+	}
+	return out
+}

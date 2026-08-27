@@ -10,7 +10,7 @@ var (
 
 	processedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "corekafka_processed_records_total",
-		Help: "Numero di record elaborati con successo (sink/transform) per consumer.",
+		Help: "Numero di record elaborati con successo (handle/transform) per consumer.",
 	}, []string{"consumer"})
 
 	producedTotal = prometheus.NewCounterVec(prometheus.CounterOpts{

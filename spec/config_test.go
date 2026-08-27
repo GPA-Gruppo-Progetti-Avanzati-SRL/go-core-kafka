@@ -45,8 +45,13 @@ func TestResolve_DefaultDellaLibreria(t *testing.T) {
 		t.Errorf("InitTransactionsTimeout = %v, atteso %v", got.Producer.InitTransactionsTimeout, DefaultInitTransactionsTimeout)
 	}
 	if got.Restart.InitialBackoff != DefaultRestartInitialBackoff || got.Restart.MaxBackoff != DefaultRestartMaxBackoff ||
-		got.Restart.Multiplier != DefaultRestartMultiplier || got.Restart.ResetAfter != DefaultRestartResetAfter {
+		got.Restart.BackoffMultiplier() != DefaultRestartMultiplier || got.Restart.ResetAfter != DefaultRestartResetAfter {
 		t.Errorf("default del restart non applicati: %+v", got.Restart)
+	}
+	// Il budget dei tentativi è FINITO per default: l'illimitato è una scelta esplicita (-1), non
+	// ciò che si ottiene non scrivendo nulla.
+	if got.Restart.Attempts() != DefaultRestartMaxAttempts || got.Restart.Unlimited() {
+		t.Errorf("max-attempts di default = %d (illimitati=%v), atteso %d finito", got.Restart.Attempts(), got.Restart.Unlimited(), DefaultRestartMaxAttempts)
 	}
 }
 
@@ -64,12 +69,12 @@ func TestResolve_Precedenza(t *testing.T) {
 			DeadletterTopic:  strPtr("comune.DLQ"),
 		},
 		Producer: ProducerTuning{Acks: "all", CompressionType: "snappy"},
-		Restart:  RestartSpec{MaxAttempts: 5, MaxBackoff: time.Minute},
+		Restart:  RestartSpec{MaxAttempts: ptr(5), MaxBackoff: time.Minute},
 	}
 	s := validSpec()
 	s.Consumer.SessionTimeoutMs = 30000 // override esplicito
 	s.Producer.Acks = "1"               // override esplicito
-	s.Restart.MaxAttempts = 2           // override esplicito
+	s.Restart.MaxAttempts = ptr(2)      // override esplicito
 
 	got := s.Resolve(server)
 
@@ -80,8 +85,8 @@ func TestResolve_Precedenza(t *testing.T) {
 	if got.Producer.Acks != "1" {
 		t.Errorf("producer.acks = %q, atteso l'override", got.Producer.Acks)
 	}
-	if got.Restart.MaxAttempts != 2 {
-		t.Errorf("restart.max-attempts = %d, atteso l'override", got.Restart.MaxAttempts)
+	if got.Restart.Attempts() != 2 {
+		t.Errorf("restart.max-attempts = %d, atteso l'override", got.Restart.Attempts())
 	}
 	// 2) il globale batte il default della libreria
 	if got.Consumer.MaxBatchSize != 100 {
@@ -128,10 +133,10 @@ func TestResolve_NonToccaLIdentita(t *testing.T) {
 // finisce in nessuna ConfigMap. Resta però sovrascrivibile campo per campo sul singolo processor.
 func TestResolve_RestartEreditatoCampoPerCampo(t *testing.T) {
 	server := KafkaServer{Restart: RestartSpec{
-		MaxAttempts:     5,
+		MaxAttempts:     ptr(5),
 		InitialBackoff:  2 * time.Second,
 		MaxBackoff:      time.Minute,
-		Multiplier:      3,
+		Multiplier:      ptr(3.0),
 		ResetAfter:      time.Hour,
 		OnBusinessError: boolPtr(true),
 	}}
@@ -144,7 +149,7 @@ func TestResolve_RestartEreditatoCampoPerCampo(t *testing.T) {
 		t.Errorf("InitialBackoff = %v, atteso l'override", got.InitialBackoff)
 	}
 	// L'override di un campo non deve azzerare gli altri del blocco.
-	if got.MaxAttempts != 5 || got.MaxBackoff != time.Minute || got.Multiplier != 3 || got.ResetAfter != time.Hour {
+	if got.Attempts() != 5 || got.MaxBackoff != time.Minute || got.BackoffMultiplier() != 3 || got.ResetAfter != time.Hour {
 		t.Errorf("l'override di un campo ha azzerato gli altri: %+v", got)
 	}
 	if !got.RestartsOnBusinessError() {
@@ -279,7 +284,7 @@ func TestResolve_Idempotente(t *testing.T) {
 	server := KafkaServer{
 		Consumer: ConsumerTuning{SessionTimeoutMs: 10000, MaxBatchSize: 100},
 		Producer: ProducerTuning{Acks: "all"},
-		Restart:  RestartSpec{MaxAttempts: 3},
+		Restart:  RestartSpec{MaxAttempts: ptr(3)},
 	}
 	once := validSpec().Resolve(server)
 	twice := once.Resolve(server)

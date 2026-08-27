@@ -104,100 +104,43 @@ func (s *shutdown) flushContext() (context.Context, context.CancelFunc) {
 
 // NewConsumers valida gli spec contro i processor registrati (fail-fast dal costruttore) e registra
 // nel lifecycle fx l'avvio/arresto cooperativo di una goroutine per consumer.
+// seams sono i due value group indicizzati per nome del processor. La modalità di un processor è
+// DERIVATA da quale dei due lo contiene, quindi qui vivono insieme.
+type seams struct {
+	handlers     map[string]processor.Handler
+	transformers map[string]processor.Transformer
+}
+
 func NewConsumers(p params) (*Consumers, error) {
-	handlers := make(map[string]processor.Handler, len(p.Handlers))
-	for _, h := range p.Handlers {
-		handlers[h.Consumer] = h.Handler
+	sm := seams{
+		handlers:     make(map[string]processor.Handler, len(p.Handlers)),
+		transformers: make(map[string]processor.Transformer, len(p.Transformers)),
 	}
-	transformers := make(map[string]processor.Transformer, len(p.Transformers))
+	for _, h := range p.Handlers {
+		sm.handlers[h.Consumer] = h.Handler
+	}
 	for _, t := range p.Transformers {
-		transformers[t.Consumer] = t.Transformer
+		sm.transformers[t.Consumer] = t.Transformer
 	}
 
 	// Le chiavi riservate in kafka-properties fermano l'avvio: sono invarianti dell'engine, non
 	// default sovrascrivibili (vedi spec.DeniedKafkaProperties).
-	for owner, props := range map[string]map[string]string{
-		"server":          p.Kafka.KafkaProperties,
-		"server.consumer": p.Kafka.Consumer.KafkaProperties,
-		"server.producer": p.Kafka.Producer.KafkaProperties,
-	} {
-		if err := spec.ValidateKafkaProperties(owner, props); err != nil {
-			return nil, err
-		}
+	if err := spec.ValidateServerProperties(p.Kafka); err != nil {
+		return nil, err
 	}
 
 	runners := make([]*runner, 0, len(p.Specs))
 	for _, raw := range p.Specs {
-		// Qui gli spec diventano quelli EFFETTIVI: Resolve eredita dai blocchi di `server` i campi
-		// non valorizzati e poi applica i default della libreria. Da questa riga in poi nessuno
-		// consulta più i blocchi globali — un campo letto da r.spec è già il valore giusto.
-		s := raw.Resolve(p.Kafka)
-
-		// È la lista `processors` di config a comandare l'attivazione; disabled=true la salta.
-		if s.Disabled {
-			log.Info().Str("processor", s.Name).Msg("corekafka: processor disabilitato (disabled=true), non attivato")
+		// È la lista `processors` di config a comandare l'attivazione; disabled=true la salta. Lo
+		// skip sta QUI e non in newRunner: è una decisione di attivazione, non di costruzione.
+		if raw.Disabled {
+			log.Info().Str("processor", raw.Name).Msg("corekafka: processor disabilitato (disabled=true), non attivato")
 			continue
 		}
-
-		for owner, props := range map[string]map[string]string{
-			"processor " + s.Name + " (consumer)": raw.Consumer.KafkaProperties,
-			"processor " + s.Name + " (producer)": raw.Producer.KafkaProperties,
-		} {
-			if err := spec.ValidateKafkaProperties(owner, props); err != nil {
-				return nil, err
-			}
+		r, err := newRunner(raw, p.Kafka, sm, p.Factory, p.DLQ)
+		if err != nil {
+			return nil, err
 		}
-
-		r := &runner{spec: s, kafka: p.Kafka, factory: p.Factory, dlq: p.DLQ}
-
-		// La modalità è DERIVATA dalla registrazione: nome nel gruppo kafka_handlers -> handle, in
-		// kafka_transformers -> transform. In entrambi -> ambiguo; in nessuno -> non registrato.
-		h, isHandler := handlers[s.Name]
-		t, isTransformer := transformers[s.Name]
-		switch {
-		case isHandler && isTransformer:
-			return nil, fmt.Errorf("processor %q: registrato sia come Handler sia come Transformer (ambiguo)", s.Name)
-		case isHandler:
-			r.handler = h
-			// In modalità handle il producer è quello CONDIVISO del processo (serve al DLQ): un
-			// blocco `producer` sul processor non ha un destinatario. Warning e non errore perché
-			// la modalità è derivata dalla registrazione, quindi chi scrive la config non ha modo di
-			// saperlo guardando solo il YAML.
-			if !raw.Producer.IsZero() {
-				log.Warn().Str("processor", s.Name).
-					Msg("corekafka: il blocco `producer` su un processor in modalità handle è ignorato (il producer del DLQ è condiviso): usare `server.producer`")
-			}
-			if s.Consumer.OnError == spec.OnErrorDeadletter && s.Consumer.Deadletter() == "" {
-				return nil, fmt.Errorf("processor %q: consumer.on-error=deadletter richiede consumer.deadletter-topic", s.Name)
-			}
-			// Il DLQ (via Producer condiviso) serve sia per la policy di default deadletter sia quando
-			// l'handler sceglie il deadletter a runtime (processor.DeadLetter): se c'è un
-			// deadletter-topic, il Producer deve essere presente.
-			if s.HasDeadletter() && p.DLQ == nil {
-				return nil, fmt.Errorf("processor %q: consumer.deadletter-topic impostato richiede il Producer (usare corekafka.WithProducer)", s.Name)
-			}
-		case isTransformer:
-			r.transformer = t
-			if s.TransactionalID == "" {
-				return nil, fmt.Errorf("processor %q (transform): transactional-id obbligatorio", s.Name)
-			}
-		default:
-			return nil, fmt.Errorf("processor %q: nessun processor registrato (usare corekafka.RegisterHandler o RegisterTransformer con questo nome)", s.Name)
-		}
-
-		// Configure opzionale: passa le Properties dello spec all'handler/transformer che le vuole
-		// all'avvio (precompute/validazione). Un errore fa fail-fast: l'app non parte.
-		if c, ok := r.handler.(processor.Configurable); ok {
-			if err := c.Configure(s.Properties); err != nil {
-				return nil, fmt.Errorf("processor %q: Configure: %w", s.Name, err)
-			}
-		}
-		if c, ok := r.transformer.(processor.Configurable); ok {
-			if err := c.Configure(s.Properties); err != nil {
-				return nil, fmt.Errorf("processor %q: Configure: %w", s.Name, err)
-			}
-		}
-
 		runners = append(runners, r)
 	}
 
@@ -257,6 +200,95 @@ func NewConsumers(p params) (*Consumers, error) {
 	return &Consumers{}, nil
 }
 
+// newRunner costruisce il runner di un processor attivo: risolve lo spec, ne verifica la coerenza,
+// deriva la modalità dalla registrazione e passa le properties a chi le vuole all'avvio.
+//
+// Sta fuori da NewConsumers perché è la parte PER-PROCESSOR: lì dentro il ciclo di vita fx — la
+// ragione per cui quel costruttore esiste — restava sepolto sotto cento righe di validazione.
+func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Factory, dlq *producer.Producer) (*runner, error) {
+	// Qui lo spec diventa quello EFFETTIVO: Resolve eredita dai blocchi di `server` i campi non
+	// valorizzati e poi applica i default della libreria. Da questa riga in poi nessuno consulta più
+	// i blocchi globali — un campo letto da r.spec è già il valore giusto.
+	s := raw.Resolve(k)
+
+	// I blocchi RAW del processor, non quelli risolti: le chiavi riservate vanno attribuite a chi le
+	// ha scritte, e un blocco ereditato è già stato validato al livello di `server`.
+	for _, blk := range []struct {
+		owner string
+		props map[string]string
+	}{
+		{"processor " + s.Name + " (consumer)", raw.Consumer.KafkaProperties},
+		{"processor " + s.Name + " (producer)", raw.Producer.KafkaProperties},
+	} {
+		if err := spec.ValidateKafkaProperties(blk.owner, blk.props); err != nil {
+			return nil, err
+		}
+	}
+
+	// Politica di riavvio: le combinazioni che renderebbero inefficace il limite dei tentativi
+	// fermano l'avvio invece di passare inosservate (vedi RestartSpec.Validate).
+	if err := s.Restart.Validate("processor " + s.Name); err != nil {
+		return nil, err
+	}
+	if s.Restart.Unlimited() && !s.Restart.IsDisabled() {
+		log.Warn().Str("processor", s.Name).
+			Msg("corekafka: restart.max-attempts negativo = riavvii ILLIMITATI: un guasto stabile verrà mascherato indefinitamente invece di far uscire il processo. Guardare corekafka_consumer_restarts_total: una crescita continua senza record consumati è quel caso")
+	}
+
+	r := &runner{spec: s, kafka: k, factory: f, dlq: dlq}
+
+	// La modalità è DERIVATA dalla registrazione: nome nel gruppo kafka_handlers -> handle, in
+	// kafka_transformers -> transform. In entrambi -> ambiguo; in nessuno -> non registrato.
+	h, isHandler := sm.handlers[s.Name]
+	t, isTransformer := sm.transformers[s.Name]
+	switch {
+	case isHandler && isTransformer:
+		return nil, fmt.Errorf("processor %q: registrato sia come Handler sia come Transformer (ambiguo)", s.Name)
+	case isHandler:
+		r.handler = h
+		// In modalità handle il producer è quello CONDIVISO del processo (serve al DLQ): un blocco
+		// `producer` sul processor non ha un destinatario. Warning e non errore perché la modalità è
+		// derivata dalla registrazione, quindi chi scrive la config non ha modo di saperlo guardando
+		// solo il YAML.
+		if !raw.Producer.IsZero() {
+			log.Warn().Str("processor", s.Name).
+				Msg("corekafka: il blocco `producer` su un processor in modalità handle è ignorato (il producer del DLQ è condiviso): usare `server.producer`")
+		}
+		if s.Consumer.OnError == spec.OnErrorDeadletter && s.Consumer.Deadletter() == "" {
+			return nil, fmt.Errorf("processor %q: consumer.on-error=deadletter richiede consumer.deadletter-topic", s.Name)
+		}
+		// Il DLQ (via Producer condiviso) serve sia per la policy di default deadletter sia quando
+		// l'handler sceglie il deadletter a runtime (processor.DeadLetter): se c'è un
+		// deadletter-topic, il Producer deve essere presente.
+		if s.HasDeadletter() && dlq == nil {
+			return nil, fmt.Errorf("processor %q: consumer.deadletter-topic impostato richiede il Producer (usare corekafka.WithProducer)", s.Name)
+		}
+	case isTransformer:
+		r.transformer = t
+		if s.TransactionalID == "" {
+			return nil, fmt.Errorf("processor %q (transform): transactional-id obbligatorio", s.Name)
+		}
+	default:
+		return nil, fmt.Errorf("processor %q: nessun processor registrato (usare corekafka.RegisterHandler o RegisterTransformer con questo nome)", s.Name)
+	}
+
+	// Configure opzionale: passa le Properties dello spec al seam che le vuole all'avvio
+	// (precompute/validazione). Un errore fa fail-fast: l'app non parte. Il loop copre i due seam
+	// insieme — solo uno è valorizzato, e l'assertion su un'interfaccia nil è false — perché scritto
+	// due volte era una coppia da ricordarsi di aggiornare in parallelo.
+	for _, seam := range []any{r.handler, r.transformer} {
+		c, ok := seam.(processor.Configurable)
+		if !ok {
+			continue
+		}
+		if err := c.Configure(s.Properties); err != nil {
+			return nil, fmt.Errorf("processor %q: Configure: %w", s.Name, err)
+		}
+	}
+
+	return r, nil
+}
+
 // run supervisiona il consumo: esegue il loop e, se termina con errore, decide se ricostruire il
 // client e riprovare dopo un backoff o lasciare risalire l'errore (che fa terminare il processo).
 //
@@ -287,7 +319,7 @@ func (r *runner) run(ctx context.Context) error {
 		}
 		wait, ok := b.next()
 		if !ok {
-			return fmt.Errorf("processor %q: esauriti i %d tentativi di riavvio: %w", r.spec.Name, r.spec.Restart.MaxAttempts, err)
+			return fmt.Errorf("processor %q: esauriti i %d tentativi di riavvio: %w", r.spec.Name, r.spec.Restart.Attempts(), err)
 		}
 
 		restartsTotal.WithLabelValues(r.spec.Name, sev.String()).Inc()
@@ -396,7 +428,7 @@ func (r *runner) absorb(ctx context.Context, err error, s driver.Session, batch 
 	n := len(*batch)
 	*batch = (*batch)[:0]
 	batchDiscardedTotal.WithLabelValues(r.spec.Name, sev.String()).Add(float64(n))
-	log.Warn().Err(err).Str("consumer", r.spec.Name).Int("records", n).
+	log.Info().Err(err).Str("consumer", r.spec.Name).Int("records", n).
 		Msg("corekafka: batch scartato senza commit, il consumo prosegue")
 	return true
 }
@@ -446,6 +478,17 @@ func (r *runner) consume(ctx context.Context, s driver.Session, f flusher) error
 		return nil
 	}
 
+	// cut chiude il batch e assorbe gli eventi di protocollo. È una closure perché la stessa sequenza
+	// serve al taglio a tempo e a quello a dimensione, e scriverla due volte è il modo in cui due rami
+	// dello stesso loop divergono.
+	cut := func(c context.Context) error {
+		err := flush(c)
+		if err == nil || r.absorb(c, err, s, &batch) {
+			return nil
+		}
+		return err
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -466,15 +509,13 @@ func (r *runner) consume(ctx context.Context, s driver.Session, f flusher) error
 			}
 			return nil
 		case <-ticker.C:
-			if err := flush(ctx); err != nil {
-				if r.absorb(ctx, err, s, &batch) {
-					continue
-				}
+			if err := cut(ctx); err != nil {
 				return err
 			}
 		default:
 			rec, err := s.Poll(ctx, r.spec.Consumer.PollTimeout)
 			if err != nil {
+				// Qui non c'è nessun flush di mezzo: non è la sequenza di cut.
 				if r.absorb(ctx, err, s, &batch) {
 					continue
 				}
@@ -486,10 +527,7 @@ func (r *runner) consume(ctx context.Context, s driver.Session, f flusher) error
 			consumedTotal.WithLabelValues(r.spec.Name).Inc()
 			batch = append(batch, rec)
 			if len(batch) >= r.spec.Consumer.MaxBatchSize {
-				if err := flush(ctx); err != nil {
-					if r.absorb(ctx, err, s, &batch) {
-						continue
-					}
+				if err := cut(ctx); err != nil {
 					return err
 				}
 			}
@@ -528,10 +566,11 @@ func (h handleFlusher) flush(ctx context.Context, batch []*message.Record) error
 			return err // DLQ non configurato/irraggiungibile → replay
 		}
 		deadletteredTotal.WithLabelValues(r.spec.Name).Add(float64(len(poison)))
-		processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch) - len(poison)))
-	case outcomeCommit:
-		processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch)))
 	}
+	// Una sola volta, fuori dallo switch: nel ramo commit `poison` è vuoto, quindi l'espressione era
+	// la stessa scritta due volte — ed è la forma che transformFlusher ha già. Due contabilità
+	// simmetriche scritte in modi diversi divergono senza che nessuno lo veda, se non su un grafico.
+	processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch) - len(poison)))
 	return h.gc.Commit(ctx)
 }
 
