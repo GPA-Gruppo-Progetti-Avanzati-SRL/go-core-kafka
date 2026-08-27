@@ -21,7 +21,7 @@ type Producer struct {
 // Produce invia i record e attende i delivery report.
 func (p *Producer) Produce(ctx context.Context, recs []*message.ProducerRecord) *core.ApplicationError {
 	if err := p.d.Produce(ctx, recs); err != nil {
-		return core.TechnicalErrorWithError(err)
+		return core.TechnicalError().WithCause(err)
 	}
 	return nil
 }
