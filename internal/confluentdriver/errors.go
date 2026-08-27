@@ -30,6 +30,7 @@ var permanentCodes = map[kafka.ErrorCode]struct{}{
 	kafka.ErrInvalidArg:                         {},
 	kafka.ErrSecurityDisabled:                   {},
 	kafka.ErrUnsupportedVersion:                 {},
+	kafka.ErrUnknownTopicOrPart:                 {},
 }
 
 // resetCodes: eventi del protocollo di consumer group. Il client resta valido; va scartato il batch
