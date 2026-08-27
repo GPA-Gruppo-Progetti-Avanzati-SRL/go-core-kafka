@@ -51,11 +51,11 @@ const (
 	DefaultFlushTimeout            = 60 * time.Second
 	DefaultPollTimeout             = 100 * time.Millisecond
 	DefaultInitTransactionsTimeout = 60 * time.Second
-
-	DefaultRestartInitialBackoff = time.Second
-	DefaultRestartMaxBackoff     = 30 * time.Second
-	DefaultRestartMultiplier     = 2.0
-	DefaultRestartResetAfter     = 2 * time.Minute
+	DefaultMaxAttempts             = 5
+	DefaultRestartInitialBackoff   = time.Second
+	DefaultRestartMaxBackoff       = 30 * time.Second
+	DefaultRestartMultiplier       = 2.0
+	DefaultRestartResetAfter       = 2 * time.Minute
 )
 
 // KafkaServer è tutto ciò che riguarda "come parliamo con Kafka": la connessione condivisa da tutti i
@@ -415,7 +415,7 @@ func (r RestartSpec) inherit(g RestartSpec) RestartSpec {
 	if r.Disabled == nil {
 		r.Disabled = g.Disabled
 	}
-	if r.MaxAttempts <= 0 {
+	if r.MaxAttempts < 1 {
 		r.MaxAttempts = g.MaxAttempts
 	}
 	if r.InitialBackoff <= 0 {
@@ -450,6 +450,10 @@ func (r RestartSpec) WithDefaults() RestartSpec {
 	if r.ResetAfter <= 0 {
 		r.ResetAfter = DefaultRestartResetAfter
 	}
+	if r.MaxAttempts <= 0 {
+		r.MaxAttempts = DefaultMaxAttempts
+	}
+
 	return r
 }
 

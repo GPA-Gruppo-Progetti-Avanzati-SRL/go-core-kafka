@@ -28,10 +28,7 @@ func (b *backoff) next() (time.Duration, bool) {
 	}
 	b.attempts++
 	d := b.current
-	b.current = time.Duration(float64(b.current) * b.cfg.Multiplier)
-	if b.current > b.cfg.MaxBackoff {
-		b.current = b.cfg.MaxBackoff
-	}
+	b.current = min(time.Duration(float64(b.current)*b.cfg.Multiplier), b.cfg.MaxBackoff)
 	return d, true
 }
 

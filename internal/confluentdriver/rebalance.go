@@ -47,7 +47,7 @@ func (o *rebalanceObserver) callback(_ *kafka.Consumer, ev kafka.Event) error {
 		o.revoked = true
 		log.Warn().Str("consumer", o.name).Int("partitions", len(e.Partitions)).
 			Str("assignment", e.String()).
-			Msg("corekafka: partizioni revocate, offset non committati scartati")
+			Msg("corekafka: partizioni revocate")
 	}
 	return nil
 }
