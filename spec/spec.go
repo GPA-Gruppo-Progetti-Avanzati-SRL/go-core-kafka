@@ -217,6 +217,37 @@ func (t ConsumerTuning) WithDefaults() ConsumerTuning {
 	return t
 }
 
+// Validate verifica le RELAZIONI fra i knob del consumer su uno spec risolto. I valori presi
+// singolarmente li coprono già i tag `validate:`; qui stanno le combinazioni che, prese una per una,
+// sono tutte legittime e insieme non lo sono — la stessa ragione per cui esiste RestartSpec.Validate.
+//
+// Solo relazioni fra campi ENTRAMBI valorizzati: uno zero significa "lascia il default di librdkafka"
+// (vedi il commento in testa al package), e inventarsi il valore implicito per poterlo confrontare
+// significherebbe far fallire l'avvio su una configurazione che nessuno ha scritto.
+func (t ConsumerTuning) Validate(owner string) error {
+	// librdkafka vuole l'heartbeat comodamente dentro la sessione: oltre un terzo del session-timeout
+	// basta perdere un battito per farsi espellere dal gruppo, e l'espulsione non si presenta come un
+	// errore di config ma come un rebalance inspiegabile a intermittenza.
+	if t.SessionTimeoutMs > 0 && t.HeartbeatIntervalMs > 0 && t.HeartbeatIntervalMs*3 >= t.SessionTimeoutMs {
+		return fmt.Errorf("%s: consumer.heartbeat-interval-ms (%d) deve stare sotto un terzo di consumer.session-timeout-ms (%d): con questo rapporto un solo battito perso fa espellere il consumer dal gruppo",
+			owner, t.HeartbeatIntervalMs, t.SessionTimeoutMs)
+	}
+	// Due watchdog che si contraddicono: se l'intervallo massimo fra due poll è più corto della
+	// sessione, a scadere è sempre il primo e session-timeout-ms non è mai raggiungibile — cioè uno
+	// dei due valori configurati non ha alcun effetto.
+	if t.MaxPollIntervalMs > 0 && t.SessionTimeoutMs > 0 && t.MaxPollIntervalMs < t.SessionTimeoutMs {
+		return fmt.Errorf("%s: consumer.max-poll-interval-ms (%d) < consumer.session-timeout-ms (%d): il primo scade sempre per primo, quindi il secondo non ha effetto",
+			owner, t.MaxPollIntervalMs, t.SessionTimeoutMs)
+	}
+	// Il ticker del taglio è osservato FRA due poll (vedi il loop di consumo): con un poll più lungo
+	// del taglio, cut-frequency non è rispettabile e il batch si chiude quando capita.
+	if t.CutFrequency > 0 && t.PollTimeout >= t.CutFrequency {
+		return fmt.Errorf("%s: consumer.poll-timeout (%s) >= consumer.cut-frequency (%s): il taglio a tempo è osservato fra due poll, quindi non potrebbe mai rispettare la frequenza richiesta",
+			owner, t.PollTimeout, t.CutFrequency)
+	}
+	return nil
+}
+
 // ProducerTuning è il blocco `producer`: come si produce. Vale per il producer condiviso del processo
 // (DLQ della modalità handle, Producer pubblico) quando sta in `server.producer`, e per il producer
 // TRANSAZIONALE di un singolo processor quando sta in `processors[].producer` — è quello l'unico
@@ -276,6 +307,21 @@ func (p ProducerTuning) WithDefaults() ProducerTuning {
 		p.InitTransactionsTimeout = DefaultInitTransactionsTimeout
 	}
 	return p
+}
+
+// Validate verifica le relazioni fra i knob del producer su uno spec risolto (vedi
+// ConsumerTuning.Validate per il criterio).
+func (p ProducerTuning) Validate(owner string) error {
+	// flush-timeout è quanto Close attende per svuotare la coda; delivery-timeout è quanto il client
+	// insiste su un singolo record. Se il secondo è più lungo, alla chiusura ci sono record ancora
+	// LEGITTIMAMENTE in volo che Close abbandona: li riporta come "flush incompleto", ma sono persi.
+	// È l'incoerenza che TestDefaults_SonoCoerenti ha trovato nei default della libreria; qui la stessa
+	// regola vale per ciò che scrive l'utente.
+	if p.DeliveryTimeout > 0 && p.FlushTimeout > 0 && p.DeliveryTimeout > p.FlushTimeout {
+		return fmt.Errorf("%s: producer.delivery-timeout (%s) > producer.flush-timeout (%s): alla chiusura i record ancora in volo verrebbero abbandonati",
+			owner, p.DeliveryTimeout, p.FlushTimeout)
+	}
+	return nil
 }
 
 // Idempotent indica se il producer va configurato come idempotente (default: sì).

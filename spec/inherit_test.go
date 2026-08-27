@@ -165,22 +165,74 @@ func TestIsZero_ProducerTuning(t *testing.T) {
 func TestDefaults_SonoCoerenti(t *testing.T) {
 	// I default della libreria devono superare le validazioni della libreria: un default che non le
 	// passa è un'app che non parte senza che nessuno abbia configurato niente.
+	// Le regole non sono più riscritte qui: sono i Validate della libreria, gli stessi che girano
+	// all'avvio su ogni processor. Prima questo test ne teneva una copia a mano — utile finché i
+	// Validate non esistevano, ma una seconda scrittura della stessa regola è una regola che diverge.
 	got := validSpec().Resolve(KafkaServer{})
-	if err := got.Restart.Validate("default"); err != nil {
-		t.Errorf("i default del restart non superano la propria validazione: %v", err)
+	for name, check := range map[string]func(string) error{
+		"restart":  got.Restart.Validate,
+		"consumer": got.Consumer.Validate,
+		"producer": got.Producer.Validate,
+	} {
+		if err := check("default"); err != nil {
+			t.Errorf("i default di %s non superano la propria validazione: %v", name, err)
+		}
 	}
+}
 
-	// delivery-timeout <= flush-timeout: flush-timeout è quanto Close attende alla chiusura del
-	// producer, quindi un delivery-timeout più lungo lascia allo shutdown record ancora
-	// legittimamente in volo che Close abbandona.
-	if DefaultDeliveryTimeout > DefaultFlushTimeout {
-		t.Errorf("delivery-timeout di default (%v) > flush-timeout (%v): alla chiusura si perdono i record ancora in volo",
-			DefaultDeliveryTimeout, DefaultFlushTimeout)
+func TestConsumerTuningValidate(t *testing.T) {
+	base := func() ConsumerTuning { return ConsumerTuning{}.WithDefaults() }
+	tests := []struct {
+		name    string
+		mutate  func(*ConsumerTuning)
+		wantErr bool
+	}{
+		{"default coerenti", func(*ConsumerTuning) {}, false},
+		// Un solo campo valorizzato non ha con cosa contraddirsi: lo zero significa "lascia il default
+		// di librdkafka", e inventarsi il valore implicito per confrontarlo farebbe fallire l'avvio su
+		// una configurazione che nessuno ha scritto.
+		{"solo session-timeout", func(c *ConsumerTuning) { c.SessionTimeoutMs = 10000 }, false},
+		{"solo heartbeat", func(c *ConsumerTuning) { c.HeartbeatIntervalMs = 3000 }, false},
+		{"heartbeat sotto un terzo", func(c *ConsumerTuning) {
+			c.SessionTimeoutMs, c.HeartbeatIntervalMs = 10000, 3000
+		}, false},
+		{"heartbeat esattamente un terzo", func(c *ConsumerTuning) {
+			c.SessionTimeoutMs, c.HeartbeatIntervalMs = 9000, 3000
+		}, true},
+		{"heartbeat oltre un terzo", func(c *ConsumerTuning) {
+			c.SessionTimeoutMs, c.HeartbeatIntervalMs = 10000, 8000
+		}, true},
+		{"max-poll sopra la sessione", func(c *ConsumerTuning) {
+			c.SessionTimeoutMs, c.MaxPollIntervalMs = 10000, 300000
+		}, false},
+		{"max-poll sotto la sessione", func(c *ConsumerTuning) {
+			c.SessionTimeoutMs, c.MaxPollIntervalMs = 45000, 10000
+		}, true},
+		{"poll-timeout oltre il taglio", func(c *ConsumerTuning) {
+			c.PollTimeout, c.CutFrequency = 2*time.Second, time.Second
+		}, true},
 	}
-	// poll-timeout è la granularità con cui l'engine osserva il ticker del taglio: se fosse più
-	// lungo, cut-frequency non sarebbe rispettabile.
-	if DefaultPollTimeout >= DefaultCutFrequency {
-		t.Errorf("poll-timeout (%v) >= cut-frequency (%v)", DefaultPollTimeout, DefaultCutFrequency)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := base()
+			tc.mutate(&c)
+			if err := c.Validate("test"); (err != nil) != tc.wantErr {
+				t.Errorf("Validate = %v, atteso errore = %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// L'incoerenza che TestDefaults_SonoCoerenti aveva trovato nei default della libreria è ora una
+// regola imposta anche a ciò che scrive l'utente.
+func TestProducerTuningValidate(t *testing.T) {
+	p := ProducerTuning{}.WithDefaults()
+	if err := p.Validate("test"); err != nil {
+		t.Fatalf("default = %v, atteso nil", err)
+	}
+	p.DeliveryTimeout = p.FlushTimeout + time.Second
+	if err := p.Validate("test"); err == nil {
+		t.Error("delivery-timeout > flush-timeout: atteso errore, i record in volo verrebbero abbandonati")
 	}
 }
 

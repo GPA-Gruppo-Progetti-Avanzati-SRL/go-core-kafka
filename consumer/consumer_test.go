@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -755,8 +756,11 @@ func newEngine(t *testing.T, gc driver.GroupConsumer) *fakeLifecycle {
 	_, err := NewConsumers(params{
 		LC:         lc,
 		Shutdowner: fakeShutdowner{},
-		Specs:      []spec.ProcessorSpec{s},
-		Factory:    &fakeFactory{consumers: []driver.GroupConsumer{gc}},
+		// bootstrap-servers è obbligatorio: NewConsumers valida ora la sezione `server` coi suoi tag,
+		// e uno zero value non è più una config accettabile — che è il punto della validazione.
+		Server:  spec.KafkaServer{BootstrapServers: "broker:9092"},
+		Specs:   []spec.ProcessorSpec{s},
+		Factory: &fakeFactory{consumers: []driver.GroupConsumer{gc}},
 		Handlers: []processor.HandlerRegistration{{
 			Consumer: "test",
 			Handler:  handlerFunc(func(context.Context, []*message.Record) error { return nil }),
@@ -812,5 +816,41 @@ func TestOnStop_ConsumerAppesoNonImpedisceLArresto(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("OnStop non è tornata: l'arresto dipende ancora dal fatto che ogni runner termini")
+	}
+}
+
+// resolveTopics è ciò che sta fra il Transformer e il broker: un record senza destinazione veniva
+// prodotto verso il topic "", e il fallimento arrivava dal client senza nominare né il processor né
+// la chiave di config da correggere.
+func TestResolveTopics(t *testing.T) {
+	r := &runner{spec: spec.ProcessorSpec{Name: "tx", DefaultOutputTopic: "out"}}
+
+	recs := []*message.ProducerRecord{{}, {Topic: "esplicito"}}
+	if err := r.resolveTopics(recs); err != nil {
+		t.Fatalf("resolveTopics = %v, atteso nil", err)
+	}
+	if recs[0].Topic != "out" {
+		t.Errorf("Topic = %q, atteso il default-output-topic", recs[0].Topic)
+	}
+	if recs[1].Topic != "esplicito" {
+		t.Errorf("Topic = %q: il default non deve sovrascrivere quello scritto dal Transformer", recs[1].Topic)
+	}
+}
+
+func TestResolveTopics_SenzaDestinazione(t *testing.T) {
+	// Senza default-output-topic un record che non porta il proprio Topic non sa dove andare.
+	senzaDefault := &runner{spec: spec.ProcessorSpec{Name: "tx"}}
+	err := senzaDefault.resolveTopics([]*message.ProducerRecord{{Topic: "a"}, {}})
+	if err == nil {
+		t.Fatal("record senza Topic e senza default: atteso errore invece della produzione sul topic vuoto")
+	}
+	if !strings.Contains(err.Error(), "tx") || !strings.Contains(err.Error(), "default-output-topic") {
+		t.Errorf("errore = %q, atteso che nomini il processor e la chiave di config", err)
+	}
+
+	// Il fan-out topic→topic — un Transformer che instrada da sé ogni record — resta legittimo e non
+	// richiede alcun default: pretenderlo al boot vieterebbe il caso d'uso.
+	if err := senzaDefault.resolveTopics([]*message.ProducerRecord{{Topic: "a"}, {Topic: "b"}}); err != nil {
+		t.Errorf("fan-out con Topic su ogni record = %v, atteso nil", err)
 	}
 }

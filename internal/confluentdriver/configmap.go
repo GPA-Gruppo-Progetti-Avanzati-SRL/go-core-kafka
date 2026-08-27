@@ -11,6 +11,13 @@ import (
 // Regola di tutto questo file: un knob NON valorizzato non viene scritto nella ConfigMap, così resta
 // il default di librdkafka. Scrivere lo zero al posto di omettere la chiave significherebbe imporre
 // "0" a proprietà dove zero è un valore legittimo e molto diverso dal default.
+//
+// Sugli errori: `set` esiste perché kafka.ConfigMap.SetKey ritorna un error che è STRUTTURALMENTE
+// sempre nil — è un assegnamento di mappa — e tredici `set(cm, ...)` sparsi nel file lasciavano
+// intendere che qui si stesse ingoiando qualcosa. Non è così: una chiave sconosciuta o un valore non
+// accettato sono rifiutati da librdkafka al momento della costruzione del client, dove
+// kafka.NewConsumer/NewProducer ritornano un ErrInvalidArg che cita la proprietà per nome. wrap lo
+// classifica SeverityPermanent, quindi il processo esce — che è il fail-fast voluto, e avviene già.
 
 // consumerConfigMap traduce KafkaServer + ProcessorSpec nella kafka.ConfigMap del consumer. Lo spec
 // arriva GIÀ RISOLTO (ProcessorSpec.Resolve): il tuning sta in s.Consumer e qui non si conosce
@@ -55,14 +62,14 @@ func producerConfigMap(transactionalID, owner string, p spec.ProducerTuning, k s
 	cm := &kafka.ConfigMap{"bootstrap.servers": k.BootstrapServers}
 
 	if transactionalID != "" {
-		_ = cm.SetKey("transactional.id", transactionalID)
+		set(cm, "transactional.id", transactionalID)
 		if p.TransactionTimeoutMs > 0 {
-			_ = cm.SetKey("transaction.timeout.ms", p.TransactionTimeoutMs)
+			set(cm, "transaction.timeout.ms", p.TransactionTimeoutMs)
 		}
 	} else {
 		// enable.idempotence forza acks=all e il retry ordinato: è il default storico di
 		// go-core-kafka, disattivabile solo esplicitamente.
-		_ = cm.SetKey("enable.idempotence", p.Idempotent())
+		set(cm, "enable.idempotence", p.Idempotent())
 	}
 
 	typed := map[string]any{
@@ -81,7 +88,7 @@ func producerConfigMap(transactionalID, owner string, p spec.ProducerTuning, k s
 	setIfSet(cm, typed)
 	// linger.ms è un *int proprio per poter impostare 0 (invia subito): setIfSet lo scarterebbe.
 	if p.LingerMs != nil {
-		_ = cm.SetKey("linger.ms", *p.LingerMs)
+		set(cm, "linger.ms", *p.LingerMs)
 	}
 
 	applyCommon(cm, k)
@@ -101,19 +108,19 @@ func applyCommon(cm *kafka.ConfigMap, k spec.KafkaServer) {
 	})
 	// socket.keepalive.enable si imposta solo se true: false è già il default.
 	if k.SocketKeepaliveEnable {
-		_ = cm.SetKey("socket.keepalive.enable", true)
+		set(cm, "socket.keepalive.enable", true)
 	}
 }
 
 // applySecurity mappa security-protocol / SASL / TLS sulle chiavi dotted di librdkafka.
 func applySecurity(cm *kafka.ConfigMap, k spec.KafkaServer) {
 	if k.SecurityProtocol != "" {
-		_ = cm.SetKey("security.protocol", k.SecurityProtocol)
+		set(cm, "security.protocol", k.SecurityProtocol)
 	}
 	if k.SASL.Mechanisms != "" {
-		_ = cm.SetKey("sasl.mechanism", k.SASL.Mechanisms)
-		_ = cm.SetKey("sasl.username", k.SASL.Username)
-		_ = cm.SetKey("sasl.password", k.SASL.Password)
+		set(cm, "sasl.mechanism", k.SASL.Mechanisms)
+		set(cm, "sasl.username", k.SASL.Username)
+		set(cm, "sasl.password", k.SASL.Password)
 	}
 	setIfSet(cm, map[string]any{
 		"ssl.ca.location": k.SSL.CaLocation,
@@ -123,7 +130,7 @@ func applySecurity(cm *kafka.ConfigMap, k spec.KafkaServer) {
 		"ssl.key.password":         k.SSL.KeyPassword,
 	})
 	if k.SSL.SkipVerify {
-		_ = cm.SetKey("enable.ssl.certificate.verification", false)
+		set(cm, "enable.ssl.certificate.verification", false)
 	}
 }
 
@@ -143,8 +150,14 @@ func applyKafkaProperties(cm *kafka.ConfigMap, owner string, props map[string]st
 				Interface("overridden", prev).Str("value", normalized[key]).
 				Msg("corekafka: kafka-properties sovrascrive una proprietà già impostata dalla config tipizzata")
 		}
-		_ = cm.SetKey(key, normalized[key])
+		set(cm, key, normalized[key])
 	}
+}
+
+// set scrive una chiave. Ignora l'error di SetKey perché non ne esiste uno: vedi il commento in testa
+// al file per dove avviene il rifiuto reale.
+func set(cm *kafka.ConfigMap, key string, value kafka.ConfigValue) {
+	_ = cm.SetKey(key, value)
 }
 
 // setIfSet scrive solo le chiavi con un valore non-zero: stringa non vuota, int > 0. Uno zero
@@ -161,11 +174,11 @@ func setIfSet(cm *kafka.ConfigMap, values map[string]any) {
 		switch v := values[k].(type) {
 		case string:
 			if v != "" {
-				_ = cm.SetKey(k, v)
+				set(cm, k, v)
 			}
 		case int:
 			if v > 0 {
-				_ = cm.SetKey(k, v)
+				set(cm, k, v)
 			}
 		}
 	}

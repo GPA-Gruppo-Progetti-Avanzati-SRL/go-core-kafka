@@ -123,9 +123,12 @@ func NewConsumers(p params) (*Consumers, error) {
 		sm.transformers[t.Consumer] = t.Transformer
 	}
 
-	// Le chiavi riservate in kafka-properties fermano l'avvio: sono invarianti dell'engine, non
-	// default sovrascrivibili (vedi spec.DeniedKafkaProperties).
-	if err := spec.ValidateServerProperties(p.Server); err != nil {
+	// La sezione `server` è validata QUI, dal costruttore fx, e non dall'app: i tag `validate:` non si
+	// applicano da soli, e finché a eseguirli era solo la core.ReadConfig dell'app le regole dichiarate
+	// sullo spec valevano per chi passava di lì e per nessun altro. Copre anche le chiavi riservate in
+	// kafka-properties, che sono invarianti dell'engine e non default sovrascrivibili (vedi
+	// spec.DeniedKafkaProperties).
+	if err := spec.ValidateServer(p.Server); err != nil {
 		return nil, err
 	}
 
@@ -202,29 +205,26 @@ func NewConsumers(p params) (*Consumers, error) {
 // Sta fuori da NewConsumers perché è la parte PER-PROCESSOR: lì dentro il ciclo di vita fx — la
 // ragione per cui quel costruttore esiste — restava sepolto sotto cento righe di validazione.
 func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Factory, dlq *producer.Producer) (*runner, error) {
+	// Sullo spec GREZZO, prima di risolverlo: i tag `validate:` e le chiavi riservate vanno attribuiti
+	// a chi li ha scritti, e un blocco ereditato è già stato validato al livello di `server`.
+	if err := spec.ValidateProcessor(raw); err != nil {
+		return nil, err
+	}
+
 	// Qui lo spec diventa quello EFFETTIVO: Resolve eredita dai blocchi di `server` i campi non
 	// valorizzati e poi applica i default della libreria. Da questa riga in poi nessuno consulta più
 	// i blocchi globali — un campo letto da r.spec è già il valore giusto.
 	s := raw.Resolve(k)
+	owner := "processor " + s.Name
 
-	// I blocchi RAW del processor, non quelli risolti: le chiavi riservate vanno attribuite a chi le
-	// ha scritte, e un blocco ereditato è già stato validato al livello di `server`.
-	for _, blk := range []struct {
-		owner string
-		props map[string]string
-	}{
-		{"processor " + s.Name + " (consumer)", raw.Consumer.KafkaProperties},
-		{"processor " + s.Name + " (producer)", raw.Producer.KafkaProperties},
+	// Le RELAZIONI fra i knob si verificano invece sul risolto, dove il valore effettivo è quello che
+	// conta: sono combinazioni in cui ogni campo preso da solo è legittimo e l'insieme non lo è.
+	for _, check := range []func(string) error{
+		s.Consumer.Validate, s.Producer.Validate, s.Restart.Validate,
 	} {
-		if err := spec.ValidateKafkaProperties(blk.owner, blk.props); err != nil {
+		if err := check(owner); err != nil {
 			return nil, err
 		}
-	}
-
-	// Politica di riavvio: le combinazioni che renderebbero inefficace il limite dei tentativi
-	// fermano l'avvio invece di passare inosservate (vedi RestartSpec.Validate).
-	if err := s.Restart.Validate("processor " + s.Name); err != nil {
-		return nil, err
 	}
 	if s.Restart.Unlimited() && !s.Restart.IsDisabled() {
 		log.Warn().Str("processor", s.Name).
@@ -263,6 +263,14 @@ func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Fa
 		r.transformer = t
 		if s.TransactionalID == "" {
 			return nil, fmt.Errorf("processor %q (transform): transactional-id obbligatorio", s.Name)
+		}
+		// La transazione copre un batch: se scade prima che il batch venga anche solo CHIUSO, il broker
+		// la considera abbandonata e fa fencing del producer a ogni giro — un loop di riavvii in cui
+		// non viene mai committato nulla. Il controllo sta qui e non in ProducerTuning.Validate perché
+		// incrocia i due blocchi ed è specifico della modalità, che a quel livello non è nota.
+		if ms := s.Producer.TransactionTimeoutMs; ms > 0 && time.Duration(ms)*time.Millisecond <= s.Consumer.CutFrequency {
+			return nil, fmt.Errorf("processor %q (transform): producer.transaction-timeout-ms (%dms) <= consumer.cut-frequency (%s): la transazione scadrebbe prima della chiusura del batch, con fencing a ogni giro",
+				s.Name, ms, s.Consumer.CutFrequency)
 		}
 	default:
 		return nil, fmt.Errorf("processor %q: nessun processor registrato (usare corekafka.RegisterHandler o RegisterTransformer con questo nome)", s.Name)
@@ -602,7 +610,12 @@ func (t transformFlusher) flush(ctx context.Context, batch []*message.Record) er
 		return err
 	}
 	out, tErr := r.transformer.Transform(ctx, batch)
-	resolveTopics(out, r.spec.DefaultOutputTopic)
+	if err := r.resolveTopics(out); err != nil {
+		// Difetto deterministico del transformer o della config: rigiocarlo darebbe lo stesso esito,
+		// quindi si abortisce e l'errore risale (fail-fast) invece di provare a produrre.
+		abort()
+		return err
+	}
 
 	// Stesso modello a esiti della modalità handle (classify è condivisa), ma la consegna DLQ
 	// avviene DENTRO la sessione transazionale (append agli output) così l'EOS resta intatto:
@@ -700,11 +713,28 @@ func attempts(headers message.Headers) int {
 	return n
 }
 
-// resolveTopics assegna il DefaultOutputTopic ai record di output privi di Topic.
-func resolveTopics(recs []*message.ProducerRecord, def string) {
-	for _, r := range recs {
-		if r.Topic == "" {
-			r.Topic = def
+// resolveTopics assegna il DefaultOutputTopic ai record di output privi di Topic, e RIFIUTA quelli
+// che restano senza destinazione.
+//
+// Il rifiuto è il punto. Prima un record senza Topic, in un processor senza `default-output-topic`,
+// veniva prodotto verso il topic "": il fallimento arrivava dal client, sul primo batch, con un
+// messaggio che non nominava né il processor né la chiave di config da correggere — mentre ogni altro
+// difetto dello stesso spec ferma l'avvio.
+//
+// Non è invece un controllo di avvio: un transformer che instrada da sé ogni record (fan-out
+// topic→topic, dove il Topic si calcola dal contenuto) è un uso legittimo e non ha alcun bisogno di un
+// default. Pretenderlo al boot vieterebbe il caso d'uso; verificarlo qui coglie esattamente il record
+// che non sa dove andare.
+func (r *runner) resolveTopics(recs []*message.ProducerRecord) error {
+	def := r.spec.DefaultOutputTopic
+	for i, rec := range recs {
+		if rec.Topic != "" {
+			continue
 		}
+		if def == "" {
+			return fmt.Errorf("processor %q: il record di output #%d non ha Topic e `default-output-topic` non è configurato: impostarlo sullo spec, oppure assegnare il Topic nel Transformer", r.spec.Name, i)
+		}
+		rec.Topic = def
 	}
+	return nil
 }

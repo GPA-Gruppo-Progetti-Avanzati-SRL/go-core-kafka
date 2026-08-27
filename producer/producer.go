@@ -35,7 +35,7 @@ func (p *Producer) Produce(ctx context.Context, recs []*message.ProducerRecord) 
 func NewProducer(lc fx.Lifecycle, f driver.Factory, k spec.KafkaServer, p spec.ProducerTuning) (*Producer, error) {
 	// Stessa validazione dell'engine, dalla stessa funzione: il Producer è registrabile anche da solo
 	// (senza consumer), quindi non può appoggiarsi al fatto che qualcun altro l'abbia già fatta.
-	if err := spec.ValidateServerProperties(k); err != nil {
+	if err := spec.ValidateServer(k); err != nil {
 		return nil, err
 	}
 	d, err := f.NewProducer(k, p.WithDefaults())
