@@ -1,6 +1,7 @@
 package corekafka
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
@@ -89,5 +90,41 @@ func TestNeedsDeadletterProducer_IgnoraIDisabilitati(t *testing.T) {
 	cfg := Config{Processors: []spec.ProcessorSpec{dlqSpec("spento", "spento.DLQ", true)}}
 	if needsDeadletterProducer(cfg.ActiveProcessors(), cfg.Server, false) {
 		t.Error("il DLQ di un processor disabilitato non deve far costruire il Producer")
+	}
+}
+
+// WithDriver è OBBLIGATORIA: senza, non esiste alcun client Kafka da usare e il messaggio deve
+// portare chi legge ai due import possibili. È un panic e non un errore fx perché senza driver non
+// c'è nemmeno un grafo da costruire, e l'errore va a chi scrive la composition root.
+func TestModule_SenzaDriverPanica(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("Module senza WithDriver deve panicare")
+		}
+		msg, _ := r.(string)
+		for _, want := range []string{"WithDriver", "confluentdriver.Driver", "franzdriver.Driver", "CGO_ENABLED=1"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("panic = %q, atteso contenesse %q", msg, want)
+			}
+		}
+	}()
+	Module(&Config{}, func() {})
+}
+
+// La Driver non prende i modes: li eredita dal Module che la invoca. Se li prendesse, un'app potrebbe
+// registrare il driver in modi diversi da quelli dei suoi consumer — un grafo che a runtime non si
+// costruisce, per una divergenza che nessuno ha motivo di volere.
+func TestWithDriver(t *testing.T) {
+	var o options
+	called := 0
+	WithDriver(func() { called++ })(&o)
+
+	if o.driver == nil {
+		t.Fatal("WithDriver non ha registrato il driver")
+	}
+	o.driver()
+	if called != 1 {
+		t.Errorf("driver invocato %d volte, attesa 1", called)
 	}
 }

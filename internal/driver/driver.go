@@ -1,7 +1,8 @@
 // Package driver è l'astrazione client-agnostic di go-core-kafka. L'engine e il Producer pubblico
-// dipendono SOLO da queste interfacce (mai dal client concreto): l'unica implementazione oggi è
-// internal/confluentdriver (confluent-kafka-go). Aggiungere in futuro internal/franzdriver e cambiare
-// la Factory di default (driversel.go nel package root) non impatta né l'engine né le app.
+// dipendono SOLO da queste interfacce (mai dal client concreto). Le implementazioni sono due —
+// internal/confluentdriver (confluent-kafka-go, CGo) e internal/franzdriver (twmb/franz-go, puro Go) —
+// e quale sia attiva lo decide l'APP, importando il guscio driver/confluent o driver/franz e
+// passandone la Driver a corekafka.WithDriver. Aggiungerne una terza non impatta engine né app.
 //
 // Le interfacce usano i tipi neutri di message/spec, quindi nessun tipo del client Kafka attraversa
 // questo confine. L'EOS è esposto come "sessione" (TransactSession) a un livello in cui sia il modello
@@ -75,8 +76,9 @@ type Producer interface {
 	Close() error
 }
 
-// Factory è l'unico punto legato all'implementazione del client. La Factory attiva è scelta a
-// compile-time nel package root (driversel.go).
+// Factory è l'unico punto legato all'implementazione del client. Quale Factory sia attiva lo decide
+// l'app con corekafka.WithDriver: la scelta è un import, quindi il client non scelto non entra
+// nemmeno nel binario.
 //
 // NewGroupConsumer e NewTransactSession ricevono uno spec GIÀ RISOLTO (ProcessorSpec.Resolve): il
 // tuning che serve loro sta in s.Consumer e s.Producer, e il driver non conosce l'eredità. Il

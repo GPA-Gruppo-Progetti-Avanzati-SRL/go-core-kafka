@@ -6,15 +6,27 @@ via fx value group).
 
 Package root: `corekafka` (`github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka`).
 
-## ⚠️ CGo / librdkafka
+## Due client Kafka, scelti dall'app
 
-Il client è **confluent-kafka-go/v2**, un binding CGo su librdkafka. Il modulo e le app che lo usano
-richiedono `CGO_ENABLED=1` e una toolchain C; le immagini Docker devono includere le dipendenze
-librdkafka (o usare i binari bundled del pacchetto, default sulle piattaforme supportate).
+Il client concreto è una **scelta dell'applicazione**, dichiarata al wiring con
+`corekafka.WithDriver(...)` — vedi [Scelta del driver](#scelta-del-driver). Ne discendono i requisiti
+di build:
+
+| Driver | Import | Build |
+|---|---|---|
+| Confluent (`confluent-kafka-go/v2`, binding CGo su librdkafka) | `go-core-kafka/driver/confluent` | `CGO_ENABLED=1` + toolchain C |
+| franz-go (`twmb/franz-go`, puro Go) | `go-core-kafka/driver/franz` | `CGO_ENABLED=0`, binario statico |
+
+Il modulo `go-core-kafka` nel suo insieme contiene entrambi, quindi la sua build completa richiede
+CGo; un'applicazione invece compila solo ciò che importa, e con il driver franz non si porta dietro né
+librdkafka né confluent-kafka-go (che nel suo `go.mod` non compaiono affatto).
 
 ```bash
-CGO_ENABLED=1 go build ./...
-CGO_ENABLED=1 go test ./...
+# nel modulo: la build completa include il driver confluent
+CGO_ENABLED=1 go build ./... && CGO_ENABLED=1 go test ./...
+
+# tutto il resto è puro Go
+CGO_ENABLED=0 go build $(go list ./... | grep -v confluent)
 ```
 
 ## Due seam di business logic (la modalità è DERIVATA dalla registrazione, non da config)
@@ -123,11 +135,56 @@ Per Handler/Transformer con costruzione non banale restano `corekafka.ProvideHan
 `corekafka.ProvideTransformer(constructor)` (costruttore fx che ritorna la registrazione direttamente;
 sempre EAGER, chiamabili anche fuori da `Register`/`Module`).
 
-## Astrazione client → futuro franz-go
+## Scelta del driver
 
-Il client concreto è confinato in `internal/confluentdriver`, dietro le interfacce di
-`internal/driver`. L'API pubblica e l'engine non importano mai confluent-kafka-go. Aggiungere un
-`internal/franzdriver` e cambiare `driversel.go` fa lo switch **senza toccare le app**.
+L'engine, il Producer e le app dipendono solo dalle interfacce di `internal/driver`: nessun tipo del
+client concreto attraversa quel confine. Le due implementazioni vivono in `internal/confluentdriver` e
+`internal/franzdriver`, e di pubblico c'è solo il **punto di registrazione**:
+
+```go
+import confluentdriver "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/driver/confluent"
+// oppure
+import franzdriver "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/driver/franz"
+
+corekafka.Module(&svc.Kafka, consumer.Register,
+    corekafka.WithDriver(franzdriver.Driver),
+)
+```
+
+`WithDriver` è **obbligatoria** e non ha un default: un default costringerebbe il package root a
+importare un driver, e con confluent significherebbe CGo per ogni app — compresa quella che ha scelto
+franz. Senza, `Module` panica al boot con il messaggio che nomina i due import.
+
+`Driver` non prende i modes: eredita quelli del `Module` che la invoca. Un driver registrato in modi
+diversi da quelli dei suoi consumer è solo un grafo che non si costruisce.
+
+### Cosa cambia fra i due driver
+
+Config, semantica dei processor, DLQ, EOS, supervisione e metriche `corekafka_*` sono le stesse: la
+severità degli errori, il commit manuale, lo scarto del batch e il restart sono governati dall'engine,
+non dal client. Le differenze sono quelle che il client impone:
+
+| | Confluent | franz-go |
+|---|---|---|
+| CGo | sì (`CGO_ENABLED=1`) | no |
+| `context` nella poll | non osservato (chiamata CGo bloccante, bound = `poll-timeout`) | osservato |
+| Rebalance durante un batch | rilevato a posteriori → batch scartato | **bloccato** finché il batch non è committato (`BlockRebalanceOnPoll`) |
+| Metriche/tracing del client | assenti | hook OTel (kotel) sui tre client |
+| `kafka-properties` | passate as-is a librdkafka | tradotte (vedi sotto) |
+
+**Knob tipizzati senza equivalente in franz-go** — sono ignorati con un `Warn` al boot che li elenca:
+`debug`, `socket-keepalive-enable`, `consumer.queued-max-messages-kbytes`,
+`producer.message-max-bytes` (in franz coincide con `batch-size`), `producer.batch-num-messages`
+(franz batcha a byte), `producer.metadata-max-idle-ms`, `producer.init-transactions-timeout` (la init
+la gestisce il client, con i propri retry).
+
+**`kafka-properties` con il driver franz**: le chiavi dotted sono di librdkafka, quindi il driver le
+**traduce** nelle opzioni equivalenti (`session.timeout.ms`, `fetch.*`, `acks`, `linger.ms`,
+`compression.type`, `batch.size`, `retries`, `request.timeout.ms`, `delivery.timeout.ms`,
+`retry.backoff.ms`, `transaction.timeout.ms`, `enable.idempotence`, …). Una chiave **non traducibile
+ferma l'avvio**, nominando chiave e sezione: una property che non ha destinatario è indistinguibile, a
+runtime, da una mai scritta. Le alternative sono nel messaggio d'errore (campo tipizzato, rimozione, o
+driver confluent).
 
 ## Esempio A — handle Kafka→Mongo (modalità handle, da RegisterHandler)
 
@@ -256,6 +313,7 @@ type Config struct {
 // main.go
 import (
     corekafka "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka"
+    franzdriver "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/driver/franz"
     coremongo "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-mongo"
     "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/gpa-consumer-app/app/consumer"
     // ...
@@ -265,7 +323,8 @@ func main() {
     svc := core.Boot[app.Config, services.Config](core.App{ /* ... */ })
 
     coremongo.Module(&svc.Mongo)
-    corekafka.Module(&svc.Kafka, consumer.Register) // NB: senza parentesi
+    corekafka.Module(&svc.Kafka, consumer.Register, // NB: register senza parentesi
+        corekafka.WithDriver(franzdriver.Driver))   // obbligatoria: vedi "Scelta del driver"
 
     core.Run(core.WithTracing())
 }
@@ -274,7 +333,8 @@ func main() {
 `Module` ha firma `Module(cfg *Config, register func(), opts ...Option)`: `register` è il riferimento
 alla funzione dell'app, chiamato da `Module` stesso — non un side-effect implicito da qualche `init()`.
 
-Opzioni di `Module`: `WithModes(...)` (gate per `core.Mode`), `WithProducer()` (forza la costruzione
+Opzioni di `Module`: `WithDriver(...)` (**obbligatoria**, sceglie il client Kafka),
+`WithModes(...)` (gate per `core.Mode`), `WithProducer()` (forza la costruzione
 del Producer interno anche se nessuno spec attivo ha `deadletter-topic`, caso in cui è già
 auto-abilitato per il DLQ), `WithModule(...)` (componenti extra come `ModuleFunc`, gate-ati sugli
 stessi modes).

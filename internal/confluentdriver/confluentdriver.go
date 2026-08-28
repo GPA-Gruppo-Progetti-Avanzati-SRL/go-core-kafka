@@ -1,7 +1,8 @@
 // Package confluentdriver è l'implementazione di internal/driver basata su confluent-kafka-go/v2.
-// È l'UNICO package di go-core-kafka che importa il client Kafka concreto: engine, producer pubblico
-// e API pubblica dipendono solo da internal/driver. Un futuro internal/franzdriver sostituirebbe
-// questo package cambiando una sola riga nel package root (driversel.go), senza impatto sulle app.
+// Engine, producer pubblico e API pubblica dipendono solo da internal/driver: qui dentro è confinato
+// tutto ciò che sa del client. L'alternativa è internal/franzdriver, e la scelta la fa l'app
+// importando il guscio driver/confluent (questo) o driver/franz e passandone la Driver a
+// corekafka.WithDriver.
 //
 // È anche l'unico package che interpreta un kafka.Error: la traduzione in driver.Severity sta in
 // errors.go.
@@ -15,13 +16,21 @@ import (
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/rs/zerolog/log"
 )
 
 // Factory implementa driver.Factory usando confluent-kafka-go.
 type Factory struct{}
 
-// New ritorna la Factory Confluent come driver.Factory (usata di default dal package root).
-func New() driver.Factory { return Factory{} }
+// New ritorna la Factory Confluent come driver.Factory. La registra il guscio pubblico
+// driver/confluent, che l'app sceglie con corekafka.WithDriver.
+//
+// Il log all'avvio non è decorativo: con due driver selezionabili, quale sia in esercizio è la prima
+// cosa da sapere leggendo i log di un processo che si comporta in modo inatteso.
+func New() driver.Factory {
+	log.Info().Msg("corekafka: driver confluent-kafka-go/v2 (librdkafka, CGo)")
+	return Factory{}
+}
 
 // NewGroupConsumer crea un consumer di consumer-group per la modalità handle (at-least-once).
 func (Factory) NewGroupConsumer(s spec.ProcessorSpec, k spec.KafkaServer) (driver.GroupConsumer, error) {

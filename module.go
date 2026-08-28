@@ -19,9 +19,19 @@ import (
 // Option configura Module.
 type Option func(*options)
 
+// DriverFunc è la registrazione di un driver Kafka: qualunque `func()` va bene. È un alias e non un
+// defined type perché i due gusci pubblici (driver/confluent, driver/franz) possano dichiarare la
+// propria Driver senza importare corekafka.
+//
+// Senza modes di proposito: il driver appartiene a QUESTO Module e ne eredita il gating. Ripassarli
+// non aggiungerebbe nulla e permetterebbe di sbagliarli, ottenendo un driver registrato in modi
+// diversi da quelli dei consumer che lo iniettano.
+type DriverFunc = func()
+
 type options struct {
 	modes    []string
 	producer bool
+	driver   DriverFunc
 }
 
 // WithModes limita i consumer (e i backend collegati) ai core.Mode indicati. Vuoto = sempre attivi.
@@ -37,10 +47,21 @@ func WithProducer() Option {
 	return func(o *options) { o.producer = true }
 }
 
+// WithDriver sceglie il client Kafka concreto. È OBBLIGATORIA e non ha un default: un default
+// costringerebbe QUESTO package a importare un driver, e con confluent significherebbe librdkafka
+// via CGo per ogni app — compresa quella che ha scelto franz. La scelta è quindi un import dell'app.
+//
+//	corekafka.WithDriver(confluentdriver.Driver)  // go-core-kafka/driver/confluent — CGO_ENABLED=1
+//	corekafka.WithDriver(franzdriver.Driver)      // go-core-kafka/driver/franz     — puro Go
+func WithDriver(d DriverFunc) Option {
+	return func(o *options) { o.driver = d }
+}
+
 // Module wira il sottosistema Kafka a partire da una singola Config e dalla funzione di registrazione
 // dell'app (che chiama RegisterHandler/RegisterTransformer per ogni consumer). Fornisce a fx la
-// connessione e la lista dei processor attivi (core.Supply), la driver.Factory (provideDriver),
-// l'eventuale Producer/DLQ, poi registra e avvia l'engine. Il gating è per-registrazione via i modes.
+// connessione e la lista dei processor attivi (core.Supply), la driver.Factory (il driver scelto
+// con WithDriver), l'eventuale Producer/DLQ, poi registra e avvia l'engine. Il gating è
+// per-registrazione via i modes.
 //
 // È un core.ModuleClosed: Kafka è un sottosistema chiuso — consuma i seam dell'app (Handler e
 // Transformer) e non le espone nulla in cambio, quindi spec.KafkaServer, []spec.ProcessorSpec,
@@ -51,6 +72,13 @@ func Module(cfg *Config, register func(), opts ...Option) {
 	var o options
 	for _, opt := range opts {
 		opt(&o)
+	}
+	if o.driver == nil {
+		// Panic e non errore fx: senza driver non c'è nulla da wirare, e il messaggio deve arrivare
+		// a chi scrive la composition root — non dentro un grafo che non verrà mai costruito.
+		panic("corekafka.Module: WithDriver è obbligatoria — corekafka.WithDriver(confluentdriver.Driver) " +
+			"(go-core-kafka/driver/confluent, richiede CGO_ENABLED=1) oppure " +
+			"corekafka.WithDriver(franzdriver.Driver) (go-core-kafka/driver/franz, puro Go)")
 	}
 
 	// Un solo filtro per tutto il wiring (vedi Config.ActiveProcessors): ciò che passa di qui è
@@ -77,7 +105,11 @@ func Module(cfg *Config, register func(), opts ...Option) {
 		// disabilitato non arriva nemmeno all'engine.
 		core.Supply(active, o.modes...)
 
-		provideDriver(o.modes...)
+		// Il driver eredita il gating del Module: la stessa condizione che core.Provide applicherebbe
+		// ai suoi modes, valutata qui perché la Driver non li prende.
+		if core.IsMode(o.modes...) {
+			o.driver()
+		}
 
 		if needsDeadletterProducer(active, cfg.Server, o.producer) {
 			producer.Module(o.modes...)

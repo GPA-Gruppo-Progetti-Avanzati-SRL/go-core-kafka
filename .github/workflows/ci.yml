@@ -1,0 +1,17 @@
+name: ci
+
+# Caller di sei righe: la logica sta nel reusable workflow del repo ombrello, così i sette moduli
+# non hanno sette copie da tenere allineate. Per cambiare cosa gira, modificare
+# GPA-Gruppo-Progetti-Avanzati-SRL/go-core → .github/workflows/module-ci.yml
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: GPA-Gruppo-Progetti-Avanzati-SRL/go-core/.github/workflows/module-ci.yml@main
