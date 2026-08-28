@@ -3,6 +3,7 @@ package producer
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
@@ -38,9 +39,13 @@ func (f *fakeDriverProducer) Close() error {
 type fakeFactory struct {
 	p   driver.Producer
 	err error
+	tx  driver.TxProducer
 	// got registra il tuning ricevuto: serve a verificare che i default siano applicati PRIMA di
 	// arrivare al driver.
 	got spec.ProducerTuning
+	// gotTxID registra l'id passato al driver: è il valore che decide la transazionalità, quindi
+	// deve arrivare al client esattamente come scritto in config.
+	gotTxID string
 }
 
 func (f *fakeFactory) NewGroupConsumer(spec.ProcessorSpec, spec.KafkaServer) (driver.GroupConsumer, error) {
@@ -54,6 +59,12 @@ func (f *fakeFactory) NewTransactSession(spec.ProcessorSpec, spec.KafkaServer) (
 func (f *fakeFactory) NewProducer(_ spec.KafkaServer, p spec.ProducerTuning) (driver.Producer, error) {
 	f.got = p
 	return f.p, f.err
+}
+
+func (f *fakeFactory) NewTxProducer(_ spec.KafkaServer, p spec.ProducerTuning, id string) (driver.TxProducer, error) {
+	f.got = p
+	f.gotTxID = id
+	return f.tx, f.err
 }
 
 type fakeLifecycle struct{ hooks []fx.Hook }
@@ -169,3 +180,165 @@ func TestOnStop_ChiudeIlProducer(t *testing.T) {
 		t.Error("il producer del driver non è stato chiuso")
 	}
 }
+
+// --- ProduceTo ---
+
+func TestProduceTo_NonSovrascriveIlTopicDelRecord(t *testing.T) {
+	// Il topic passato è il DEFAULT per chi non ne ha uno: sovrascrivere quello già impostato
+	// impedirebbe il fan-out nella stessa chiamata (un record verso il DLQ in mezzo agli altri), e lo
+	// farebbe in silenzio.
+	d := &fakeDriverProducer{}
+	p, err := NewProducer(&fakeLifecycle{}, &fakeFactory{p: d}, validServer(), spec.ProducerTuning{})
+	if err != nil {
+		t.Fatalf("NewProducer: %v", err)
+	}
+
+	recs := []*message.ProducerRecord{{Value: []byte("a")}, {Topic: "suo", Value: []byte("b")}}
+	if appErr := p.ProduceTo(context.Background(), "default", recs); appErr != nil {
+		t.Fatalf("ProduceTo = %v", appErr)
+	}
+	if d.produced[0].Topic != "default" {
+		t.Errorf("record senza topic: %q, atteso default", d.produced[0].Topic)
+	}
+	if d.produced[1].Topic != "suo" {
+		t.Errorf("record con topic proprio: %q, atteso suo (non sovrascritto)", d.produced[1].Topic)
+	}
+}
+
+// --- producer transazionale ---
+
+// fakeTx registra la sequenza delle chiamate: della transazione conta l'ordine, e un abort mancante
+// lascia la transazione aperta lato broker — con i consumer read_committed bloccati su quelle
+// partizioni fino al transaction.timeout.ms.
+type fakeTx struct {
+	calls      []string
+	produced   []*message.ProducerRecord
+	beginErr   error
+	produceErr error
+	commitErr  error
+	closed     bool
+}
+
+func (f *fakeTx) Begin(context.Context) error { f.calls = append(f.calls, "begin"); return f.beginErr }
+
+func (f *fakeTx) Produce(_ context.Context, recs []*message.ProducerRecord) error {
+	f.calls = append(f.calls, "produce")
+	f.produced = append(f.produced, recs...)
+	return f.produceErr
+}
+
+func (f *fakeTx) Commit(context.Context) error {
+	f.calls = append(f.calls, "commit")
+	return f.commitErr
+}
+
+func (f *fakeTx) Abort(context.Context) error { f.calls = append(f.calls, "abort"); return nil }
+func (f *fakeTx) Close() error                { f.closed = true; return nil }
+
+func (f *fakeTx) seq() string { return strings.Join(f.calls, ",") }
+
+func newTx(t *testing.T, d *fakeTx, id string) (*TxProducer, *fakeFactory) {
+	t.Helper()
+	f := &fakeFactory{tx: d}
+	p, err := NewTxProducer(&fakeLifecycle{}, f, validServer(), spec.ProducerTuning{TransactionalID: id})
+	if err != nil {
+		t.Fatalf("NewTxProducer: %v", err)
+	}
+	return p, f
+}
+
+func TestTxProducer_UnaTransazionePerProduce(t *testing.T) {
+	d := &fakeTx{}
+	p, f := newTx(t, d, "notifiche-pod-0")
+
+	if appErr := p.Produce(context.Background(), []*message.ProducerRecord{{Topic: "t"}}); appErr != nil {
+		t.Fatalf("Produce = %v", appErr)
+	}
+	if got := d.seq(); got != "begin,produce,commit" {
+		t.Fatalf("sequenza = %s, attesa begin,produce,commit", got)
+	}
+	// L'id scritto in config deve arrivare al client: è ciò che il broker usa per il fencing, quindi
+	// un id perso per strada significa un producer non transazionale che si crede transazionale.
+	if f.gotTxID != "notifiche-pod-0" {
+		t.Errorf("transactional-id passato al driver = %q, atteso notifiche-pod-0", f.gotTxID)
+	}
+}
+
+func TestTxProducer_BatchVuotoNonApreTransazioni(t *testing.T) {
+	d := &fakeTx{}
+	p, _ := newTx(t, d, "id")
+
+	if appErr := p.Produce(context.Background(), nil); appErr != nil {
+		t.Fatalf("Produce di un batch vuoto = %v, atteso nil", appErr)
+	}
+	if len(d.calls) != 0 {
+		t.Fatalf("un batch vuoto ha aperto una transazione: %v", d.calls)
+	}
+}
+
+func TestTxProducer_AbortaSuOgniErrore(t *testing.T) {
+	tests := []struct {
+		name string
+		d    *fakeTx
+		seq  string
+	}{
+		{"produce fallito", &fakeTx{produceErr: errors.New("broker giù")}, "begin,produce,abort"},
+		// Anche dopo un commit fallito: la transazione è ancora aperta lato broker, e lasciarla tale
+		// blocca i consumer read_committed su quelle partizioni.
+		{"commit fallito", &fakeTx{commitErr: errors.New("fenced")}, "begin,produce,commit,abort"},
+		// Begin fallito: non c'è nulla da abortire, e chiederlo darebbe un errore di stato invalido.
+		{"begin fallito", &fakeTx{beginErr: errors.New("init")}, "begin"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _ := newTx(t, tc.d, "id")
+			if appErr := p.Produce(context.Background(), []*message.ProducerRecord{{Topic: "t"}}); appErr == nil {
+				t.Fatal("atteso errore")
+			}
+			if got := tc.d.seq(); got != tc.seq {
+				t.Fatalf("sequenza = %s, attesa %s", got, tc.seq)
+			}
+		})
+	}
+}
+
+func TestTxProducer_AbortaAncheSuContextScaduto(t *testing.T) {
+	// L'abort non può viaggiare sul context del chiamante: quando si arriva qui il motivo è spesso
+	// proprio una deadline scaduta, e su un context cancellato l'abort non partirebbe — lasciando
+	// aperta la transazione che si sta cercando di chiudere.
+	d := &fakeTx{produceErr: context.DeadlineExceeded}
+	p, _ := newTx(t, d, "id")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if appErr := p.Produce(ctx, []*message.ProducerRecord{{Topic: "t"}}); appErr == nil {
+		t.Fatal("atteso errore")
+	}
+	if got := d.seq(); got != "begin,produce,abort" {
+		t.Fatalf("sequenza = %s: l'abort non è stato tentato su un context cancellato", got)
+	}
+}
+
+func TestTxProducer_OnStopChiudeIlClient(t *testing.T) {
+	lc := &fakeLifecycle{}
+	d := &fakeTx{}
+	if _, err := NewTxProducer(lc, &fakeFactory{tx: d}, validServer(), spec.ProducerTuning{TransactionalID: "id"}); err != nil {
+		t.Fatalf("NewTxProducer: %v", err)
+	}
+	if len(lc.hooks) != 1 {
+		t.Fatalf("hook registrati = %d, atteso 1", len(lc.hooks))
+	}
+	if err := lc.hooks[0].OnStop(context.Background()); err != nil {
+		t.Errorf("OnStop = %v", err)
+	}
+	if !d.closed {
+		t.Error("il producer transazionale non è stato chiuso")
+	}
+}
+
+// I due tipi devono soddisfare il contratto che l'app inietta: senza questa asserzione il mismatch
+// comparirebbe solo al wiring, come "missing type" di fx.
+var (
+	_ IProducer = (*Producer)(nil)
+	_ IProducer = (*TxProducer)(nil)
+)

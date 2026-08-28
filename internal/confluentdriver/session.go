@@ -2,48 +2,26 @@ package confluentdriver
 
 import (
 	"context"
-	"time"
 
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
-	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/rs/zerolog/log"
 )
 
 // transactSession implementa driver.TransactSession (modalità EOS Kafka->Kafka). Consuma con il
-// consumer group di groupSession (auto-commit off, read_committed) e produce con un producer
-// transazionale; Commit invia gli offset consumati e committa la transazione atomicamente.
+// consumer group di groupSession (auto-commit off, read_committed) e produce con il producer
+// transazionale di txn; Commit invia gli offset consumati e committa la transazione atomicamente.
+//
+// Le due metà sono entrambe condivise: groupSession con il consumer della modalità handle, txn con il
+// producer transazionale del processo. Qui resta solo ciò che è davvero dell'EOS — legare gli offset
+// consumati all'esito della transazione.
 type transactSession struct {
 	groupSession
-	p           *kafka.Producer
-	initTimeout time.Duration
-	reportWait  time.Duration
-	inited      bool
-	// txnOpen dice se c'è una transazione da abortire. Serve perché Abort/Discard sono chiamate
-	// anche su percorsi in cui nessuna transazione è stata aperta (un errore risalito da Poll prima
-	// del primo Begin): abortire lì darebbe un errore di stato invalido al posto di un no-op.
-	txnOpen bool
+	txn
 }
 
-// Begin apre una transazione (init lazy al primo Begin, col timeout dello spec).
-//
-// La init è legata al context dell'engine E al proprio timeout: prima partiva da un
-// context.Background(), quindi un arresto che cadesse durante la InitTransactions non poteva
-// interromperla e teneva il processo appeso fino a init-transactions-timeout (60s di default) —
-// la stessa classe di problema chiusa sull'attesa dei delivery report.
+// Begin apre la transazione (init lazy al primo giro, col timeout dello spec — vedi txn.begin).
 func (t *transactSession) Begin(ctx context.Context) error {
-	if !t.inited {
-		ictx, cancel := context.WithTimeout(ctx, t.initTimeout)
-		defer cancel()
-		if err := t.p.InitTransactions(ictx); err != nil {
-			return wrap("init-transactions", err)
-		}
-		t.inited = true
-	}
-	if err := wrap("begin-transaction", t.p.BeginTransaction()); err != nil {
-		return err
-	}
-	t.txnOpen = true
-	return nil
+	return t.begin(ctx)
 }
 
 // Produce invia i record di output nella transazione corrente e verifica i delivery report prima del
@@ -51,10 +29,12 @@ func (t *transactSession) Begin(ctx context.Context) error {
 // L'attesa dei report è la stessa del producer condiviso — vedi produceAndAwait: ha un bound, quindi
 // un report che non arriva non appende più la goroutine del consumer.
 func (t *transactSession) Produce(ctx context.Context, recs []*message.ProducerRecord) error {
-	return produceAndAwait(ctx, t.p, recs, t.reportWait)
+	return t.produce(ctx, recs)
 }
 
-// Commit invia gli offset consumati alla transazione e la committa (atomico: output + offset).
+// Commit invia gli offset consumati alla transazione e la committa (atomico: output + offset). È
+// l'unica parte che l'EOS aggiunge alla transazione nuda: senza gli offset dentro, i record prodotti
+// sarebbero atomici fra loro ma non con il consumo che li ha generati.
 func (t *transactSession) Commit(ctx context.Context) error {
 	meta, err := t.c.GetConsumerGroupMetadata()
 	if err != nil {
@@ -65,23 +45,19 @@ func (t *transactSession) Commit(ctx context.Context) error {
 			return wrap("send-offsets", err)
 		}
 	}
-	if err := t.p.CommitTransaction(ctx); err != nil {
-		return wrap("commit-transaction", err)
+	if err := t.txn.commit(ctx); err != nil {
+		return err
 	}
-	t.txnOpen = false
 	t.offsets.reset()
 	return nil
 }
 
-// Abort annulla la transazione corrente; gli offset non vengono committati (replay). È un no-op se
-// nessuna transazione è aperta.
+// Abort annulla la transazione corrente; gli offset non vengono committati (replay). È un no-op sulla
+// transazione se non ce n'è una aperta, ma gli offset vanno scartati comunque: è l'altra metà del
+// contratto di Discard.
 func (t *transactSession) Abort(ctx context.Context) error {
 	t.offsets.reset()
-	if !t.txnOpen {
-		return nil
-	}
-	t.txnOpen = false
-	return wrap("abort-transaction", t.p.AbortTransaction(ctx))
+	return t.txn.abort(ctx)
 }
 
 // Discard scarta gli offset E abortisce la transazione aperta: in EOS le due cose sono la stessa

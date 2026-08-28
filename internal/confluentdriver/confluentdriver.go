@@ -63,9 +63,11 @@ func (Factory) NewTransactSession(s spec.ProcessorSpec, k spec.KafkaServer) (dri
 	}
 	return &transactSession{
 		groupSession: gs,
-		p:            prod,
-		initTimeout:  s.Producer.InitTransactionsTimeout,
-		reportWait:   reportWait(s.Producer),
+		txn: txn{
+			p:           prod,
+			initTimeout: s.Producer.InitTransactionsTimeout,
+			reportWait:  reportWait(s.Producer),
+		},
 	}, nil
 }
 
@@ -78,6 +80,30 @@ func (Factory) NewProducer(k spec.KafkaServer, p spec.ProducerTuning) (driver.Pr
 		return nil, fmt.Errorf("confluentdriver: NewProducer: %w", err)
 	}
 	return &producer{p: prod, flushTimeout: int(p.FlushTimeout.Milliseconds()), reportWait: reportWait(p)}, nil
+}
+
+// NewTxProducer crea il producer TRANSAZIONALE del processo (una transazione per Produce). Come il
+// non transazionale non appartiene a nessun processor, quindi il tuning arriva da `server.producer` —
+// da cui viene anche l'id, che è ciò che ha fatto scegliere questa forma al chiamante
+// (`server.producer.transactional-id`).
+//
+// L'id non è ri-validato qui: senza, il chiamante avrebbe costruito il non transazionale. È lo stesso
+// contratto di NewTransactSession, che invece lo pretende perché in EOS l'id sta sullo spec del
+// processor e la sua assenza è una misconfig.
+func (Factory) NewTxProducer(k spec.KafkaServer, p spec.ProducerTuning, transactionalID string) (driver.TxProducer, error) {
+	p = p.WithDefaults()
+	prod, err := kafka.NewProducer(producerConfigMap(transactionalID, "server.producer", p, k))
+	if err != nil {
+		return nil, fmt.Errorf("confluentdriver: NewProducer (tx): %w", err)
+	}
+	return &txProducer{
+		txn: txn{
+			p:           prod,
+			initTimeout: p.InitTransactionsTimeout,
+			reportWait:  reportWait(p),
+		},
+		flushTimeout: int(p.FlushTimeout.Milliseconds()),
+	}, nil
 }
 
 // newGroupSession crea il consumer, lo iscrive ai topic con il rebalance callback che protegge gli

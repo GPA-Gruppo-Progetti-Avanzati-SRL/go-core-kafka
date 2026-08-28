@@ -277,7 +277,21 @@ type ProducerTuning struct {
 	// FlushTimeout è il tempo concesso alla chiusura del producer per svuotare la coda di invio.
 	FlushTimeout time.Duration `yaml:"flush-timeout" mapstructure:"flush-timeout" json:"flush-timeout"`
 
-	// --- transazioni (modalità transform) ---
+	// --- transazioni ---
+	// TransactionalID rende TRANSAZIONALE il producer del processo (quello di
+	// corekafka.ProducerModule / WithProducer): ogni chiamata a Produce diventa una transazione, e i
+	// record di un batch sono visibili ai consumer read_committed tutti o nessuno. Assente = producer
+	// idempotente, con un Warn al boot che dice cosa si perde.
+	//
+	// DEVE essere univoco per replica, altrimenti due repliche con lo stesso id si fencano a vicenda:
+	// va interpolato, es. `transactional-id: notifiche-${HOSTNAME}` (core.ReadConfig sostituisce le
+	// env).
+	//
+	// NON è l'id del producer EOS di un processor: quello è ProcessorSpec.TransactionalID, e il driver
+	// lo riceve da lì (NewTransactSession → producerConfigMap(s.TransactionalID, ...)). Questo campo
+	// viene ereditato da `processors[].producer` come tutti gli altri, ma quella copia è INERTE:
+	// nessun client la legge. Vedi TestTransactionalIDNonRaggiungeIlProducerEOS.
+	TransactionalID string `yaml:"transactional-id" mapstructure:"transactional-id" json:"transactional-id"`
 	// TransactionTimeoutMs limita la durata di una transazione EOS: se un batch impiega più di così,
 	// il broker la considera abbandonata e fa fencing del producer.
 	TransactionTimeoutMs int `yaml:"transaction-timeout-ms" mapstructure:"transaction-timeout-ms" json:"transaction-timeout-ms"`

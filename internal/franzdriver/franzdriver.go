@@ -106,6 +106,26 @@ func (Factory) NewProducer(k spec.KafkaServer, p spec.ProducerTuning) (driver.Pr
 	return &producer{cl: cl, flushTimeout: p.FlushTimeout}, nil
 }
 
+// NewTxProducer crea il producer TRANSAZIONALE del processo (una transazione per Produce). Come il non
+// transazionale non appartiene a nessun processor, quindi il tuning arriva da `server.producer` — da
+// cui viene anche l'id, che è ciò che ha fatto scegliere questa forma al chiamante
+// (`server.producer.transactional-id`).
+//
+// L'id non è ri-validato qui: senza, il chiamante avrebbe costruito il non transazionale.
+func (Factory) NewTxProducer(k spec.KafkaServer, p spec.ProducerTuning, transactionalID string) (driver.TxProducer, error) {
+	p = p.WithDefaults()
+	b, err := producerOpts(transactionalID, "server.producer", p, k)
+	if err != nil {
+		return nil, err
+	}
+	cl, err := kgo.NewClient(b.opts...)
+	if err != nil {
+		return nil, driver.NewError(driver.SeverityPermanent, "new-tx-producer",
+			fmt.Errorf("franzdriver: NewClient (producer tx): %w", err))
+	}
+	return &txProducer{cl: cl, flushTimeout: p.FlushTimeout}, nil
+}
+
 // newSession compone la parte comune ai due client. Il buffer di poll è dimensionato sul batch
 // dell'engine: chiedere più record di quanti ne entrano in un batch significherebbe tenerli fermi nel
 // driver mentre il batch precedente viene elaborato.

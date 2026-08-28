@@ -127,6 +127,13 @@ func (f *fakeFactory) NewTransactSession(spec.ProcessorSpec, spec.KafkaServer) (
 	return nil, errFactoryExhausted
 }
 
+// NewTxProducer non serve ai test dell'engine: il producer transazionale del processo non è un
+// ingranaggio del consumo (l'EOS passa da NewTransactSession). Sta qui solo per soddisfare
+// driver.Factory.
+func (f *fakeFactory) NewTxProducer(spec.KafkaServer, spec.ProducerTuning, string) (driver.TxProducer, error) {
+	return nil, errors.New("NewTxProducer non usata dai test dell'engine")
+}
+
 func (f *fakeFactory) NewProducer(spec.KafkaServer, spec.ProducerTuning) (driver.Producer, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

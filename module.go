@@ -39,10 +39,17 @@ func WithModes(modes ...string) Option {
 	return func(o *options) { o.modes = modes }
 }
 
-// WithProducer forza la costruzione del Producer interno anche quando nessuno spec ha un
-// deadletter-topic (in quel caso è già abilitato in automatico, serve per il DLQ). Il Producer è
-// privato al sottosistema — vedi Module — quindi l'Option non lo rende iniettabile dall'app: un
-// consumer che deve produrre lo fa con un Transformer (EOS Kafka→Kafka), che è il seam previsto.
+// WithProducer aggiunge a Module il producer PUBBLICO: un'app che consuma e in più pubblica su Kafka
+// per conto suo (un'API che accoda, un job che notifica). Il producer è lo stesso di
+// ProducerModule — stessa Config, stesso driver, stessa scelta di transazionalità
+// (`server.producer.transactional-id`) — e l'app lo inietta come corekafka.IProducer.
+//
+// Registrato fuori dal ModuleClosed, quindi serve anche il DLQ dei processor in modalità handle: un
+// solo client, una sola connessione, un solo tuning.
+//
+// Non è il modo di produrre DENTRO un consumer: per quello c'è il Transformer (EOS Kafka→Kafka), il
+// solo seam in cui output e offset consumati sono atomici. Un Handler che pubblica con questo producer
+// ha due esiti indipendenti, e a un replay del batch ripubblica.
 func WithProducer() Option {
 	return func(o *options) { o.producer = true }
 }
@@ -73,13 +80,7 @@ func Module(cfg *Config, register func(), opts ...Option) {
 	for _, opt := range opts {
 		opt(&o)
 	}
-	if o.driver == nil {
-		// Panic e non errore fx: senza driver non c'è nulla da wirare, e il messaggio deve arrivare
-		// a chi scrive la composition root — non dentro un grafo che non verrà mai costruito.
-		panic("corekafka.Module: WithDriver è obbligatoria — corekafka.WithDriver(confluentdriver.Driver) " +
-			"(go-core-kafka/driver/confluent, richiede CGO_ENABLED=1) oppure " +
-			"corekafka.WithDriver(franzdriver.Driver) (go-core-kafka/driver/franz, puro Go)")
-	}
+	requireDriver(&o, "corekafka.Module")
 
 	// Un solo filtro per tutto il wiring (vedi Config.ActiveProcessors): ciò che passa di qui è
 	// attivo, e nessuno più a valle deve chiederselo.
@@ -111,13 +112,39 @@ func Module(cfg *Config, register func(), opts ...Option) {
 			o.driver()
 		}
 
-		if needsDeadletterProducer(active, cfg.Server, o.producer) {
-			producer.Module(o.modes...)
+		// Il producer del DLQ, privato al sottosistema. Con WithProducer() NON si registra qui: il
+		// producer è già a root (vedi sotto) e da lì il modulo — che ne è discendente — lo vede. Un
+		// secondo client per lo stesso lavoro sarebbe una connessione in più e due tuning da
+		// tenere allineati.
+		if !o.producer && needsDeadletterProducer(active, cfg.Server) {
+			core.ProvideAs[producer.IProducer](producer.NewProducer, o.modes...)
 		}
 
 		core.Provide(consumer.NewConsumers, o.modes...)
 		core.Invoke(func(*consumer.Consumers) {}, o.modes...)
 	})
+
+	// WithProducer(): il producer esce dal sottosistema e diventa iniettabile dall'app. Registrato
+	// FUORI dal ModuleClosed, che è il solo modo di esporre un seam (da dentro non esce nulla), e con
+	// la stessa Config — l'app scrive la connessione una volta sola. Serve anche il DLQ, perché dal
+	// modulo si vede ciò che sta a root.
+	if o.producer {
+		provideProducer(cfg, o)
+	}
+}
+
+// requireDriver è il fail-fast condiviso dai due entry-point: senza driver non c'è nulla da wirare.
+//
+// Panic e non errore fx: il messaggio deve arrivare a chi scrive la composition root, non finire
+// dentro un grafo che non verrà mai costruito. Non ha un default di proposito — un default
+// costringerebbe QUESTO package a importare un driver, e con confluent significherebbe librdkafka via
+// CGo per ogni app, compresa quella che ha scelto franz.
+func requireDriver(o *options, entryPoint string) {
+	if o.driver == nil {
+		panic(entryPoint + ": WithDriver è obbligatoria — corekafka.WithDriver(confluentdriver.Driver) " +
+			"(go-core-kafka/driver/confluent, richiede CGO_ENABLED=1) oppure " +
+			"corekafka.WithDriver(franzdriver.Driver) (go-core-kafka/driver/franz, puro Go)")
+	}
 }
 
 // needsDeadletterProducer dice se serve il Producer condiviso (non transazionale), che alimenta il DLQ
@@ -130,14 +157,12 @@ func Module(cfg *Config, register func(), opts ...Option) {
 // `server.consumer` non lo ha scritto su di sé, ma il Producer gli serve lo stesso. La risoluzione sta
 // QUI, nell'unico punto del wiring che legge un campo ereditabile, e non a monte su tutta la lista.
 //
-// force è WithProducer(): lo abilita anche senza alcun deadletter-topic.
+// Non prende più un `force`: con WithProducer() il producer è registrato a root — quindi il DLQ lo
+// trova comunque — e questa funzione decide solo se ne serve uno PRIVATO al sottosistema.
 //
 // È una funzione e non due righe dentro la closure del wiring perché è l'unica decisione condizionale
 // del Module, quindi la sola parte testabile senza costruire un grafo fx.
-func needsDeadletterProducer(active []spec.ProcessorSpec, server spec.KafkaServer, force bool) bool {
-	if force {
-		return true
-	}
+func needsDeadletterProducer(active []spec.ProcessorSpec, server spec.KafkaServer) bool {
 	for _, s := range active {
 		if s.Resolve(server).HasDeadletter() {
 			return true

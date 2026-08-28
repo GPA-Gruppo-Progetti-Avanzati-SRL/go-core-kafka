@@ -334,14 +334,13 @@ func main() {
 alla funzione dell'app, chiamato da `Module` stesso — non un side-effect implicito da qualche `init()`.
 
 Opzioni di `Module`: `WithDriver(...)` (**obbligatoria**, sceglie il client Kafka),
-`WithModes(...)` (gate per `core.Mode`), `WithProducer()` (forza la costruzione
-del Producer interno anche se nessuno spec attivo ha `deadletter-topic`, caso in cui è già
-auto-abilitato per il DLQ), `WithModule(...)` (componenti extra come `ModuleFunc`, gate-ati sugli
-stessi modes).
+`WithModes(...)` (gate per `core.Mode`), `WithProducer()` (espone all'app il producer del processo:
+vedi "Il producer"), `WithModule(...)` (componenti extra come `ModuleFunc`, gate-ati sugli stessi
+modes).
 
 Le registrazioni stanno in un `core.ModuleClosed("kafka")`: Kafka è un **sottosistema chiuso** —
 consuma i seam dell'app (`Handler`/`Transformer`) e non le espone nulla in cambio, quindi
-`spec.KafkaServer`, `[]spec.ConsumerSpec`, `driver.Factory`, `*producer.Producer` e
+`spec.KafkaServer`, `[]spec.ProcessorSpec`, `driver.Factory`, il producer del DLQ e
 `*consumer.Consumers` sono privati al modulo e non iniettabili dal grafo dell'app. Gli Handler
 restano forniti a root: il value group li porta dentro il modulo, e le loro dipendenze applicative
 sono risolte a root come sempre. Un consumer che deve produrre lo fa con un `Transformer` (EOS
@@ -355,6 +354,76 @@ dei processor attivi (`processor.Apply`). Le dipendenze di un processor spento (
 non entrano quindi nel grafo e **non vengono mai connesse** — altrimenti fx costruirebbe eagerly tutti
 i membri del value group, quindi anche i backend dei consumer disattivati. Un nome registrato ma
 assente da `processors[]` produce solo un log info ("costruzione saltata"), nessun errore.
+
+## Il producer
+
+Due entry-point, **una sola `Config`**:
+
+```go
+// processo che consuma (e in più pubblica per conto suo)
+corekafka.Module(&svc.Kafka, consumer.Register,
+    corekafka.WithDriver(franzdriver.Driver),
+    corekafka.WithProducer())
+
+// processo che pubblica soltanto (es. un batch con notifiche Kafka)
+corekafka.ProducerModule(&svc.Kafka,
+    corekafka.WithDriver(franzdriver.Driver),
+    corekafka.WithModes(engine.Scheduler))
+```
+
+`ProducerModule` prende la stessa `Config`, le stesse `Option` e lo stesso driver di `Module`: la
+configurazione Kafka di un'applicazione è una e sola, e l'unica differenza fra i due casi è la
+sezione `processors:` — che `ProducerModule` **ignora**, con un log Info e non un errore. È
+deliberato: la stessa sezione serve due processi dello stesso deployment (uno per `MODE`), e farla
+fallire vorrebbe dire che la config univoca non si può usare.
+
+L'app inietta `corekafka.IProducer`:
+
+```go
+type Notificatore struct {
+    Kafka corekafka.IProducer `inject:""`
+}
+
+func (n *Notificatore) Notifica(ctx context.Context, recs []*corekafka.ProducerRecord) error {
+    // ProduceTo stampa il topic sui soli record che non ne hanno uno: il fan-out nella stessa
+    // chiamata resta possibile.
+    if appErr := n.Kafka.ProduceTo(ctx, "notifiche.topic", recs); appErr != nil {
+        return appErr
+    }
+    return nil
+}
+```
+
+È un'**interfaccia** e non la struct perché `Producer` avvolge un `internal/driver.Producer`: fuori
+da go-core-kafka non sarebbe costruibile con un fake, e chi la consuma non sarebbe testabile.
+
+### La transazionalità è una scelta della config
+
+| `server.producer.transactional-id` | Producer | Garanzia |
+|---|---|---|
+| valorizzato | transazionale (una transazione per `Produce`) | i record di una chiamata diventano visibili ai consumer `read_committed` **tutti o nessuno**; su qualsiasi errore la transazione è abortita |
+| assente | idempotente | ogni record va per sé; un gruppo può risultare parzialmente visibile. **Warn al boot** che lo dice |
+
+```yaml
+kafka:
+  server:
+    bootstrap-servers: ${KAFKA_BROKERS}
+    producer:
+      acks: all
+      transactional-id: notifiche-${HOSTNAME}   # assente = non transazionale
+```
+
+L'id **deve essere univoco per replica**: due repliche con lo stesso `transactional.id` si fencano a
+vicenda, ed è il motivo per cui va interpolato (`core.ReadConfig` sostituisce le env). Il campo è
+ereditato da `processors[].producer` come ogni altro del blocco, ma quella copia è **inerte**: per
+l'EOS il driver prende l'id da `processors[].transactional-id`, non dal tuning.
+
+### Cosa NON è
+
+Il producer non è il modo di produrre **dentro** un consumer: per quello c'è il `Transformer` (EOS
+Kafka→Kafka), il solo seam in cui i record prodotti e gli offset consumati sono atomici. Un `Handler`
+che pubblicasse con questo producer avrebbe due esiti indipendenti, e a un replay del batch
+ripubblicherebbe. Senza `WithProducer()` il producer del DLQ resta infatti privato al sottosistema.
 
 ## Properties per-processor + esito deciso dall'handler
 
@@ -497,6 +566,8 @@ services:
         compression-type: snappy            # none | gzip | snappy | lz4 | zstd
         linger-ms: 20                       # 0 esplicito = invia subito (è un *int, vedi sotto)
         flush-timeout: 60s                  # tempo concesso alla chiusura per svuotare la coda
+        # transactional-id: notifiche-${HOSTNAME}   # presente = producer del processo TRANSAZIONALE
+                                                    # (univoco per replica!); assente = idempotente + Warn
         # transaction-timeout-ms: 100000     # oltre questa durata il broker fa fencing del producer
         # init-transactions-timeout: 60s
 
@@ -547,7 +618,7 @@ stesse chiavi: non c'è una lista di "campi sovrascrivibili" da tenere allineata
 | Blocco | Cosa contiene | Ereditabile |
 |---|---|---|
 | `consumer` | tuning del client consumer (`auto-offset-reset`, `session-timeout-ms`, `heartbeat-interval-ms`, `fetch-*`, `max-partition-fetch-bytes`, `queued-max-messages-kbytes`, `max-poll-interval-ms`, `partition-assignment-strategy`, `isolation-level`), dell'engine (`max-batch-size`, `cut-frequency`, `poll-timeout`), policy (`on-error`, `deadletter-topic`) e `kafka-properties` | sì, campo per campo |
-| `producer` | tuning del client producer (`acks`, `compression-type`, `linger-ms`, `batch-*`, `max-retries`, `max-in-flight`, `retry-backoff`, `delivery-timeout`, `request-timeout-ms`, `flush-timeout`, `enable-idempotence`), transazioni (`transaction-timeout-ms`, `init-transactions-timeout`) e `kafka-properties` | sì, campo per campo |
+| `producer` | tuning del client producer (`acks`, `compression-type`, `linger-ms`, `batch-*`, `max-retries`, `max-in-flight`, `retry-backoff`, `delivery-timeout`, `request-timeout-ms`, `flush-timeout`, `enable-idempotence`), transazioni (`transactional-id` — solo per il producer del processo, vedi "Il producer" —, `transaction-timeout-ms`, `init-transactions-timeout`) e `kafka-properties` | sì, campo per campo (`transactional-id` è ereditato ma **inerte** su un processor) |
 | `restart` | `disabled`, `max-attempts`, `initial-backoff`, `max-backoff`, `multiplier`, `reset-after`, `on-business-error` | sì, campo per campo |
 | _identità_ | `name`, `topics`, `group-id`, `transactional-id`, `default-output-topic`, `properties` | **no**: è ciò che distingue un processor dall'altro |
 

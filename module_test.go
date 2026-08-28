@@ -51,18 +51,15 @@ func TestNeedsDeadletterProducer(t *testing.T) {
 	tests := []struct {
 		name   string
 		active []spec.ProcessorSpec
-		force  bool
 		want   bool
 	}{
-		{"nessun processor", nil, false, false},
-		{"nessun deadletter-topic", []spec.ProcessorSpec{dlqSpec("a", "", false)}, false, false},
-		{"un processor con DLQ", []spec.ProcessorSpec{dlqSpec("a", "", false), dlqSpec("b", "b.DLQ", false)}, false, true},
-		{"WithProducer forza senza DLQ", []spec.ProcessorSpec{dlqSpec("a", "", false)}, true, true},
-		{"WithProducer senza processor", nil, true, true},
+		{"nessun processor", nil, false},
+		{"nessun deadletter-topic", []spec.ProcessorSpec{dlqSpec("a", "", false)}, false},
+		{"un processor con DLQ", []spec.ProcessorSpec{dlqSpec("a", "", false), dlqSpec("b", "b.DLQ", false)}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := needsDeadletterProducer(tc.active, spec.KafkaServer{}, tc.force); got != tc.want {
+			if got := needsDeadletterProducer(tc.active, spec.KafkaServer{}); got != tc.want {
 				t.Errorf("needsDeadletterProducer = %v, atteso %v", got, tc.want)
 			}
 		})
@@ -76,10 +73,10 @@ func TestNeedsDeadletterProducer_DeadletterEreditato(t *testing.T) {
 	server := spec.KafkaServer{Consumer: spec.ConsumerTuning{DeadletterTopic: &comune}}
 	active := []spec.ProcessorSpec{dlqSpec("a", "", false)}
 
-	if needsDeadletterProducer(active, spec.KafkaServer{}, false) {
+	if needsDeadletterProducer(active, spec.KafkaServer{}) {
 		t.Fatal("senza globale non c'è alcun DLQ: il Producer non serve")
 	}
-	if !needsDeadletterProducer(active, server, false) {
+	if !needsDeadletterProducer(active, server) {
 		t.Error("il deadletter-topic ereditato dal globale deve far costruire il Producer")
 	}
 }
@@ -88,7 +85,7 @@ func TestNeedsDeadletterProducer_DeadletterEreditato(t *testing.T) {
 // deadletter-topic non ha destinatario. Il filtro sta in ActiveProcessors, quindi va verificato insieme.
 func TestNeedsDeadletterProducer_IgnoraIDisabilitati(t *testing.T) {
 	cfg := Config{Processors: []spec.ProcessorSpec{dlqSpec("spento", "spento.DLQ", true)}}
-	if needsDeadletterProducer(cfg.ActiveProcessors(), cfg.Server, false) {
+	if needsDeadletterProducer(cfg.ActiveProcessors(), cfg.Server) {
 		t.Error("il DLQ di un processor disabilitato non deve far costruire il Producer")
 	}
 }

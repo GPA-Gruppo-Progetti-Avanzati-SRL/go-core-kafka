@@ -47,7 +47,7 @@ type params struct {
 	Factory      driver.Factory
 	Handlers     []processor.HandlerRegistration     `group:"kafka_handlers"`
 	Transformers []processor.TransformerRegistration `group:"kafka_transformers"`
-	DLQ          *producer.Producer                  `optional:"true"`
+	DLQ          producer.IProducer                  `optional:"true"`
 }
 
 // runner incapsula uno spec e il suo processor; apre il proprio client a ogni tentativo di run.
@@ -57,7 +57,7 @@ type runner struct {
 	factory     driver.Factory
 	handler     processor.Handler
 	transformer processor.Transformer
-	dlq         *producer.Producer
+	dlq         producer.IProducer
 	// stop porta al flush finale il context dell'arresto (vedi shutdown); è condiviso da tutti i
 	// runner dello stesso engine.
 	stop *shutdown
@@ -204,7 +204,7 @@ func NewConsumers(p params) (*Consumers, error) {
 //
 // Sta fuori da NewConsumers perché è la parte PER-PROCESSOR: lì dentro il ciclo di vita fx — la
 // ragione per cui quel costruttore esiste — restava sepolto sotto cento righe di validazione.
-func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Factory, dlq *producer.Producer) (*runner, error) {
+func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Factory, dlq producer.IProducer) (*runner, error) {
 	// Sullo spec GREZZO, prima di risolverlo: i tag `validate:` e le chiavi riservate vanno attribuiti
 	// a chi li ha scritti, e un blocco ereditato è già stato validato al livello di `server`.
 	if err := spec.ValidateProcessor(raw); err != nil {

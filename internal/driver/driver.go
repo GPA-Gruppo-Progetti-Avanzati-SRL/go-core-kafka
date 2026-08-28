@@ -76,6 +76,26 @@ type Producer interface {
 	Close() error
 }
 
+// TxProducer è il producer TRANSAZIONALE del processo: produce senza consumare, quindi non ha offset
+// da mandare in transazione. Serve a chi pubblica un gruppo di record che deve diventare visibile ai
+// consumer read_committed tutto o niente — il caso del job di notifica di go-core-batch, che drena un
+// outbox.
+//
+// È distinto da TransactSession, che è l'EOS Kafka->Kafka: là la transazione lega output e offset
+// consumati, qui non c'è consumo. Ed è distinto da Producer perché la transazionalità non è un
+// dettaglio del client ma una garanzia diversa, che il chiamante deve avere scelto (spec:
+// `server.producer.transactional-id`).
+//
+// L'engine non usa questa interfaccia: la usa il producer pubblico, che apre e chiude una transazione
+// per ogni Produce.
+type TxProducer interface {
+	Begin(ctx context.Context) error
+	Produce(ctx context.Context, recs []*message.ProducerRecord) error
+	Commit(ctx context.Context) error
+	Abort(ctx context.Context) error
+	Close() error
+}
+
 // Factory è l'unico punto legato all'implementazione del client. Quale Factory sia attiva lo decide
 // l'app con corekafka.WithDriver: la scelta è un import, quindi il client non scelto non entra
 // nemmeno nel binario.
@@ -88,4 +108,8 @@ type Factory interface {
 	NewGroupConsumer(s spec.ProcessorSpec, k spec.KafkaServer) (GroupConsumer, error)
 	NewTransactSession(s spec.ProcessorSpec, k spec.KafkaServer) (TransactSession, error)
 	NewProducer(k spec.KafkaServer, p spec.ProducerTuning) (Producer, error)
+	// NewTxProducer crea il producer transazionale del processo. L'id arriva come parametro e non
+	// dal tuning perché è il chiamante — che l'ha letto da `server.producer.transactional-id` — a
+	// decidere con esso QUALE dei due producer costruire: se è vuoto non si arriva qui.
+	NewTxProducer(k spec.KafkaServer, p spec.ProducerTuning, transactionalID string) (TxProducer, error)
 }

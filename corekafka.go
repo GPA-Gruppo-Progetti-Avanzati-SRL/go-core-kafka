@@ -6,6 +6,7 @@ import (
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/processor"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/producer"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 )
 
@@ -50,6 +51,10 @@ type (
 	Properties = core.Properties
 	// Configurable è implementata da Handler/Transformer che vogliono le Properties all'avvio.
 	Configurable = processor.Configurable
+	// IProducer è il producer del processo, quello che l'app inietta con ProducerModule o
+	// Module+WithProducer. Idempotente o transazionale a seconda di
+	// `server.producer.transactional-id`: per il chiamante è lo stesso contratto.
+	IProducer = producer.IProducer
 )
 
 // ErrFailFast: ritornalo (anche wrappato) da Handler/Transformer per forzare il fail-fast (no commit,

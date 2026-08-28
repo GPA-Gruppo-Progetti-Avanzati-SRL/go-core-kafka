@@ -7,7 +7,7 @@ decisione la porta la `driver.Severity`, non un codice.
 
 | Codice | HTTP | Costante | Origine | Significato |
 |---|---|---|---|---|
-| `KAFKA-PRODUCE` | 500 | `producer.CodeProduce` | `producer/producer.go:36` | `Produce` (o l'attesa dei delivery report) fallita. `Ambit = go-core-kafka` (`producer.Ambit`) |
+| `KAFKA-PRODUCE` | 500 | `producer.CodeProduce` | `producer/producer.go` | `Produce` fallita: l'invio, l'attesa dei delivery report o — sul producer transazionale — il `Begin`/`Commit` della transazione (in quel caso la transazione è già stata abortita). `Ambit = go-core-kafka` (`producer.Ambit`) |
 
 > **Da quale libreria viene l'errore.** Gli errori non-`ApplicationError` lo dicono nel
 > messaggio, con un prefisso: `corekafka:` per engine, config e supervisione;

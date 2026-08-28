@@ -299,3 +299,29 @@ func TestRestartAccessors(t *testing.T) {
 		t.Error("max-attempts positivo non è illimitato")
 	}
 }
+
+// TestTransactionalIDNonRaggiungeIlProducerEOS blocca l'invariante che rende sicuro tenere
+// `transactional-id` dentro ProducerTuning: il campo è ereditato da `server.producer` come tutti gli
+// altri, ma per il producer EOS di un processor il driver prende l'id da ProcessorSpec.TransactionalID
+// — non dal tuning. Se un giorno un driver leggesse s.Producer.TransactionalID, due client
+// (il producer del processo e quello EOS del processor) avrebbero lo STESSO id e si fencerebbero a
+// vicenda: un guasto che si manifesta solo sotto carico, e mai in test.
+func TestTransactionalIDNonRaggiungeIlProducerEOS(t *testing.T) {
+	server := KafkaServer{
+		BootstrapServers: "broker:9092",
+		Producer:         ProducerTuning{TransactionalID: "notifiche-pod-0", Acks: "all"},
+	}
+	got := ProcessorSpec{Name: "ingest", Topics: []string{"t"}, GroupID: "g", TransactionalID: "eos-ingest"}.Resolve(server)
+
+	// L'eredità c'è (è la regola uniforme di core.Inherit, senza eccezioni per campo)...
+	if got.Producer.TransactionalID != "notifiche-pod-0" {
+		t.Fatalf("Producer.TransactionalID = %q: atteso il valore ereditato da server.producer", got.Producer.TransactionalID)
+	}
+	// ...ma l'id che il processor usa davvero è il SUO, quello dello spec.
+	if got.TransactionalID != "eos-ingest" {
+		t.Fatalf("ProcessorSpec.TransactionalID = %q, atteso eos-ingest", got.TransactionalID)
+	}
+	if got.TransactionalID == got.Producer.TransactionalID {
+		t.Fatal("i due id coincidono: il producer del processo e quello EOS si fencerebbero a vicenda")
+	}
+}
