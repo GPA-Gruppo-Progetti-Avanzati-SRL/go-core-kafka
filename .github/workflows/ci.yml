@@ -7,6 +7,10 @@ on:
   push:
     branches: [master]
   pull_request:
+  # Notturna: govulncheck deve girare anche senza commit, perché una CVE nuova compare da sé.
+  # Minuti sfalsati fra le librerie per non far partire sette run nello stesso istante.
+  schedule:
+    - cron: '52 5 * * *'
   workflow_dispatch:
 
 permissions:
