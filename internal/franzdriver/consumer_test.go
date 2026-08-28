@@ -16,6 +16,10 @@ type fakeGroupClient struct {
 	committed [][]*kgo.Record
 	err       error
 	closed    bool
+	// releasedAtClose fotografa il contatore dei rilasci nel momento della chiusura: è l'unico modo
+	// di verificare l'ORDINE fra rilascio e Close, che è ciò che conta (vedi il test sotto).
+	releasedAtClose int
+	poller          *fakePoller
 }
 
 func (f *fakeGroupClient) CommitRecords(_ context.Context, rs ...*kgo.Record) error {
@@ -26,9 +30,15 @@ func (f *fakeGroupClient) CommitRecords(_ context.Context, rs ...*kgo.Record) er
 	return nil
 }
 
-func (f *fakeGroupClient) Close() { f.closed = true }
+func (f *fakeGroupClient) Close() {
+	f.closed = true
+	if f.poller != nil {
+		f.releasedAtClose = f.poller.released
+	}
+}
 
 func newTestGroupConsumer(p *fakePoller, cl *fakeGroupClient) *groupConsumer {
+	cl.poller = p
 	return &groupConsumer{session: *newTestSession(p), cl: cl, offsets: newOffsetTracker()}
 }
 
@@ -208,5 +218,52 @@ func TestTransactSession_ProduceFallito(t *testing.T) {
 	err := s.Produce(context.Background(), []*message.ProducerRecord{{Topic: "out"}})
 	if err == nil {
 		t.Fatal("un delivery fallito deve risalire da Produce")
+	}
+}
+
+// Regressione: chiudere senza aver prima rilasciato il rebalance appende l'arresto.
+//
+// Con BlockRebalanceOnPoll ogni poll registra un poller dentro franz, e la poll finale — quella che
+// ritorna subito perché il context del loop è cancellato — lo registra senza rilasciarlo. Close fa
+// LeaveGroup, che attende che i poller scendano a zero: il risultato osservato è stato un SIGTERM che
+// finisce in "stop failed: context deadline exceeded" con i consumer ancora vivi.
+func TestGroupConsumer_CloseRilasciaPrimaDiChiudere(t *testing.T) {
+	p := &fakePoller{fetches: []kgo.Fetches{records("t", 1)}}
+	cl := &fakeGroupClient{}
+	g := newTestGroupConsumer(p, cl)
+
+	if _, err := g.Poll(context.Background(), time.Millisecond); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	releasedPrima := p.released
+
+	if err := g.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if !cl.closed {
+		t.Fatal("il client non è stato chiuso")
+	}
+	if cl.releasedAtClose <= releasedPrima {
+		t.Errorf("rilasci al momento della Close = %d, attesi > %d: il rebalance va sbloccato PRIMA, o LeaveGroup resta appeso",
+			cl.releasedAtClose, releasedPrima)
+	}
+}
+
+// Stessa precondizione per la sessione EOS: la Discard dentro Close rilascia il rebalance.
+func TestTransactSession_CloseRilasciaPrimaDiChiudere(t *testing.T) {
+	p := &fakePoller{fetches: []kgo.Fetches{records("t", 1)}}
+	cl := &fakeTxnClient{}
+	s := newTestTransactSession(p, cl)
+
+	if _, err := s.Poll(context.Background(), time.Millisecond); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	releasedPrima := p.released
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if p.released <= releasedPrima || !cl.closed {
+		t.Errorf("released=%d (prima %d) closed=%v: il rebalance va sbloccato prima della chiusura",
+			p.released, releasedPrima, cl.closed)
 	}
 }

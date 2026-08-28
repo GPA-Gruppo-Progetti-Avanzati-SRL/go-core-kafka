@@ -62,8 +62,19 @@ func (g *groupConsumer) Discard(context.Context) {
 	g.dropAndRelease()
 }
 
+// Close rilascia il rebalance PRIMA di chiudere il client, e non è un dettaglio di cortesia: con
+// BlockRebalanceOnPoll ogni poll registra un poller, e la poll finale — quella che ritorna subito
+// perché il context del loop è stato cancellato — lo registra dentro franz senza rilasciarlo (il
+// ramo `ctx.Done()` di PollRecords chiama waitAndAddPoller e ritorna un fetch sintetico). Close fa
+// LeaveGroup, che attende che i poller scendano a zero: senza il rilascio resta appeso fino alla
+// deadline dell'arresto, e con lui l'OnStop dell'engine — un SIGTERM che finisce in "stop failed:
+// context deadline exceeded" invece che in un LeaveGroup pulito.
+//
+// È lo stesso motivo per cui franz espone Client.CloseAllowingRebalance; qui il rilascio passa da
+// dropAndRelease perché butta anche i record fetchati e non consegnati, che nessuno consumerà più.
 func (g *groupConsumer) Close() error {
 	g.offsets.reset()
+	g.dropAndRelease()
 	g.cl.Close()
 	return nil
 }

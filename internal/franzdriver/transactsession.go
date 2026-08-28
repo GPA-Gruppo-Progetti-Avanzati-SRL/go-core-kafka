@@ -120,6 +120,10 @@ func (t *transactSession) Discard(ctx context.Context) {
 // Close chiude la sessione, abortendo prima una transazione eventualmente aperta: chiuderla lasciandola
 // in volo la tiene aperta fino al transaction.timeout.ms del broker, e nel frattempo i consumatori
 // read_committed a valle restano bloccati su quelle partizioni.
+//
+// La Discard rilascia anche il rebalance (dropAndRelease), che è la precondizione della chiusura con
+// BlockRebalanceOnPoll: il LeaveGroup dentro Close attende che i poller scendano a zero — vedi
+// groupConsumer.Close per il dettaglio.
 func (t *transactSession) Close() error {
 	t.Discard(context.Background())
 	t.sess.Close()
