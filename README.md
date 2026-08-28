@@ -703,6 +703,39 @@ un replay dal nuovo owner: duplicati, mai buchi. In EOS il batch viene abortito 
 Il callback non chiama `Assign`/`Unassign`: se non riassegna, il client Kafka lo fa da sé scegliendo il
 protocollo giusto (`incremental_assign` quando il gruppo è `cooperative-sticky`, `assign` altrimenti).
 
+## Header dei record — una lista, non una mappa
+
+`message.Record.Headers` e `ProducerRecord.Headers` sono di tipo `message.Headers`:
+
+```go
+type Header struct {
+    Key   string
+    Value []byte
+}
+
+type Headers []Header
+```
+
+**È una lista perché Kafka ammette chiavi ripetute**, ed è una possibilità usata davvero (tracing,
+catene di reprocessing che accodano il proprio marcatore). Con una mappa il secondo valore
+sovrascriveva il primo **dentro il driver**, prima che la business logic potesse vederlo: informazione
+persa in silenzio e non ricostruibile a valle. Il `Value` è `[]byte` e non `string` perché nel
+protocollo un header è opaco: può portare un payload binario.
+
+| Metodo | Semantica |
+|---|---|
+| `Get(key) string` | il **primo** valore, `""` se assente — l'accesso giusto quando la chiave è unica |
+| `Has(key) bool` | presenza, distingue l'assenza da un header con valore vuoto |
+| `Values(key) []string` | **tutti** i valori, nell'ordine del messaggio |
+| `Set(key, value)` | sostituisce la prima occorrenza mantenendone la posizione, collassa i duplicati |
+| `Add(key, value)` | accoda senza toccare le occorrenze esistenti |
+| `Clone()` | copia, per derivare un record da un altro senza mutarlo (è ciò che fa l'instradamento al DLQ) |
+
+Le chiavi sono confrontate byte per byte (**case-sensitive**), come nel protocollo.
+
+> **Migrazione per le app:** `rec.Headers["k"]` → `rec.Headers.Get("k")`. È breaking, ma di
+> compilazione: il compilatore trova ogni sito.
+
 ### Header dei record in DLQ
 
 Oltre al payload e agli header originali (la correlazione di trace sopravvive), i record instradati al
