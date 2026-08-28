@@ -695,6 +695,12 @@ server:
 
 ## Errori e restart
 
+Catalogo dei codici: **[ERRORI.md](ERRORI.md)**. `corekafka` ha **un solo `ApplicationError`** —
+`KAFKA-PRODUCE` (`producer.CodeProduce`, `Ambit` = `producer.Ambit`), da `IProducer.Produce`/`ProduceTo`
+— perché tutto il resto della libreria ritorna `error`: l'engine non risponde a un client HTTP ma
+decide se committare, replayare, mandare al DLQ o ricostruire il consumer, e quella decisione la porta
+la **severità**, non un codice.
+
 L'engine distingue **errori del client Kafka** — classificati dal driver, che è l'unico a vedere il
 tipo concreto — da **errori della business logic**. Alla prima categoria è assegnata una *severità*,
 che non è una scala di gravità ma un verbo: dice cosa deve fare l'engine.
