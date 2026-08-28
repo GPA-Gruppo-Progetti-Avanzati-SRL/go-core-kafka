@@ -17,6 +17,14 @@ import (
 	"go.uber.org/fx"
 )
 
+// Ambit e codice del solo ApplicationError prodotto da corekafka: tutto il resto della
+// libreria ritorna error, perché l'engine non risponde a un client HTTP ma decide se
+// committare, replayare o ricostruire il consumer (vedi driver.Severity).
+const (
+	Ambit       = "go-core-kafka"
+	CodeProduce = "KAFKA-PRODUCE" // Produce (o attesa dei delivery report) fallita
+)
+
 // Producer è il servizio di produzione usato dall'engine (vedi il doc del package).
 type Producer struct {
 	d driver.Producer
@@ -25,7 +33,7 @@ type Producer struct {
 // Produce invia i record e attende i delivery report.
 func (p *Producer) Produce(ctx context.Context, recs []*message.ProducerRecord) *core.ApplicationError {
 	if err := p.d.Produce(ctx, recs); err != nil {
-		return core.TechnicalError().WithCause(err)
+		return core.TechnicalError().WithAmbit(Ambit).WithCode(CodeProduce).WithCause(err)
 	}
 	return nil
 }

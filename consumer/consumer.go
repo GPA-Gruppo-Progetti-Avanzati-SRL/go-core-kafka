@@ -239,7 +239,7 @@ func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Fa
 	t, isTransformer := sm.transformers[s.Name]
 	switch {
 	case isHandler && isTransformer:
-		return nil, fmt.Errorf("processor %q: registrato sia come Handler sia come Transformer (ambiguo)", s.Name)
+		return nil, fmt.Errorf("corekafka: processor %q: registrato sia come Handler sia come Transformer (ambiguo)", s.Name)
 	case isHandler:
 		r.handler = h
 		// In modalità handle il producer è quello CONDIVISO del processo (serve al DLQ): un blocco
@@ -251,29 +251,29 @@ func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Fa
 				Msg("corekafka: il blocco `producer` su un processor in modalità handle è ignorato (il producer del DLQ è condiviso): usare `server.producer`")
 		}
 		if s.Consumer.OnError == spec.OnErrorDeadletter && s.Consumer.Deadletter() == "" {
-			return nil, fmt.Errorf("processor %q: consumer.on-error=deadletter richiede consumer.deadletter-topic", s.Name)
+			return nil, fmt.Errorf("corekafka: processor %q: consumer.on-error=deadletter richiede consumer.deadletter-topic", s.Name)
 		}
 		// Il DLQ (via Producer condiviso) serve sia per la policy di default deadletter sia quando
 		// l'handler sceglie il deadletter a runtime (processor.DeadLetter): se c'è un
 		// deadletter-topic, il Producer deve essere presente.
 		if s.HasDeadletter() && dlq == nil {
-			return nil, fmt.Errorf("processor %q: consumer.deadletter-topic impostato richiede il Producer (usare corekafka.WithProducer)", s.Name)
+			return nil, fmt.Errorf("corekafka: processor %q: consumer.deadletter-topic impostato richiede il Producer (usare corekafka.WithProducer)", s.Name)
 		}
 	case isTransformer:
 		r.transformer = t
 		if s.TransactionalID == "" {
-			return nil, fmt.Errorf("processor %q (transform): transactional-id obbligatorio", s.Name)
+			return nil, fmt.Errorf("corekafka: processor %q (transform): transactional-id obbligatorio", s.Name)
 		}
 		// La transazione copre un batch: se scade prima che il batch venga anche solo CHIUSO, il broker
 		// la considera abbandonata e fa fencing del producer a ogni giro — un loop di riavvii in cui
 		// non viene mai committato nulla. Il controllo sta qui e non in ProducerTuning.Validate perché
 		// incrocia i due blocchi ed è specifico della modalità, che a quel livello non è nota.
 		if ms := s.Producer.TransactionTimeoutMs; ms > 0 && time.Duration(ms)*time.Millisecond <= s.Consumer.CutFrequency {
-			return nil, fmt.Errorf("processor %q (transform): producer.transaction-timeout-ms (%dms) <= consumer.cut-frequency (%s): la transazione scadrebbe prima della chiusura del batch, con fencing a ogni giro",
+			return nil, fmt.Errorf("corekafka: processor %q (transform): producer.transaction-timeout-ms (%dms) <= consumer.cut-frequency (%s): la transazione scadrebbe prima della chiusura del batch, con fencing a ogni giro",
 				s.Name, ms, s.Consumer.CutFrequency)
 		}
 	default:
-		return nil, fmt.Errorf("processor %q: nessun processor registrato (usare corekafka.RegisterHandler o RegisterTransformer con questo nome)", s.Name)
+		return nil, fmt.Errorf("corekafka: processor %q: nessun processor registrato (usare corekafka.RegisterHandler o RegisterTransformer con questo nome)", s.Name)
 	}
 
 	// Configure opzionale: passa le Properties dello spec al seam che le vuole all'avvio
@@ -286,7 +286,7 @@ func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Fa
 			continue
 		}
 		if err := c.Configure(s.Properties); err != nil {
-			return nil, fmt.Errorf("processor %q: Configure: %w", s.Name, err)
+			return nil, fmt.Errorf("corekafka: processor %q: Configure: %w", s.Name, err)
 		}
 	}
 
@@ -323,7 +323,7 @@ func (r *runner) run(ctx context.Context) error {
 		}
 		wait, ok := b.next()
 		if !ok {
-			return fmt.Errorf("processor %q: esauriti i %d tentativi di riavvio: %w", r.spec.Name, r.spec.Restart.Attempts(), err)
+			return fmt.Errorf("corekafka: processor %q: esauriti i %d tentativi di riavvio: %w", r.spec.Name, r.spec.Restart.Attempts(), err)
 		}
 
 		restartsTotal.WithLabelValues(r.spec.Name, sev.String()).Inc()
@@ -441,7 +441,7 @@ func (r *runner) absorb(ctx context.Context, err error, s driver.Session, batch 
 // non è configurato, così una richiesta di deadletter senza DLQ non perde silenziosamente i dati.
 func (r *runner) sendDeadletter(ctx context.Context, pr *processor.PoisonRecords) error {
 	if r.dlq == nil || r.spec.Consumer.Deadletter() == "" {
-		return fmt.Errorf("processor %q: deadletter richiesto ma non configurato (manca deadletter-topic/Producer): %w", r.spec.Name, pr.Cause)
+		return fmt.Errorf("corekafka: processor %q: deadletter richiesto ma non configurato (manca deadletter-topic/Producer): %w", r.spec.Name, pr.Cause)
 	}
 	if appErr := r.dlq.Produce(ctx, r.toDLQ(pr)); appErr != nil {
 		return appErr
@@ -654,7 +654,7 @@ func (t transformFlusher) flush(ctx context.Context, batch []*message.Record) er
 // il topic DLQ non è configurato, così una richiesta di DeadLetter senza DLQ non perde dati.
 func (r *runner) dlqRecords(pr *processor.PoisonRecords) ([]*message.ProducerRecord, error) {
 	if r.spec.Consumer.Deadletter() == "" {
-		return nil, fmt.Errorf("processor %q: DeadLetter richiesto ma deadletter-topic assente", r.spec.Name)
+		return nil, fmt.Errorf("corekafka: processor %q: DeadLetter richiesto ma deadletter-topic assente", r.spec.Name)
 	}
 	return r.toDLQ(pr), nil
 }
@@ -732,7 +732,7 @@ func (r *runner) resolveTopics(recs []*message.ProducerRecord) error {
 			continue
 		}
 		if def == "" {
-			return fmt.Errorf("processor %q: il record di output #%d non ha Topic e `default-output-topic` non è configurato: impostarlo sullo spec, oppure assegnare il Topic nel Transformer", r.spec.Name, i)
+			return fmt.Errorf("corekafka: processor %q: il record di output #%d non ha Topic e `default-output-topic` non è configurato: impostarlo sullo spec, oppure assegnare il Topic nel Transformer", r.spec.Name, i)
 		}
 		rec.Topic = def
 	}

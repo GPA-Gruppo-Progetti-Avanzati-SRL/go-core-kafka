@@ -27,7 +27,7 @@ import (
 // entrambe sbagliate quale errore comparisse cambiava da un avvio all'altro.
 func ValidateServer(k KafkaServer) error {
 	if err := core.ValidateStruct(k); err != nil {
-		return fmt.Errorf("server: %w", err)
+		return fmt.Errorf("corekafka: server: %w", err)
 	}
 	for _, blk := range []struct {
 		owner string
@@ -54,7 +54,7 @@ func ValidateServer(k KafkaServer) error {
 // ConsumerTuning.Validate — perché lì il valore effettivo è quello che conta.
 func ValidateProcessor(raw ProcessorSpec) error {
 	if err := core.ValidateStruct(raw); err != nil {
-		return fmt.Errorf("processor %q: %w", raw.Name, err)
+		return fmt.Errorf("corekafka: processor %q: %w", raw.Name, err)
 	}
 	for _, blk := range []struct {
 		owner string

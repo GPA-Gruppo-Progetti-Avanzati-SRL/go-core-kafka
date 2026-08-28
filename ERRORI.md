@@ -1,9 +1,19 @@
 # Codici di errore — go-core-kafka
 
-`corekafka` **non definisce codici applicativi** (`WithCode`) tranne il default `TECH500` di
-`producer/producer.go:28`. Il suo modello d'errore è diverso e più importante: un errore, qui,
-non serve a produrre una risposta HTTP ma a **decidere cosa fa il consumer** — committare,
-replayare, mandare al DLQ, ricostruire il client o uscire.
+`corekafka` ha **un solo `ApplicationError`**: tutto il resto della libreria ritorna `error`,
+perché l'engine non risponde a un client HTTP ma decide se **committare, replayare, mandare al
+DLQ, ricostruire il consumer o uscire**. Codificare quegli errori non servirebbe a nessuno: la
+decisione la porta la `driver.Severity`, non un codice.
+
+| Codice | HTTP | Costante | Origine | Significato |
+|---|---|---|---|---|
+| `KAFKA-PRODUCE` | 500 | `producer.CodeProduce` | `producer/producer.go:36` | `Produce` (o l'attesa dei delivery report) fallita. `Ambit = go-core-kafka` (`producer.Ambit`) |
+
+> **Da quale libreria viene l'errore.** Gli errori non-`ApplicationError` lo dicono nel
+> messaggio, con un prefisso: `corekafka:` per engine, config e supervisione;
+> `confluentdriver:` / `franzdriver:` per il client. Prima gli errori dell'engine iniziavano
+> direttamente con `processor %q: …` e, arrivati a fx o a un log applicativo, non nominavano
+> nessuna libreria.
 
 ## 1. Esito del batch → azione dell'engine
 
@@ -64,7 +74,7 @@ Metriche correlate: `corekafka_consumer_restarts_total{consumer,severity}`,
 
 | Messaggio | Origine | Causa |
 |---|---|---|
-| `processor %q: esauriti i %d tentativi di riavvio: %w` | `consumer/consumer.go:326` | budget `restart.max-attempts` esaurito (default **5**, ~31s di insistenza). L'errore risale, il processo esce e il recovery passa all'orchestratore |
+| `corekafka: processor %q: esauriti i %d tentativi di riavvio: %w` | `consumer/consumer.go:326` | budget `restart.max-attempts` esaurito (default **5**, ~31s di insistenza). L'errore risale, il processo esce e il recovery passa all'orchestratore |
 
 ## 5. Errori di avvio (l'app non parte)
 
@@ -75,7 +85,7 @@ Metriche correlate: `corekafka_consumer_restarts_total{consumer,severity}`,
 | `corekafka.Module: WithDriver è obbligatoria` | `module.go:79` — con i due import (`driver/confluent`, `driver/franz`) nel messaggio |
 | `corekafka: RegisterHandler/RegisterTransformer chiamata fuori dalla funzione passata a Module` | `processor/processor.go:195` |
 
-### Coerenza del processor (`consumer/consumer.go`)
+### Coerenza del processor (`consumer/consumer.go`, messaggi prefissati `corekafka: processor %q:`)
 
 | Messaggio | Riga | Causa |
 |---|---|---|
@@ -91,8 +101,8 @@ Metriche correlate: `corekafka_consumer_restarts_total{consumer,severity}`,
 
 | Messaggio | Origine | Causa |
 |---|---|---|
-| `restart.max-attempts=0 non è ammesso` | `spec/spec.go:444` | `0` è lo zero value: chi l'ha scritto intendeva "illimitati". Il messaggio nomina `-1` (illimitati, esplicito) e `restart.disabled` |
-| `restart.reset-after <= restart.max-backoff` | `spec/spec.go:457` | un run più breve di una singola attesa azzererebbe il contatore, rendendo inefficace `max-attempts` |
+| `corekafka: … restart.max-attempts=0 non è ammesso` | `spec/spec.go:444` | `0` è lo zero value: chi l'ha scritto intendeva "illimitati". Il messaggio nomina `-1` (illimitati, esplicito) e `restart.disabled` |
+| `corekafka: … restart.reset-after <= restart.max-backoff` | `spec/spec.go:457` | un run più breve di una singola attesa azzererebbe il contatore, rendendo inefficace `max-attempts` |
 | `kafka-properties contiene chiavi riservate` | `spec/kafkaprops.go:44` | invarianti dell'engine: `bootstrap.servers`, `group.id`, `transactional.id`, `enable.auto.commit`, `isolation.level` |
 | valore fuori da `validate:"oneof=..."` | `spec/validate.go` | typo su `on-error`, `auto-offset-reset`, `acks`, `compression-type`, … Prima degradava in silenzio |
 
