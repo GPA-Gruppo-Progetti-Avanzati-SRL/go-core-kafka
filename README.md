@@ -930,6 +930,42 @@ DLQ portano:
 | `corekafka-dlq-error` / `-error-at` | causa e istante dello scarto |
 | `Kafka-Delivery-Attempts` | contatore incrementale (nome ereditato da `tpm-kafka-common`): permette a chi riprocessa il DLQ di fermarsi |
 
+## Dump della configurazione al boot
+
+Al livello **Debug**, ogni client Kafka e ogni processor stampano la propria configurazione effettiva
+— sul modello del `ConsumerConfig values: ...` che il driver Java emette al boot. Si accende alzando
+il livello di log dell'applicazione, senza knob dedicati:
+
+```yaml
+logger:
+  level: debug
+```
+
+Vengono emessi due tipi di evento:
+
+| Evento | Contenuto | Emesso da |
+|---|---|---|
+| `configurazione del client consumer/producer di <owner>` | le chiavi passate al client (`bootstrap.servers`, `group.id`, `isolation.level`, `acks`, … incluse le `kafka-properties`) | una volta per client costruito |
+| `configurazione dell'engine per il processor <nome>` | i knob che **non** arrivano a nessun client: `mode`, `max-batch-size`, `cut-frequency`, `poll-timeout`, `on-error`, `deadletter-topic`, il blocco `restart` | una volta per processor, a `newRunner` |
+
+Il secondo blocco è la metà di configurazione che il driver Java non ha, perché dall'altra parte non
+esiste: è dove stanno le decisioni dell'engine. Il campo `mode` vi riporta anche ciò che dallo YAML
+non è deducibile — `handle`, `transform/exactly-once` o `transform/at-least-once` — perché la modalità
+è derivata dalla registrazione.
+
+Tre cose da sapere leggendolo:
+
+- **Le password non ci sono.** Qualsiasi chiave che contenga `password`, `secret`, `token` (o
+  `sasl.oauthbearer.config`) è stampata come `[redacted]`. Il match è su sottostringa e non su una
+  lista chiusa perché le `kafka-properties` sono un vocabolario aperto. Username, path dei certificati
+  e `security.protocol` restano in chiaro: servono a diagnosticare e non sono segreti.
+- **Le chiavi sono ordinate alfabeticamente**, così i dump di due pod si confrontano con un `diff`.
+  Il blocco engine usa invece l'ordine logico in cui l'engine li applica.
+- **È la configurazione che go-core-kafka IMPOSTA, non quella che il client userà.** I default che
+  librdkafka o franz-go applicano per conto proprio non compaiono: nessuno dei due espone la
+  configurazione risolta. È anche il motivo per cui i knob su cui i due client non concordano hanno un
+  default della libreria (vedi sopra) — quelli sono scritti, quindi nel dump si vedono.
+
 ## Metriche
 
 Registrate su Prometheus dall'engine (esposte da `core.NewServerMetrics` su `:2112/metrics`):

@@ -3,6 +3,7 @@ package confluentdriver
 import (
 	"sort"
 
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/rs/zerolog/log"
@@ -51,7 +52,21 @@ func consumerConfigMap(s spec.ProcessorSpec, k spec.KafkaServer) *kafka.ConfigMa
 	// e quindi l'ultimo a scrivere.
 	applyKafkaProperties(cm, "server", k.KafkaProperties)
 	applyKafkaProperties(cm, "processor "+s.Name, c.KafkaProperties)
+	// Il dump sta QUI e non nei costruttori perché questa è l'unica funzione attraversata da ogni
+	// consumer, ed è chiamata una volta per client: una riga di log per client, senza doverla
+	// ripetere in ogni NewXxx.
+	logConfigMap("processor "+s.Name, "consumer", cm)
 	return cm
+}
+
+// logConfigMap adatta la kafka.ConfigMap al dump condiviso dei due driver. La conversione è a mano
+// perché ConfigValue è un tipo proprio del client, non un `any`.
+func logConfigMap(owner, role string, cm *kafka.ConfigMap) {
+	m := make(map[string]any, len(*cm))
+	for k, v := range *cm {
+		m[k] = v
+	}
+	driver.LogConfigValues(owner, role, m)
 }
 
 // producerConfigMap traduce KafkaServer + ProducerTuning nella kafka.ConfigMap del producer. owner
@@ -95,6 +110,7 @@ func producerConfigMap(transactionalID, owner string, p spec.ProducerTuning, k s
 	applySecurity(cm, k)
 	applyKafkaProperties(cm, "server", k.KafkaProperties)
 	applyKafkaProperties(cm, owner, p.KafkaProperties)
+	logConfigMap(owner, "producer", cm)
 	return cm
 }
 

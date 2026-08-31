@@ -270,3 +270,26 @@ func TestProducerOpts_InitTransactionsTimeoutAlDefaultNonAvvisa(t *testing.T) {
 		t.Error("un init-transactions-timeout configurato a mano deve comparire fra i knob non supportati")
 	}
 }
+
+// Gli invarianti dell'engine passano da `set` e non da `add` proprio per finire nella traccia
+// `applied`, che è ciò che il dump di configurazione al boot stampa. Convertirli era il punto: con
+// `add` dal dump mancavano `bootstrap.servers`, `group.id` e `enable.auto.commit`, cioè le chiavi che
+// si guardano per prime.
+func TestConsumerOpts_InvariantiNellaTraccia(t *testing.T) {
+	s := processor(spec.ConsumerTuning{}).Resolve(server())
+	b, err := consumerOpts(s, server())
+	if err != nil {
+		t.Fatalf("consumerOpts: %v", err)
+	}
+	want := map[string]string{
+		"bootstrap.servers":  "broker-1:9092,broker-2:9092",
+		"group.id":           "g",
+		"topics":             "in",
+		"enable.auto.commit": "false",
+	}
+	for k, v := range want {
+		if got := b.applied[k]; got != v {
+			t.Errorf("%s = %q, atteso %q: senza, la chiave manca dal dump di configurazione", k, got, v)
+		}
+	}
+}

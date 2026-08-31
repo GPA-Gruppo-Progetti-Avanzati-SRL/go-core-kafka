@@ -1,5 +1,5 @@
-github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app v0.0.29-0.20260828153848-e5bdb27caf3a h1:+vZyiZn4tzyewWuX9qCPvtxbXfc+t9bMkRgu4RzqzRI=
-github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app v0.0.29-0.20260828153848-e5bdb27caf3a/go.mod h1:/3bNDPrC2UakBy+W9ljuPJFR7QHX8lphktiWPh3TUMY=
+github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app v0.0.29-0.20260831104008-7c0e89e9ad52 h1:WFG9hcXkmtARnGkOancLiJJuj5pG0ORlnzTzgWjoS5w=
+github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app v0.0.29-0.20260831104008-7c0e89e9ad52/go.mod h1:/3bNDPrC2UakBy+W9ljuPJFR7QHX8lphktiWPh3TUMY=
 github.com/GPA-Gruppo-Progetti-Avanzati-SRL/tpm-common v0.1.95 h1:vuA6MhQ0/wuJmZnsPQxxc2viRo1PmtT4KQ5ZjVe4c8M=
 github.com/GPA-Gruppo-Progetti-Avanzati-SRL/tpm-common v0.1.95/go.mod h1:Q456LEsf8ywWb9GU1sIesWakRSIWe6MisfM2Q5lDJlw=
 github.com/KimMachineGun/automemlimit v1.0.0 h1:+MqlvDE/pkJNjk1rU+O14QsH8k10nJAD0frB0lsxyvw=

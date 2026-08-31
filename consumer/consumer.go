@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"runtime/pprof"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -309,7 +310,56 @@ func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Fa
 		}
 	}
 
+	r.logEngineConfig()
 	return r, nil
+}
+
+// logEngineConfig stampa a Debug i knob che governano l'ENGINE — quelli che non arrivano a nessun
+// client Kafka e che quindi non compaiono nel dump del driver: come si taglia il batch, cosa si fa di
+// un esito, quanto si insiste a riavviare. Sono la metà della configurazione di un processor che il
+// driver Java non ha, perché non esiste da quella parte.
+//
+// Sta in newRunner perché è l'unico punto in cui lo spec è già RISOLTO (eredità + default applicati:
+// i valori stampati sono quelli effettivi, non quelli scritti nello YAML) e la modalità è già
+// derivata dalla registrazione — che è ciò che il YAML da solo non dice.
+//
+// L'ordine è logico e non alfabetico, al contrario del dump del client: qui le chiavi sono poche e
+// nostre, e leggerle nell'ordine in cui l'engine le usa (identità, batch, esito, riavvio) dice più
+// di un elenco ordinato per nome.
+func (r *runner) logEngineConfig() {
+	e := log.Debug()
+	if !e.Enabled() {
+		return
+	}
+	s := r.spec
+	mode := "handle"
+	if r.transformer != nil {
+		mode = "transform/" + spec.DeliveryExactlyOnce
+		if s.AtLeastOnce() {
+			mode = "transform/" + spec.DeliveryAtLeastOnce
+		}
+	}
+	lines := []string{
+		"mode = " + mode,
+		"topics = " + strings.Join(s.Topics, ","),
+		"group-id = " + s.GroupID,
+		"transactional-id = " + s.TransactionalID,
+		"default-output-topic = " + s.DefaultOutputTopic,
+		"consumer.max-batch-size = " + strconv.Itoa(s.Consumer.MaxBatchSize),
+		"consumer.cut-frequency = " + s.Consumer.CutFrequency.String(),
+		"consumer.poll-timeout = " + s.Consumer.PollTimeout.String(),
+		"consumer.on-error = " + s.Consumer.OnError,
+		"consumer.deadletter-topic = " + s.Consumer.Deadletter(),
+		"restart.disabled = " + strconv.FormatBool(s.Restart.IsDisabled()),
+		"restart.max-attempts = " + strconv.Itoa(s.Restart.Attempts()),
+		"restart.initial-backoff = " + s.Restart.InitialBackoff.String(),
+		"restart.max-backoff = " + s.Restart.MaxBackoff.String(),
+		"restart.multiplier = " + strconv.FormatFloat(s.Restart.BackoffMultiplier(), 'g', -1, 64),
+		"restart.reset-after = " + s.Restart.ResetAfter.String(),
+		"restart.on-business-error = " + strconv.FormatBool(s.Restart.RestartsOnBusinessError()),
+	}
+	e.Str("consumer", s.Name).Strs("config", lines).
+		Msgf("corekafka: configurazione dell'engine per il processor %q", s.Name)
 }
 
 // run supervisiona il consumo: esegue il loop e, se termina con errore, decide se ricostruire il
@@ -562,13 +612,25 @@ func (r *runner) consume(ctx context.Context, s driver.Session, f flusher) error
 	}
 }
 
+// logClose riporta l'esito della chiusura di un client. Non c'è un'alternativa da scegliere quando
+// fallisce — il run è già finito — ma non è una ragione per buttare l'errore: una chiusura fallita è
+// il momento in cui restano record non consegnati e offset non confermati, e l'unico modo di saperlo
+// dopo il fatto è averlo scritto.
+func (r *runner) logClose(what string, err error) {
+	if err == nil {
+		return
+	}
+	log.Warn().Err(err).Str("consumer", r.spec.Name).Str("client", what).
+		Msg("corekafka: chiusura del client fallita")
+}
+
 // runHandle: modalità at-least-once. poll -> accumula -> (cut size/tempo) -> Handle -> commit dopo il ritorno.
 func (r *runner) runHandle(ctx context.Context) error {
 	gc, err := r.factory.NewGroupConsumer(r.spec, r.server)
 	if err != nil {
 		return err
 	}
-	defer gc.Close()
+	defer func() { r.logClose("consumer di gruppo", gc.Close()) }()
 	return r.consume(ctx, gc, handleFlusher{r: r, gc: gc})
 }
 
@@ -644,7 +706,7 @@ func (r *runner) runTransform(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer sess.Close()
+	defer func() { r.logClose("sessione transazionale", sess.Close()) }()
 	return r.consume(ctx, sess, transformFlusher{r: r, sess: sess})
 }
 
@@ -701,7 +763,8 @@ func (r *runner) runTransformAtLeastOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer gc.Close()
+	defer func() { r.logClose("consumer di gruppo", gc.Close()) }()
+
 	// Il producer appartiene al processor (tuning da `processors[].producer`) e nasce QUI, dentro il
 	// tentativo di run: così la supervisione che ricostruisce il consumer dopo un errore
 	// retriable ricostruisce anche lui, invece di riusare un client che potrebbe essere quello
@@ -710,7 +773,10 @@ func (r *runner) runTransformAtLeastOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer prod.Close()
+	// La chiusura del producer è quella che pesa di più: Close gli concede il `flush-timeout` per
+	// svuotare la coda, e ciò che resta dentro allo scadere è PERSO — è l'unico momento in cui
+	// questo regime può perdere record senza replayarli.
+	defer func() { r.logClose("producer del processor", prod.Close()) }()
 	return r.consume(ctx, gc, alosTransformFlusher{r: r, gc: gc, prod: prod})
 }
 

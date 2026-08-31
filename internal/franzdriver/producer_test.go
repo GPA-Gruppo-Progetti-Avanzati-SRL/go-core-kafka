@@ -109,7 +109,7 @@ func TestFactory_NewProcessorProducer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProcessorProducer: %v", err)
 	}
-	defer p.Close()
+	defer func() { _ = p.Close() }()
 
 	// La verifica sulle opzioni passa dal builder, che è dove la traduzione avviene.
 	b, err := producerOpts("", "processor "+s.Name, s.Producer, spec.KafkaServer{BootstrapServers: "b:9092"})

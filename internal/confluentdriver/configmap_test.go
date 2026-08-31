@@ -1,9 +1,12 @@
 package confluentdriver
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
@@ -261,4 +264,35 @@ func TestProducerConfigMap_LingerZeroEsplicito(t *testing.T) {
 
 	cm = producerConfigMap("", "server.producer", spec.ProducerTuning{}, spec.KafkaServer{BootstrapServers: "b:9092"})
 	mustAbsent(t, cm, "linger.ms")
+}
+
+// Il dump di configurazione al boot stampa la ConfigMap: questo test lega il percorso reale
+// (applySecurity riempie la mappa → FormatConfig la formatta) e verifica che la password non ci
+// arrivi in chiaro. È l'unico modo per cui una diagnostica utile non diventi una fuga di credenziali.
+func TestConfigMap_DumpNonEsponeLeCredenziali(t *testing.T) {
+	k := spec.KafkaServer{
+		BootstrapServers: "b:9092",
+		SecurityProtocol: "SASL_SSL",
+		SASL:             spec.SaslCfg{Mechanisms: "PLAIN", Username: "gpa-app", Password: "s3gr3t0"},
+		SSL:              spec.SSLCfg{KeyLocation: "/etc/certs/client.key", KeyPassword: "chiave-s3gr3ta"},
+	}
+	s := spec.ProcessorSpec{Name: "ingest", GroupID: "g", Topics: []string{"t"}}.Resolve(k)
+
+	m := make(map[string]string)
+	for key, v := range *consumerConfigMap(s, k) {
+		m[key] = fmt.Sprint(v)
+	}
+	joined := strings.Join(driver.FormatConfig(m), "\n")
+
+	for _, segreto := range []string{"s3gr3t0", "chiave-s3gr3ta"} {
+		if strings.Contains(joined, segreto) {
+			t.Errorf("credenziale %q in chiaro nel dump:\n%s", segreto, joined)
+		}
+	}
+	// Ciò che serve a diagnosticare deve invece esserci: username, path della chiave, protocollo.
+	for _, atteso := range []string{"gpa-app", "/etc/certs/client.key", "SASL_SSL", "b:9092"} {
+		if !strings.Contains(joined, atteso) {
+			t.Errorf("%q manca dal dump, ma non è un segreto:\n%s", atteso, joined)
+		}
+	}
 }

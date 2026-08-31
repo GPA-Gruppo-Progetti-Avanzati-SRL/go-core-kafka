@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 	"github.com/rs/zerolog/log"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -111,6 +112,14 @@ func (b *optBuilder) markUnsupported(cond bool, key string) {
 
 // warnUnsupported emette UN avviso con l'elenco: N righe di log per N knob si perdono, una riga con
 // la lista si legge.
+// logConfig stampa a Debug la configurazione che questo builder ha impostato sul client, sul modello
+// del dump che il driver Java emette al boot. La traccia `applied` esiste già per l'avviso sulle
+// kafka-properties che sovrascrivono un campo tipizzato: è la stessa mappa, usata per dire cosa è
+// stato configurato invece di cosa è stato sovrascritto.
+func (b *optBuilder) logConfig(role string) {
+	driver.LogConfig(b.owner, role, b.applied)
+}
+
 func (b *optBuilder) warnUnsupported() {
 	if len(b.unsupported) == 0 {
 		return
@@ -121,7 +130,7 @@ func (b *optBuilder) warnUnsupported() {
 
 // common applica le opzioni di connessione condivise da consumer e producer.
 func (b *optBuilder) common(k spec.KafkaServer) error {
-	b.add(kgo.SeedBrokers(strings.Split(k.BootstrapServers, ",")...))
+	b.set("bootstrap.servers", k.BootstrapServers, kgo.SeedBrokers(strings.Split(k.BootstrapServers, ",")...))
 	b.add(observabilityOpts(b.owner)...)
 
 	if k.ClientID != "" {
@@ -225,10 +234,14 @@ func consumerOpts(s spec.ProcessorSpec, k spec.KafkaServer) (*optBuilder, error)
 	if err := b.common(k); err != nil {
 		return nil, err
 	}
+	// Gli invarianti dell'engine passano da `set` e non da `add` così finiscono nella traccia
+	// `applied`, che è ciò che il dump di configurazione stampa: senza, dal dump mancherebbero
+	// proprio le chiavi che si guardano per prime. Non possono collidere con le kafka-properties —
+	// sono fra le DeniedKafkaProperties, rifiutate al boot.
+	b.set("group.id", s.GroupID, kgo.ConsumerGroup(s.GroupID))
+	b.set("topics", strings.Join(s.Topics, ","), kgo.ConsumeTopics(s.Topics...))
+	b.set("enable.auto.commit", false, kgo.DisableAutoCommit())
 	b.add(
-		kgo.ConsumerGroup(s.GroupID),
-		kgo.ConsumeTopics(s.Topics...),
-		kgo.DisableAutoCommit(),
 		// Il rebalance non può avvenire mentre un batch è in volo: il client lo trattiene finché non
 		// chiamiamo AllowRebalance, cioè dopo il commit o lo scarto. È la stessa garanzia che nel
 		// driver confluent si ottiene a posteriori (revoca → scarto del batch), qui ottenuta prima.
@@ -267,6 +280,7 @@ func consumerOpts(s spec.ProcessorSpec, k spec.KafkaServer) (*optBuilder, error)
 		return nil, err
 	}
 	b.warnUnsupported()
+	b.logConfig("consumer")
 	return b, nil
 }
 
@@ -332,6 +346,7 @@ func producerOpts(transactionalID, owner string, p spec.ProducerTuning, k spec.K
 		return nil, err
 	}
 	b.warnUnsupported()
+	b.logConfig("producer")
 	return b, nil
 }
 
