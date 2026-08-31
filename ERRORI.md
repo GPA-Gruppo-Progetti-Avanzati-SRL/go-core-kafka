@@ -36,7 +36,7 @@ validi, o riprocessare all'infinito messaggi irrecuperabili.
 
 ## 2. Header del deadletter
 
-Sono l'unica "codifica" dell'errore che sopravvive al processo (`consumer/consumer.go:667`):
+Sono l'unica "codifica" dell'errore che sopravvive al processo (`consumer/consumer.go:769`):
 
 | Header | Contenuto |
 |---|---|
@@ -74,7 +74,7 @@ Metriche correlate: `corekafka_consumer_restarts_total{consumer,severity}`,
 
 | Messaggio | Origine | Causa |
 |---|---|---|
-| `corekafka: processor %q: esauriti i %d tentativi di riavvio: %w` | `consumer/consumer.go:326` | budget `restart.max-attempts` esaurito (default **5**, ~31s di insistenza). L'errore risale, il processo esce e il recovery passa all'orchestratore |
+| `corekafka: processor %q: esauriti i %d tentativi di riavvio: %w` | `consumer/consumer.go:345` | budget `restart.max-attempts` esaurito (default **5**, ~31s di insistenza). L'errore risale, il processo esce e il recovery passa all'orchestratore |
 
 ## 5. Errori di avvio (l'app non parte)
 
@@ -90,21 +90,22 @@ Metriche correlate: `corekafka_consumer_restarts_total{consumer,severity}`,
 | Messaggio | Riga | Causa |
 |---|---|---|
 | `registrato sia come Handler sia come Transformer (ambiguo)` | 242 | la modalità è derivata dalla registrazione: due registrazioni = nessuna modalità deducibile |
-| `nessun processor registrato` | 276 | voce in `processors:` senza `RegisterHandler`/`RegisterTransformer` corrispondente |
-| `consumer.on-error=deadletter richiede consumer.deadletter-topic` | 254 | policy senza destinazione |
-| `consumer.deadletter-topic impostato richiede il Producer` | 260 | manca `corekafka.WithProducer` |
-| `(transform): transactional-id obbligatorio` | 265 | EOS senza identità transazionale |
-| `(transform): producer.transaction-timeout-ms <= consumer.cut-frequency` | 272 | la transazione scadrebbe prima della chiusura del batch: fencing a ogni giro |
-| `Configure: %w` | 289 | la `Configurable` del processor ha rifiutato le properties |
+| `nessun processor registrato` | 295 | voce in `processors:` senza `RegisterHandler`/`RegisterTransformer` corrispondente |
+| `consumer.on-error=deadletter richiede consumer.deadletter-topic` | 258 | policy senza destinazione |
+| `consumer.deadletter-topic impostato richiede il Producer` | 264 | manca `corekafka.WithProducer` |
+| `(transform): transactional-id obbligatorio` | 281 | EOS senza identità transazionale (regime di default: `delivery` assente o `exactly-once`) |
+| `(transform, delivery=at-least-once): transactional-id non ammesso` | 273 | l'id non ha destinatario, non c'è nessuna transazione. Errore e non avviso: chi l'ha scritto crede di avere l'EOS |
+| `(transform): producer.transaction-timeout-ms <= consumer.cut-frequency` | 291 | la transazione scadrebbe prima della chiusura del batch: fencing a ogni giro. Non si applica in `at-least-once` |
+| `Configure: %w` | 308 | la `Configurable` del processor ha rifiutato le properties |
 
 ### Configurazione (`spec/`)
 
 | Messaggio | Origine | Causa |
 |---|---|---|
-| `corekafka: … restart.max-attempts=0 non è ammesso` | `spec/spec.go:444` | `0` è lo zero value: chi l'ha scritto intendeva "illimitati". Il messaggio nomina `-1` (illimitati, esplicito) e `restart.disabled` |
-| `corekafka: … restart.reset-after <= restart.max-backoff` | `spec/spec.go:457` | un run più breve di una singola attesa azzererebbe il contatore, rendendo inefficace `max-attempts` |
+| `corekafka: … restart.max-attempts=0 non è ammesso` | `spec/spec.go:546` | `0` è lo zero value: chi l'ha scritto intendeva "illimitati". Il messaggio nomina `-1` (illimitati, esplicito) e `restart.disabled` |
+| `corekafka: … restart.reset-after <= restart.max-backoff` | `spec/spec.go:559` | un run più breve di una singola attesa azzererebbe il contatore, rendendo inefficace `max-attempts` |
 | `kafka-properties contiene chiavi riservate` | `spec/kafkaprops.go:44` | invarianti dell'engine: `bootstrap.servers`, `group.id`, `transactional.id`, `enable.auto.commit`, `isolation.level` |
-| valore fuori da `validate:"oneof=..."` | `spec/validate.go` | typo su `on-error`, `auto-offset-reset`, `acks`, `compression-type`, … Prima degradava in silenzio |
+| valore fuori da `validate:"oneof=..."` | `spec/validate.go` | typo su `on-error`, `auto-offset-reset`, `acks`, `compression-type`, `delivery`, … Prima degradava in silenzio |
 
 ### Driver franz (`internal/franzdriver/kafkaprops.go`)
 
@@ -126,5 +127,5 @@ li elenca: sono vocabolario della libreria, e un limite del driver si documenta.
 | `delivery report non ricevuti entro %s: %d/%d` | `internal/confluentdriver/produce.go:75` | `retriable` — i record non sono né confermati né perduti: si replaya. Il bound viene da `producer.delivery-timeout` (default libreria 2m) |
 | `attesa dei delivery report interrotta con %d/%d ricevuti` | `produce.go:72` | `retriable` — context cancellato |
 | `flush incompleto alla chiusura: %d record ancora in coda` | `internal/confluentdriver/producer.go:31` | in shutdown |
-| `il record di output #%d non ha Topic e default-output-topic non è configurato` | `consumer/consumer.go:735` | errore del Transformer |
-| `DeadLetter richiesto ma deadletter-topic assente` | `consumer/consumer.go:657` | l'handler ha chiesto il DLQ su un processor che non ne ha uno |
+| `il record di output #%d non ha Topic e default-output-topic non è configurato` | `consumer/consumer.go:832` | errore del Transformer |
+| `DeadLetter richiesto ma deadletter-topic assente` | `consumer/consumer.go:754` | l'handler ha chiesto il DLQ su un processor che non ne ha uno |

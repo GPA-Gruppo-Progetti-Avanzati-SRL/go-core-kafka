@@ -108,6 +108,15 @@ type Factory interface {
 	NewGroupConsumer(s spec.ProcessorSpec, k spec.KafkaServer) (GroupConsumer, error)
 	NewTransactSession(s spec.ProcessorSpec, k spec.KafkaServer) (TransactSession, error)
 	NewProducer(k spec.KafkaServer, p spec.ProducerTuning) (Producer, error)
+	// NewProcessorProducer crea il producer non transazionale di UN processor: è quello che scrive
+	// gli output di un transform at-least-once, e il DLQ dello stesso batch.
+	//
+	// Prende lo spec risolto invece della sola ProducerTuning — che pure basterebbe a costruire il
+	// client — perché questo producer APPARTIENE a un processor: il tuning è `processors[].producer`
+	// e l'owner che compare negli errori sulle kafka-properties e negli avvisi sui knob non
+	// supportati dev'essere quel processor. NewProducer li attribuisce a `server.producer`, che qui
+	// manderebbe chi legge nel blocco YAML sbagliato.
+	NewProcessorProducer(s spec.ProcessorSpec, k spec.KafkaServer) (Producer, error)
 	// NewTxProducer crea il producer transazionale del processo. L'id arriva come parametro e non
 	// dal tuning perché è il chiamante — che l'ha letto da `server.producer.transactional-id` — a
 	// decidere con esso QUALE dei due producer costruire: se è vuoto non si arriva qui.

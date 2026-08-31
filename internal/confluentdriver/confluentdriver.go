@@ -82,6 +82,18 @@ func (Factory) NewProducer(k spec.KafkaServer, p spec.ProducerTuning) (driver.Pr
 	return &producer{p: prod, flushTimeout: int(p.FlushTimeout.Milliseconds()), reportWait: reportWait(p)}, nil
 }
 
+// NewProcessorProducer crea il producer non transazionale di un processor (transform at-least-once).
+// A differenza di NewProducer il tuning è quello del processor — già risolto, quindi senza
+// WithDefaults — e l'owner degli avvisi è il processor, non `server.producer`.
+func (Factory) NewProcessorProducer(s spec.ProcessorSpec, k spec.KafkaServer) (driver.Producer, error) {
+	p := s.Producer
+	prod, err := kafka.NewProducer(producerConfigMap("", "processor "+s.Name, p, k))
+	if err != nil {
+		return nil, fmt.Errorf("confluentdriver: NewProcessorProducer %q: %w", s.Name, err)
+	}
+	return &producer{p: prod, flushTimeout: int(p.FlushTimeout.Milliseconds()), reportWait: reportWait(p)}, nil
+}
+
 // NewTxProducer crea il producer TRANSAZIONALE del processo (una transazione per Produce). Come il
 // non transazionale non appartiene a nessun processor, quindi il tuning arriva da `server.producer` —
 // da cui viene anche l'id, che è ciò che ha fatto scegliere questa forma al chiamante

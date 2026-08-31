@@ -72,6 +72,21 @@ func (f *fakeGroupConsumer) progress() int {
 	return f.i
 }
 
+// record permette a un altro fake — il producer della modalità transform at-least-once — di
+// scrivere nella STESSA sequenza: lì l'invariante è l'ordine fra due client distinti (produce prima
+// del commit), e due sequenze separate non lo esprimerebbero.
+func (f *fakeGroupConsumer) sequence() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.ops...)
+}
+
+func (f *fakeGroupConsumer) record(op string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = append(f.ops, op)
+}
+
 func (f *fakeGroupConsumer) Discard(context.Context) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -92,7 +107,7 @@ type fakeFactory struct {
 	mu        sync.Mutex
 	consumers []driver.GroupConsumer
 	sessions  []driver.TransactSession // modalità transform
-	producers []driver.Producer        // producer condiviso del DLQ
+	producers []driver.Producer        // producer condiviso del DLQ e producer di processor (ALOS)
 	errs      []error                  // errore di creazione per tentativo (prevale sul consumer di pari indice)
 	calls     int
 }
@@ -143,6 +158,12 @@ func (f *fakeFactory) NewProducer(spec.KafkaServer, spec.ProducerTuning) (driver
 	p := f.producers[0]
 	f.producers = f.producers[1:]
 	return p, nil
+}
+
+// NewProcessorProducer attinge alla stessa lista di NewProducer: per l'engine i due sono lo stesso
+// driver.Producer, e a distinguerli è solo chi ne possiede il tuning.
+func (f *fakeFactory) NewProcessorProducer(spec.ProcessorSpec, spec.KafkaServer) (driver.Producer, error) {
+	return f.NewProducer(spec.KafkaServer{}, spec.ProducerTuning{})
 }
 
 func (f *fakeFactory) callCount() int {
@@ -1204,16 +1225,34 @@ type fakeDriverProducer struct {
 	produced []*message.ProducerRecord
 	err      error
 	closed   bool
+	// seq, se valorizzato, riceve un "produce" nella sequenza condivisa col consumer di gruppo.
+	seq *fakeGroupConsumer
+	// partial simula la consegna PARZIALE che il Produce non transazionale ammette: i primi n record
+	// arrivano sul topic e la chiamata fallisce comunque. È il caso peggiore della modalità
+	// at-least-once, e senza fake non sarebbe riproducibile.
+	partial int
 }
 
 func (f *fakeDriverProducer) Produce(_ context.Context, recs []*message.ProducerRecord) error {
+	if f.seq != nil {
+		f.seq.record("produce")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.err != nil {
+		if f.partial > 0 && f.partial <= len(recs) {
+			f.produced = append(f.produced, recs[:f.partial]...)
+		}
 		return f.err
 	}
 	f.produced = append(f.produced, recs...)
 	return nil
+}
+
+func (f *fakeDriverProducer) sent() []*message.ProducerRecord {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*message.ProducerRecord(nil), f.produced...)
 }
 
 func (f *fakeDriverProducer) Close() error {
@@ -1337,5 +1376,259 @@ func TestRunHandle_DLQIrraggiungibileNonCommitta(t *testing.T) {
 	}
 	if fc.commits != 0 {
 		t.Errorf("commit = %d, atteso 0: senza consegna al DLQ il batch va replayato", fc.commits)
+	}
+}
+
+// --- modalità transform at-least-once ------------------------------------------------------------
+//
+// Lo stesso Transformer dell'EOS, senza transazione: il regime lo sceglie `delivery` in config. Ciò
+// che va verificato qui non è cosa produce il Transformer — lo copre già il percorso EOS, e il corpo
+// è condiviso (transformBatch) — ma che i due passi restino DUE, nell'ordine giusto, e che nessuno
+// dei due possa rendere definitivo il batch da solo.
+
+// alosSpec: transform at-least-once. Niente transactional-id (è un errore di avvio in questo regime).
+func alosSpec() spec.ProcessorSpec {
+	s := spec.ProcessorSpec{
+		Name: "alos", GroupID: "g", Topics: []string{"in"},
+		Delivery: spec.DeliveryAtLeastOnce, DefaultOutputTopic: "out",
+	}
+	s.Consumer.MaxBatchSize = 2
+	s.Restart = spec.RestartSpec{Disabled: ptr(true)}
+	return s.Resolve(spec.KafkaServer{})
+}
+
+// alosRunner costruisce il runner at-least-once con il consumer di gruppo e il producer che gli
+// verranno consegnati dalla factory. Le due sequenze di operazioni confluiscono in quella del
+// consumer (vedi fakeGroupConsumer.record), perché l'invariante da verificare le attraversa
+// entrambe.
+func alosRunner(s spec.ProcessorSpec, tr processor.Transformer, events []pollEvent) (*runner, *fakeGroupConsumer, *fakeDriverProducer) {
+	gc := &fakeGroupConsumer{
+		events:  events,
+		exhaust: driver.NewError(driver.SeverityPermanent, "poll", errors.New("fine eventi")),
+	}
+	prod := &fakeDriverProducer{seq: gc}
+	f := &fakeFactory{
+		consumers: []driver.GroupConsumer{gc},
+		producers: []driver.Producer{prod},
+	}
+	return &runner{spec: s, factory: f, transformer: tr}, gc, prod
+}
+
+// echo produce un record di output per ogni record del batch, senza Topic (prende il default).
+func echoTransformer() processor.Transformer {
+	return transformerFunc(func(_ context.Context, b []*message.Record) ([]*message.ProducerRecord, error) {
+		out := make([]*message.ProducerRecord, 0, len(b))
+		for _, rr := range b {
+			out = append(out, &message.ProducerRecord{Value: rr.Value})
+		}
+		return out, nil
+	})
+}
+
+func TestRunTransformALOS_OrdineProduceCommit(t *testing.T) {
+	// L'invariante del regime: gli output sono confermati PRIMA che gli offset siano committati.
+	// L'ordine inverso perderebbe record — un commit senza produce dichiara elaborato un batch i cui
+	// output non esistono, che è un buco e non un duplicato.
+	r, gc, prod := alosRunner(alosSpec(), echoTransformer(),
+		[]pollEvent{{rec: rec("in", 0, 1)}, {rec: rec("in", 0, 2)}})
+
+	_ = r.run(context.Background())
+
+	if got := gc.sequence(); !opsEqual(got, []string{"produce", "commit"}) {
+		t.Errorf("sequenza = %v, attesa [produce commit]", got)
+	}
+	sent := prod.sent()
+	if len(sent) != 2 {
+		t.Fatalf("record prodotti = %d, attesi 2", len(sent))
+	}
+	for _, p := range sent {
+		if p.Topic != "out" {
+			t.Errorf("Topic = %q, atteso il default-output-topic", p.Topic)
+		}
+	}
+	if !gc.closed {
+		t.Error("il consumer non è stato chiuso all'uscita dal loop")
+	}
+	if !prod.closed {
+		t.Error("il producer del processor non è stato chiuso all'uscita dal loop")
+	}
+}
+
+func TestRunTransformALOS_DeadLetterAccodatoAgliOutput(t *testing.T) {
+	// Il DLQ passa dallo STESSO producer degli output e dalla stessa Produce: senza transazione non
+	// c'è atomicità da preservare, ma restano un solo percorso di scrittura e un solo ordine — che è
+	// ciò che impedisce alle due modalità di divergere.
+	s := alosSpec()
+	s.Consumer.DeadletterTopic = ptr("dlq")
+	r, gc, prod := alosRunner(s,
+		transformerFunc(func(_ context.Context, b []*message.Record) ([]*message.ProducerRecord, error) {
+			return []*message.ProducerRecord{{Value: []byte("buono")}},
+				processor.DeadLetter(errors.New("scartato"), b[0])
+		}),
+		[]pollEvent{{rec: rec("in", 0, 1)}, {rec: rec("in", 0, 2)}})
+
+	_ = r.run(context.Background())
+
+	if got := gc.sequence(); !opsEqual(got, []string{"produce", "commit"}) {
+		t.Errorf("sequenza = %v, attesa [produce commit]: il DLQ non deve aggiungere un giro", got)
+	}
+	sent := prod.sent()
+	if len(sent) != 2 {
+		t.Fatalf("record prodotti = %d, attesi 2 (output + deadletter)", len(sent))
+	}
+	var dlq *message.ProducerRecord
+	for _, p := range sent {
+		if p.Topic == "dlq" {
+			dlq = p
+		}
+	}
+	if dlq == nil {
+		t.Fatal("nessun record instradato al deadletter-topic")
+	}
+	if got := string(dlq.Headers.Get(HeaderDLQError)); got == "" {
+		t.Error("il record DLQ non porta la causa nell'header corekafka-dlq-error")
+	}
+}
+
+func TestRunTransformALOS_ProduceFallitaNonCommitta(t *testing.T) {
+	// Output non confermati: non si committa, il batch viene replayato. Duplicati, mai buchi.
+	r, gc, prod := alosRunner(alosSpec(), echoTransformer(),
+		[]pollEvent{{rec: rec("in", 0, 1)}, {rec: rec("in", 0, 2)}})
+	prod.err = errors.New("broker giù")
+
+	_ = r.run(context.Background())
+
+	if gc.commits != 0 {
+		t.Errorf("commit = %d, atteso 0: un Produce fallito non deve confermare gli offset", gc.commits)
+	}
+}
+
+func TestRunTransformALOS_ProduceParzialeNonCommitta(t *testing.T) {
+	// Il caso peggiore del regime, e la ragione per cui l'avviso al boot esiste: il Produce NON è
+	// atomico sul gruppo. Qui il primo record arriva sul topic e la chiamata fallisce comunque —
+	// non committando, il batch viene replayato PER INTERO e quel record verrà ripubblicato.
+	// L'alternativa (committare per non duplicare) perderebbe il secondo record: è la scelta fra
+	// duplicati e buchi, e la libreria sceglie sempre i duplicati.
+	r, gc, prod := alosRunner(alosSpec(), echoTransformer(),
+		[]pollEvent{{rec: rec("in", 0, 1)}, {rec: rec("in", 0, 2)}})
+	prod.err = errors.New("delivery fallita sul secondo record")
+	prod.partial = 1
+
+	_ = r.run(context.Background())
+
+	if got := len(prod.sent()); got != 1 {
+		t.Fatalf("record consegnati = %d, atteso 1 (consegna parziale)", got)
+	}
+	if gc.commits != 0 {
+		t.Errorf("commit = %d, atteso 0: una consegna parziale non deve confermare gli offset", gc.commits)
+	}
+}
+
+func TestRunTransformALOS_RecordSenzaDestinazioneNonProduce(t *testing.T) {
+	// resolveTopics fallisce PRIMA di qualunque scrittura: un difetto deterministico del transformer
+	// non deve pubblicare metà batch e poi accorgersene.
+	s := alosSpec()
+	s.DefaultOutputTopic = "" // nessun default: un record senza Topic non ha destinazione
+	r, gc, prod := alosRunner(s, echoTransformer(),
+		[]pollEvent{{rec: rec("in", 0, 1)}, {rec: rec("in", 0, 2)}})
+
+	_ = r.run(context.Background())
+
+	if got := gc.sequence(); len(got) != 0 {
+		t.Errorf("sequenza = %v, attesa vuota: né produce né commit", got)
+	}
+	if got := len(prod.sent()); got != 0 {
+		t.Errorf("record prodotti = %d, atteso 0", got)
+	}
+}
+
+func TestRunTransformALOS_ResetScartaIlBatch(t *testing.T) {
+	// Un rebalance durante l'accumulo: il batch in volo viene scartato con Discard — senza, il
+	// commit successivo confermerebbe offset di record che il nuovo owner sta rileggendo — e il loop
+	// prosegue senza ricostruire il client.
+	r, gc, prod := alosRunner(alosSpec(), echoTransformer(), []pollEvent{
+		{rec: rec("in", 0, 1)},
+		{err: driver.NewError(driver.SeverityReset, "poll", errors.New("rebalance"))},
+	})
+
+	_ = r.run(context.Background())
+
+	if gc.discards == 0 {
+		t.Error("Discard non chiamata: gli offset tracciati nel driver resterebbero committabili")
+	}
+	if gc.commits != 0 {
+		t.Errorf("commit = %d, atteso 0: il batch è stato scartato", gc.commits)
+	}
+	if got := len(prod.sent()); got != 0 {
+		t.Errorf("record prodotti = %d, atteso 0", got)
+	}
+}
+
+// --- validazione del regime di consegna (newRunner) ----------------------------------------------
+//
+// La coerenza fra `delivery` e `transactional-id` si verifica al WIRING, non al primo batch: una
+// misconfig di questo tipo non degrada, ferma l'avvio.
+
+// newRunnerFor costruisce il runner di un transformer con lo spec dato, ritornando l'errore di
+// validazione. È il percorso reale (newRunner), non una sua imitazione.
+func newRunnerFor(s spec.ProcessorSpec) error {
+	sm := seams{
+		handlers:     map[string]processor.Handler{},
+		transformers: map[string]processor.Transformer{s.Name: echoTransformer()},
+	}
+	_, err := newRunner(s, spec.KafkaServer{BootstrapServers: "b:9092"}, sm, &fakeFactory{}, nil)
+	return err
+}
+
+func TestNewRunner_TransformAtLeastOnceSenzaTransactionalID(t *testing.T) {
+	// In at-least-once non c'è transazione, quindi non c'è un id da pretendere: è il vincolo che il
+	// regime esiste per togliere.
+	s := spec.ProcessorSpec{
+		Name: "alos", GroupID: "g", Topics: []string{"in"},
+		Delivery: spec.DeliveryAtLeastOnce, DefaultOutputTopic: "out",
+	}
+	if err := newRunnerFor(s.Resolve(spec.KafkaServer{})); err != nil {
+		t.Fatalf("un transform at-least-once senza transactional-id deve costruire: %v", err)
+	}
+}
+
+func TestNewRunner_TransformAtLeastOnceRifiutaTransactionalID(t *testing.T) {
+	// L'id non avrebbe destinatario. È un errore e non un avviso perché chi l'ha scritto crede di
+	// avere l'EOS: lasciarlo passare significherebbe lasciarglielo credere.
+	s := spec.ProcessorSpec{
+		Name: "alos", GroupID: "g", Topics: []string{"in"},
+		Delivery: spec.DeliveryAtLeastOnce, TransactionalID: "tx-1", DefaultOutputTopic: "out",
+	}
+	err := newRunnerFor(s.Resolve(spec.KafkaServer{}))
+	if err == nil {
+		t.Fatal("transactional-id con delivery=at-least-once deve fermare l'avvio")
+	}
+	if !strings.Contains(err.Error(), "transactional-id") || !strings.Contains(err.Error(), "alos") {
+		t.Errorf("errore = %q, atteso il nome del processor e il knob in conflitto", err)
+	}
+}
+
+func TestNewRunner_TransformEOSPretendeAncoraTransactionalID(t *testing.T) {
+	// Il regime di default non cambia: senza `delivery` si è in EOS, e lì l'id resta obbligatorio.
+	s := spec.ProcessorSpec{Name: "eos", GroupID: "g", Topics: []string{"in"}, DefaultOutputTopic: "out"}
+	if err := newRunnerFor(s.Resolve(spec.KafkaServer{})); err == nil {
+		t.Fatal("un transform senza delivery è EOS e pretende transactional-id")
+	}
+}
+
+func TestNewRunner_TransformAtLeastOnceIgnoraTransactionTimeout(t *testing.T) {
+	// transaction-timeout-ms <= cut-frequency ferma l'avvio in EOS (la transazione scadrebbe prima
+	// della chiusura del batch). In at-least-once non c'è transazione da far scadere, quindi il
+	// controllo non si applica — e da quando il knob ha un default della libreria, applicarlo
+	// comunque avrebbe fermato l'avvio di chi non l'ha mai scritto.
+	s := spec.ProcessorSpec{
+		Name: "alos", GroupID: "g", Topics: []string{"in"},
+		Delivery: spec.DeliveryAtLeastOnce, DefaultOutputTopic: "out",
+	}
+	s.Consumer.CutFrequency = 90 * time.Second
+	s.Consumer.PollTimeout = time.Second
+	s.Producer.TransactionTimeoutMs = 1000
+	if err := newRunnerFor(s.Resolve(spec.KafkaServer{})); err != nil {
+		t.Fatalf("il vincolo sulla transazione non si applica in at-least-once: %v", err)
 	}
 }

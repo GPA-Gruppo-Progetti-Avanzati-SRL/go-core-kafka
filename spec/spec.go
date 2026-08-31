@@ -42,6 +42,23 @@ const (
 	OnErrorFailFast   = "fail-fast"  // non committa ed esce: replay al riavvio (default)
 )
 
+// Regime di consegna di un processor in modalità TRANSFORM. Non si applica a handle, che è
+// at-least-once per costruzione.
+//
+// È l'unico campo di config che cambia come il transform rende definitivo un batch; la MODALITÀ
+// (handle vs transform) resta derivata da RegisterHandler/RegisterTransformer, non da qui.
+const (
+	// DeliveryExactlyOnce è il default: EOS Kafka→Kafka, una transazione per batch che lega record
+	// prodotti e offset consumati. Richiede transactional-id.
+	DeliveryExactlyOnce = "exactly-once"
+	// DeliveryAtLeastOnce: produce, poi committa gli offset. Due esiti INDIPENDENTI, e il gruppo di
+	// output non è nemmeno atomico fra sé — una Produce può consegnarne una parte e fallire sul
+	// resto. Un replay ripubblica ciò che era già passato, e i consumer a valle vedono gli output
+	// prima (ed eventualmente senza) il commit. Utilizzabile solo se la scrittura a valle è
+	// idempotente per chiave.
+	DeliveryAtLeastOnce = "at-least-once"
+)
+
 // Default applicati da WithDefaults quando i campi non sono valorizzati né sul processor né nel
 // corrispondente blocco globale sotto `server`.
 const (
@@ -75,6 +92,41 @@ const (
 	// tentativi con i backoff di default sono ~31s di insistenza (1+2+4+8+16), e un run che dura
 	// almeno ResetAfter ricarica il budget — quindi un consumer sano non lo consuma mai.
 	DefaultRestartMaxAttempts = 5
+)
+
+// Default della LIBRERIA sui knob dove librdkafka e franz-go NON sono d'accordo.
+//
+// La convenzione generale è "un knob non valorizzato non viene scritto: resta il default del
+// client", e regge finché i due client concordano. Su questi cinque non concordano, quindi
+// lasciarli impliciti significava che lo stesso YAML cambiava semantica cambiando driver — l'unica
+// cosa che l'astrazione driver promette di non far succedere. Non sono "valori consigliati": sono
+// il modo di rendere il default OSSERVABILE e uguale ovunque. Gli altri knob restano al default del
+// client, dove i due concordano o divergono solo in prestazioni (la tabella sta nel README).
+const (
+	// DefaultIsolationLevel: un consumer della libreria NON legge record di transazioni non ancora
+	// committate — e non vede quelle che verranno abortite. librdkafka assume read_committed,
+	// franz-go read_uncommitted (kgo defaultCfg: isolationLevel 0).
+	DefaultIsolationLevel = "read_committed"
+	// DefaultAssignmentStrategy: rebalance INCREMENTALE, che è ciò che il rebalance callback
+	// dell'engine dà per scontato (revoca parziale, non stop-the-world). librdkafka assume
+	// range,roundrobin — cioè eager — e franz-go cooperative-sticky.
+	//
+	// NB per chi migra da eager: il cambio di protocollo richiede un rolling restart, perché
+	// membri con protocolli diversi non formano gruppo.
+	DefaultAssignmentStrategy = "cooperative-sticky"
+	// DefaultCompressionType: nessuna compressione salvo richiesta esplicita. franz-go offre
+	// snappy di default, quindi senza questo default lo stesso YAML scriveva sul topic record
+	// compressi o no a seconda del driver.
+	DefaultCompressionType = "none"
+	// DefaultMaxPollIntervalMs: 5 minuti per elaborare un batch prima di essere espulsi dal
+	// gruppo. franz-go concede 60s (rebalanceTimeout), librdkafka 300000: un batch lento faceva
+	// espellere il consumer su un driver e non sull'altro.
+	DefaultMaxPollIntervalMs = 300000
+	// DefaultTransactionTimeoutMs: durata massima di una transazione EOS. librdkafka assume 60000,
+	// franz-go 40s. Averlo sempre valorizzato rende anche SEMPRE eseguito il controllo di coerenza
+	// con cut-frequency (vedi consumer.newRunner), che prima era saltato proprio quando il valore
+	// effettivo differiva fra driver.
+	DefaultTransactionTimeoutMs = 60000
 )
 
 // KafkaServer è tutto ciò che riguarda "come parliamo con Kafka": la connessione condivisa da tutti i
@@ -114,6 +166,22 @@ type KafkaServer struct {
 	// rilascio della libreria. Le chiavi che l'engine deve controllare (vedi DeniedKafkaProperties)
 	// sono rifiutate al boot: sono invarianti, non default sovrascrivibili.
 	KafkaProperties map[string]string `yaml:"kafka-properties" mapstructure:"kafka-properties" json:"kafka-properties"`
+}
+
+// WithDefaults riempie i default della libreria sui campi di CONNESSIONE. Tocca il solo ClientID:
+// lasciarlo vuoto significa presentarsi al broker come "rdkafka" o "kgo" a seconda del driver, cioè
+// non essere riconoscibili nei log e nelle metriche del cluster.
+//
+// NON tocca i blocchi Consumer/Producer, ed è vincolante: quelli sono le SORGENTI dell'eredità
+// (ProcessorSpec.Resolve li usa come valori globali da cui i processor ereditano i campi non
+// valorizzati). Applicarci un default renderebbe indistinguibile "non scritto" da "scritto al
+// valore di default", e core.Inherit non avrebbe più modo di sapere cosa ereditare. I loro default
+// li mette ConsumerTuning/ProducerTuning.WithDefaults, DOPO l'eredità.
+func (k KafkaServer) WithDefaults() KafkaServer {
+	if k.ClientID == "" {
+		k.ClientID = core.AppName
+	}
+	return k
 }
 
 // SSLCfg raccoglie i parametri TLS. CaLocation da solo basta per il TLS server-side; i tre campi
@@ -213,6 +281,17 @@ func (t ConsumerTuning) WithDefaults() ConsumerTuning {
 	}
 	if t.OnError == "" {
 		t.OnError = OnErrorFailFast
+	}
+	// I tre knob su cui i due client non concordano: qui il default lo impone la libreria, non il
+	// client (vedi il blocco Default* dedicato).
+	if t.IsolationLevel == "" {
+		t.IsolationLevel = DefaultIsolationLevel
+	}
+	if t.PartitionAssignmentStrategy == "" {
+		t.PartitionAssignmentStrategy = DefaultAssignmentStrategy
+	}
+	if t.MaxPollIntervalMs <= 0 {
+		t.MaxPollIntervalMs = DefaultMaxPollIntervalMs
 	}
 	return t
 }
@@ -319,6 +398,15 @@ func (p ProducerTuning) WithDefaults() ProducerTuning {
 	}
 	if p.InitTransactionsTimeout <= 0 {
 		p.InitTransactionsTimeout = DefaultInitTransactionsTimeout
+	}
+	// I due knob su cui i client non concordano (vedi il blocco Default* dedicato). Nessuno dei due
+	// finisce su un producer non transazionale: transaction.timeout.ms è scritto dai driver solo nel
+	// ramo con transactional-id.
+	if p.CompressionType == "" {
+		p.CompressionType = DefaultCompressionType
+	}
+	if p.TransactionTimeoutMs <= 0 {
+		p.TransactionTimeoutMs = DefaultTransactionTimeoutMs
 	}
 	return p
 }
@@ -497,6 +585,11 @@ type ProcessorSpec struct {
 	// Identità EOS (modalità transform): non ereditabili, distinguono un processor dall'altro.
 	TransactionalID    string `yaml:"transactional-id" mapstructure:"transactional-id" json:"transactional-id"`
 	DefaultOutputTopic string `yaml:"default-output-topic" mapstructure:"default-output-topic" json:"default-output-topic"`
+	// Delivery è il regime di consegna in modalità transform (vedi DeliveryExactlyOnce /
+	// DeliveryAtLeastOnce). Vuoto = exactly-once: la garanzia FORTE è quella che si ottiene non
+	// scrivendo nulla, perché l'alternativa ammette duplicati e output orfani e chi la sceglie deve
+	// averlo fatto apposta. In modalità handle è inerte, e l'engine lo segnala con un warning.
+	Delivery string `yaml:"delivery" mapstructure:"delivery" json:"delivery" validate:"omitempty,oneof=exactly-once at-least-once"`
 
 	// Override dei blocchi omonimi di `server`. Ogni campo non valorizzato eredita.
 	Consumer ConsumerTuning `yaml:"consumer" mapstructure:"consumer" json:"consumer"`
@@ -527,6 +620,10 @@ func (s ProcessorSpec) Resolve(server KafkaServer) ProcessorSpec {
 	s.Restart = s.Restart.inherit(server.Restart).WithDefaults()
 	return s
 }
+
+// AtLeastOnce dice se il transform di questo processor rinuncia all'EOS. Il vuoto vale
+// exactly-once, quindi non c'è nulla da normalizzare in Resolve (che non tocca i campi di identità).
+func (s ProcessorSpec) AtLeastOnce() bool { return s.Delivery == DeliveryAtLeastOnce }
 
 // HasDeadletter indica se è configurato un topic DLQ (abilita il deadletter, sia da policy di default
 // sia da scelta dell'handler/transformer a runtime).

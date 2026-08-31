@@ -46,7 +46,7 @@ func ProducerModule(cfg *Config, opts ...Option) {
 // consumer) darebbero un duplicate provide.
 func provideProducer(cfg *Config, o options) {
 	core.Module("kafka-producer", func() {
-		core.Supply(cfg.Server, o.modes...)
+		core.Supply(cfg.Server.WithDefaults(), o.modes...)
 		core.Supply(cfg.Server.Producer, o.modes...)
 
 		if core.IsMode(o.modes...) {

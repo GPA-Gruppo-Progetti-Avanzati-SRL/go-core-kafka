@@ -44,8 +44,13 @@ CGO_ENABLED=0 go build $(go list ./... | grep -v confluent)
   **dopo** il ritorno nil. **Business logic LIBERA**: l'handler fa ciò che vuole (Mongo, SQL, chiamate
   esterne…). Con scrittura idempotente (upsert) è effectively-once. La libreria NON fornisce un
   "sinker": è l'`Handler` a fare tutto.
-- **`transform`** — *EOS Kafka→Kafka*. poll → `Transformer.Transform(batch) → []*ProducerRecord` →
-  produce + commit degli offset consumati nella **stessa transazione** (`SendOffsetsToTransaction`).
+- **`transform`** — *Kafka→Kafka*. poll → `Transformer.Transform(batch) → []*ProducerRecord` → produce
+  → commit degli offset consumati. Il **regime di consegna** lo sceglie `delivery` sul processor:
+  - `exactly-once` (**default**, `transactional-id` obbligatorio): produce e commit degli offset
+    nella **stessa transazione** (`SendOffsetsToTransaction`). EOS.
+  - `at-least-once` (`transactional-id` **non ammesso**): produce col producer non transazionale del
+    processor, poi committa. Due passi distinti — vedi
+    [Il transform at-least-once](#il-transform-at-least-once-cosa-si-perde) prima di sceglierlo.
 
 Esito **uniforme** tra i due seam (via lo stesso errore gestito): `nil` → commit; `corekafka.DeadLetter(
 cause, recs...)` → i record indicati vanno al **DLQ** (in handle via Producer; in transform prodotti nella
@@ -293,6 +298,56 @@ func (t *Transformer) Transform(ctx context.Context, batch []*corekafka.Record) 
 }
 ```
 
+### Il transform at-least-once: cosa si perde
+
+Lo **stesso** `Transformer` — nessuna interfaccia diversa, nessuna `Register` diversa — gira senza
+transazione se il processor dichiara `delivery: at-least-once`:
+
+```yaml
+processors:
+  - name: routing
+    topics: [in]
+    group-id: gpa-routing
+    delivery: at-least-once        # assente = exactly-once
+    default-output-topic: out
+    # transactional-id: NON ammesso qui — non c'è transazione, e scriverlo ferma l'avvio
+```
+
+Serve quando l'EOS costa più di quanto valga: un `transactional.id` **univoco per replica** (con il
+fencing reciproco che ne consegue), un broker con le transazioni abilitate e le relative ACL, e la
+transazione che deve chiudersi entro `transaction-timeout-ms`. Per una trasformazione la cui
+scrittura a valle è idempotente per chiave, at-least-once basta.
+
+**Il prezzo è che il gruppo di output non è tutto-o-niente.** Il `Produce` non transazionale accoda
+ogni record e ne raccoglie il delivery report singolarmente: non esiste un rollback. Tre modi di
+fallimento, tutti reali:
+
+1. **Produce parziale.** Alcuni output finiscono sul topic, altri no → niente commit → replay
+   dell'intero batch → ciò che era già passato viene **ripubblicato**. `enable.idempotence` non
+   protegge da questo: dedupplica i retry *interni* del client su un record accodato una volta, non
+   un record che l'applicazione riaccoda dopo un replay.
+2. **Produce riuscito, commit degli offset fallito.** Replay → tutti gli output ripubblicati.
+3. **Visibilità anticipata.** Gli output non sono in transazione, quindi un consumer a valle — anche
+   `read_committed` — li vede subito, prima e indipendentemente dal commit. Se il batch poi non viene
+   committato, restano lì.
+
+La scelta è sempre fra duplicati e buchi, e la libreria sceglie sempre i duplicati:
+`producedTotal`/`processedTotal` avanzano solo dopo il commit, e nessun percorso conferma offset di
+record non elaborati. **Precondizione d'uso: la scrittura a valle dev'essere idempotente per chiave**
+(upsert / `ReplaceOne`), o il consumatore a valle deve tollerare duplicati e output orfani — la stessa
+regola della modalità handle. `max-batch-size: 1` restringe la finestra del caso 1 ma non elimina il 2
+né il 3, e non copre un `Transform` con fan-out 1:N.
+
+Dove tutto questo non è accettabile, **l'EOS non è sostituibile**: non esiste una via di mezzo che
+costi meno. Un producer transazionale sui soli output (transazione senza `SendOffsetsToTransaction`)
+darebbe l'atomicità del gruppo, ma pretenderebbe comunque `transactional.id`, broker transazionale e
+consumer `read_committed` — cioè lo stesso costo dell'EOS — conservando il modo di fallimento 2.
+
+Due differenze operative rispetto all'EOS: `processors[].producer` ha un destinatario **anche** qui
+(è il producer non transazionale del processor, che scrive output e DLQ), e `isolation-level` non è
+forzato — vale il default della libreria (`read_committed`), sovrascrivibile per processor, mentre in
+EOS `read_committed` è imposto e non negoziabile.
+
 ## Wiring — composition root (`main.go`)
 
 `Module` richiede il riferimento alla funzione di registrazione dell'app (business logic): per questo
@@ -424,6 +479,11 @@ Il producer non è il modo di produrre **dentro** un consumer: per quello c'è i
 Kafka→Kafka), il solo seam in cui i record prodotti e gli offset consumati sono atomici. Un `Handler`
 che pubblicasse con questo producer avrebbe due esiti indipendenti, e a un replay del batch
 ripubblicherebbe. Senza `WithProducer()` il producer del DLQ resta infatti privato al sottosistema.
+
+Nemmeno il `Transformer` in `delivery: at-least-once` usa questo producer: il suo è un client
+**proprio**, costruito dal processor col tuning di `processors[].producer` e ricostruito con lui a
+ogni riavvio supervisionato. Quel regime ha comunque gli stessi due esiti indipendenti — è il motivo
+per cui va scelto esplicitamente.
 
 ## Properties per-processor + esito deciso dall'handler
 
@@ -606,6 +666,16 @@ services:
           linger-ms: 0                      # override del producer TRANSAZIONALE di questo processor
         properties:
           topic-prefix: "gpa."
+
+      - name: routing               # RegisterTransformer[...]("routing") -> transform at-least-once
+        topics: [gpa.raw.in]
+        group-id: gpa-routing
+        delivery: at-least-once     # assente = exactly-once; qui transactional-id NON è ammesso
+        default-output-topic: gpa.routed
+        consumer:
+          deadletter-topic: gpa.routing.DLQ  # prodotto dallo stesso producer degli output
+        producer:
+          linger-ms: 0              # override del producer NON transazionale di questo processor
 ```
 
 ### Eredità e override
@@ -620,13 +690,15 @@ stesse chiavi: non c'è una lista di "campi sovrascrivibili" da tenere allineata
 | `consumer` | tuning del client consumer (`auto-offset-reset`, `session-timeout-ms`, `heartbeat-interval-ms`, `fetch-*`, `max-partition-fetch-bytes`, `queued-max-messages-kbytes`, `max-poll-interval-ms`, `partition-assignment-strategy`, `isolation-level`), dell'engine (`max-batch-size`, `cut-frequency`, `poll-timeout`), policy (`on-error`, `deadletter-topic`) e `kafka-properties` | sì, campo per campo |
 | `producer` | tuning del client producer (`acks`, `compression-type`, `linger-ms`, `batch-*`, `max-retries`, `max-in-flight`, `retry-backoff`, `delivery-timeout`, `request-timeout-ms`, `flush-timeout`, `enable-idempotence`), transazioni (`transactional-id` — solo per il producer del processo, vedi "Il producer" —, `transaction-timeout-ms`, `init-transactions-timeout`) e `kafka-properties` | sì, campo per campo (`transactional-id` è ereditato ma **inerte** su un processor) |
 | `restart` | `disabled`, `max-attempts`, `initial-backoff`, `max-backoff`, `multiplier`, `reset-after`, `on-business-error` | sì, campo per campo |
-| _identità_ | `name`, `topics`, `group-id`, `transactional-id`, `default-output-topic`, `properties` | **no**: è ciò che distingue un processor dall'altro |
+| _identità_ | `name`, `topics`, `group-id`, `delivery`, `transactional-id`, `default-output-topic`, `properties` | **no**: è ciò che distingue un processor dall'altro |
 
-**`processors[].producer` ha effetto solo in modalità transform.** Il producer transazionale è
-l'unico che appartiene a un processor; in modalità handle il producer è quello **condiviso** del
-processo (serve al DLQ) e un override non avrebbe destinatario — l'engine lo segnala con un warning
-al boot. La modalità è derivata dalla registrazione, quindi chi scrive il YAML non ha modo di
-accorgersene guardando solo la config: per questo è un warning e non un errore.
+**`processors[].producer` ha effetto solo in modalità transform** — in entrambi i regimi di
+consegna. Il producer che appartiene a un processor è quello transazionale dell'EOS o quello non
+transazionale dell'at-least-once; in modalità handle il producer è quello **condiviso** del processo
+(serve al DLQ) e un override non avrebbe destinatario — l'engine lo segnala con un warning al boot.
+La modalità è derivata dalla registrazione, quindi chi scrive il YAML non ha modo di accorgersene
+guardando solo la config: per questo è un warning e non un errore. Lo stesso vale per `delivery`
+scritto su un processor in modalità handle, che è at-least-once per costruzione.
 
 I blocchi si ereditano **campo per campo**: sovrascriverne uno non azzera gli altri. `restart.disabled`,
 `restart.on-business-error`, `producer.enable-idempotence` e `producer.linger-ms` sono puntatori
@@ -634,14 +706,46 @@ proprio per questo — con un valore semplice, un `true` (o un `20`) globale non
 sovrascrivibile con `false` (o `0`) da un singolo processor.
 
 **Convenzione dei knob di tuning: un campo non valorizzato NON viene scritto nella ConfigMap**, così
-resta il default di librdkafka. Scrivere lo zero al posto di omettere la chiave imporrebbe `0` a
+resta il default del client. Scrivere lo zero al posto di omettere la chiave imporrebbe `0` a
 proprietà dove zero ha un significato del tutto diverso dal default.
 
-Default della libreria (l'ultimo anello della catena) — sono quelli che governano **l'engine**, non il
-client: `consumer.max-batch-size: 500`, `consumer.cut-frequency: 1s`, `consumer.poll-timeout: 100ms`,
+Default della libreria (l'ultimo anello della catena) — quelli che governano **l'engine**:
+`consumer.max-batch-size: 500`, `consumer.cut-frequency: 1s`, `consumer.poll-timeout: 100ms`,
 `consumer.auto-offset-reset: earliest`, `consumer.on-error: fail-fast`,
-`producer.flush-timeout: 60s`, `producer.init-transactions-timeout: 60s`, e i default di `restart`
-(`initial-backoff: 1s`, `max-backoff: 30s`, `multiplier: 2`, `reset-after: 2m`).
+`producer.flush-timeout: 60s`, `producer.delivery-timeout: 30s`,
+`producer.init-transactions-timeout: 60s`, e i default di `restart`
+(`initial-backoff: 1s`, `max-backoff: 30s`, `multiplier: 2`, `reset-after: 2m`, `max-attempts: 5`).
+
+### I default dove i due client NON sono d'accordo
+
+La convenzione "non scritto = default del client" regge finché i due client concordano, e su alcuni
+knob non concordano: lì lo stesso YAML cambierebbe semantica cambiando driver, che è l'unica cosa che
+l'astrazione driver promette di non far succedere. Su questi cinque il default lo impone la
+**libreria**, quindi sono scritti anche se l'app non li configura:
+
+| knob | default della libreria | librdkafka | franz-go | perché |
+|---|---|---|---|---|
+| `consumer.isolation-level` | `read_committed` | `read_committed` | `read_uncommitted` | un consumer della libreria non legge record di transazioni non ancora committate — né quelle che verranno abortite |
+| `consumer.partition-assignment-strategy` | `cooperative-sticky` | `range,roundrobin` (eager) | `cooperative-sticky` | rebalance incrementale, che è ciò che il rebalance callback dell'engine assume |
+| `consumer.max-poll-interval-ms` | `300000` | `300000` | `60000` | con 60s un batch lento fa espellere il consumer dal gruppo |
+| `producer.compression-type` | `none` | `none` | snappy negoziata | senza, gli stessi record finivano sul topic compressi o no a seconda del driver |
+| `producer.transaction-timeout-ms` | `60000` | `60000` | `40000` | rende anche sempre eseguito il controllo di coerenza con `cut-frequency` |
+
+Più `client-id`, che senza default vale `rdkafka` o `kgo` a seconda del driver: la libreria lo riempie
+con l'`AppName`, così l'applicazione è riconoscibile nei log e nelle metriche del cluster.
+
+**Divergenze residue, solo di prestazioni e latenza** — qui il default del client resta quello giusto,
+ma sono i primi posti da guardare se il throughput cambia dopo un cambio di driver:
+`linger-ms` (librdkafka 5, franz 10) · `max-in-flight` (10⁶, oppure 5 con idempotence / franz **1**) ·
+`request-timeout-ms` (30000 / 10000) · `retry-backoff` (100ms fisso / 250ms→5s con jitter) ·
+`metadata-max-age-ms` (900000 / 300000) · `connections-max-idle-ms` (540000 / **30000**) ·
+`fetch-wait-max-ms` (500 / **5000**).
+
+> **Breaking dalla versione che introduce questi default.** *franz*: smette di vedere record abortiti
+> e non committati; smette di comprimere in snappy; `max-poll-interval-ms` passa da 60s a 300s.
+> *confluent*: passa da rebalance **eager** a `cooperative-sticky` — la migrazione **non è un
+> big-bang**, richiede un rolling restart, perché membri con protocolli diversi non formano gruppo.
+> Chi vuole il comportamento precedente lo scrive esplicitamente nel blocco `consumer`/`producer`.
 
 I valori enumerati sono validati al boot (`validate:"oneof=..."` su `on-error`, `auto-offset-reset`,
 `isolation-level`, `partition-assignment-strategy`, `security-protocol`, `sasl.mechanisms`,

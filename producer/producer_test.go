@@ -61,6 +61,11 @@ func (f *fakeFactory) NewProducer(_ spec.KafkaServer, p spec.ProducerTuning) (dr
 	return f.p, f.err
 }
 
+func (f *fakeFactory) NewProcessorProducer(s spec.ProcessorSpec, _ spec.KafkaServer) (driver.Producer, error) {
+	f.got = s.Producer
+	return f.p, f.err
+}
+
 func (f *fakeFactory) NewTxProducer(_ spec.KafkaServer, p spec.ProducerTuning, id string) (driver.TxProducer, error) {
 	f.got = p
 	f.gotTxID = id

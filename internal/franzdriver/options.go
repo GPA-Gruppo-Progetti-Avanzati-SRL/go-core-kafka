@@ -284,7 +284,13 @@ func producerOpts(transactionalID, owner string, p spec.ProducerTuning, k spec.K
 		b.setMs("transaction.timeout.ms", p.TransactionTimeoutMs, kgo.TransactionTimeout)
 		// init-transactions-timeout non ha destinatario: franz-go fa la InitProducerID da sé al primo
 		// Begin, con i propri retry, e non espone un timeout dedicato.
-		b.markUnsupported(p.InitTransactionsTimeout > 0, "producer.init-transactions-timeout")
+		//
+		// Il confronto è col DEFAULT e non con lo zero perché ProducerTuning.WithDefaults riempie
+		// sempre questo campo: sullo zero l'avviso sarebbe scattato a ogni avvio transazionale, per
+		// un valore che nessuno ha scritto — e un avviso che compare sempre smette di essere letto.
+		// Si avvisa chi ha configurato qualcosa che il driver non può onorare, non chi non ha
+		// configurato nulla.
+		b.markUnsupported(p.InitTransactionsTimeout != spec.DefaultInitTransactionsTimeout, "producer.init-transactions-timeout")
 	} else if !p.Idempotent() {
 		// L'idempotenza è ATTIVA di default sia in franz-go sia in go-core-kafka: si tocca solo per
 		// disattivarla esplicitamente.

@@ -201,3 +201,72 @@ func TestSecurity_SASLSconosciuto(t *testing.T) {
 		t.Fatalf("errore = %v, atteso il rifiuto esplicito del meccanismo", err)
 	}
 }
+
+// I default della LIBRERIA devono raggiungere il client anche quando l'app non configura nulla: è
+// l'unico modo perché lo stesso YAML abbia la stessa semantica sui due driver. Il test parte da uno
+// spec RISOLTO, che è ciò che il driver riceve sempre in produzione — a differenza di
+// TestConsumerOpts_NonValorizzatoNonScrive, che verifica il builder in isolamento.
+func TestConsumerOpts_DefaultDellaLibreriaSempreApplicati(t *testing.T) {
+	s := processor(spec.ConsumerTuning{}).Resolve(server())
+	b, err := consumerOpts(s, server())
+	if err != nil {
+		t.Fatalf("consumerOpts: %v", err)
+	}
+	want := map[string]string{
+		"isolation.level":               spec.DefaultIsolationLevel,
+		"partition.assignment.strategy": spec.DefaultAssignmentStrategy,
+		"max.poll.interval.ms":          "300000",
+		"auto.offset.reset":             spec.DefaultAutoOffsetReset,
+	}
+	for k, v := range want {
+		if got := b.applied[k]; got != v {
+			t.Errorf("%s = %q, atteso %q: senza, franz-go ricadrebbe sul PROPRIO default (read_uncommitted, 60s) e divergerebbe da librdkafka", k, got, v)
+		}
+	}
+}
+
+func TestProducerOpts_DefaultDellaLibreriaSempreApplicati(t *testing.T) {
+	p := spec.ProducerTuning{}.WithDefaults()
+	b, err := producerOpts("", "server.producer", p, server())
+	if err != nil {
+		t.Fatalf("producerOpts: %v", err)
+	}
+	// franz-go negozia snappy di default: senza questo, lo stesso YAML scriveva sul topic record
+	// compressi o no a seconda del driver.
+	if got := b.applied["compression.type"]; got != spec.DefaultCompressionType {
+		t.Errorf("compression.type = %q, atteso %q", got, spec.DefaultCompressionType)
+	}
+}
+
+// L'avviso sui knob non supportati deve nominare ciò che l'UTENTE ha scritto. init-transactions-timeout
+// è riempito sempre da WithDefaults, quindi confrontarlo con lo zero faceva comparire l'avviso a ogni
+// avvio transazionale, per un valore che nessuno aveva configurato — e un avviso che compare sempre
+// smette di essere letto.
+func TestProducerOpts_InitTransactionsTimeoutAlDefaultNonAvvisa(t *testing.T) {
+	p := spec.ProducerTuning{}.WithDefaults()
+	b, err := producerOpts("tx-ingest", "processor ingest", p, server())
+	if err != nil {
+		t.Fatalf("producerOpts: %v", err)
+	}
+	for _, u := range b.unsupported {
+		if u == "producer.init-transactions-timeout" {
+			t.Fatal("avviso emesso per un valore che l'app non ha configurato (è il default della libreria)")
+		}
+	}
+
+	// Un valore scritto a mano, invece, va segnalato: il driver non può onorarlo.
+	p.InitTransactionsTimeout = 90 * time.Second
+	b, err = producerOpts("tx-ingest", "processor ingest", p, server())
+	if err != nil {
+		t.Fatalf("producerOpts: %v", err)
+	}
+	var found bool
+	for _, u := range b.unsupported {
+		if u == "producer.init-transactions-timeout" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("un init-transactions-timeout configurato a mano deve comparire fra i knob non supportati")
+	}
+}

@@ -250,6 +250,10 @@ func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Fa
 			log.Warn().Str("processor", s.Name).
 				Msg("corekafka: il blocco `producer` su un processor in modalità handle è ignorato (il producer del DLQ è condiviso): usare `server.producer`")
 		}
+		if raw.Delivery != "" {
+			log.Warn().Str("processor", s.Name).
+				Msg("corekafka: il campo `delivery` su un processor in modalità handle è ignorato (handle è at-least-once per costruzione): riguarda solo i processor registrati con RegisterTransformer")
+		}
 		if s.Consumer.OnError == spec.OnErrorDeadletter && s.Consumer.Deadletter() == "" {
 			return nil, fmt.Errorf("corekafka: processor %q: consumer.on-error=deadletter richiede consumer.deadletter-topic", s.Name)
 		}
@@ -261,6 +265,18 @@ func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Fa
 		}
 	case isTransformer:
 		r.transformer = t
+		if s.AtLeastOnce() {
+			// L'id transazionale qui non ha destinatario: non esiste alcuna transazione da aprire.
+			// È un errore e non un avviso perché chi l'ha scritto CREDE di avere l'EOS, e un
+			// warning glielo lascerebbe credere.
+			if s.TransactionalID != "" {
+				return nil, fmt.Errorf("corekafka: processor %q (transform, delivery=%s): transactional-id non ammesso perché non c'è nessuna transazione: rimuoverlo, oppure togliere `delivery` per tornare all'EOS",
+					s.Name, spec.DeliveryAtLeastOnce)
+			}
+			log.Warn().Str("processor", s.Name).
+				Msg("corekafka: transform in at-least-once: il gruppo di output NON è atomico (una Produce può consegnarne una parte e fallire sul resto) ed è prodotto PRIMA del commit degli offset, quindi un replay del batch ripubblica anche ciò che era già passato e i consumer vedono gli output anche se il batch non verrà mai committato. La scrittura a valle dev'essere idempotente per chiave. Per l'EOS: togliere `delivery` e valorizzare `transactional-id`")
+			break
+		}
 		if s.TransactionalID == "" {
 			return nil, fmt.Errorf("corekafka: processor %q (transform): transactional-id obbligatorio", s.Name)
 		}
@@ -268,6 +284,9 @@ func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Fa
 		// la considera abbandonata e fa fencing del producer a ogni giro — un loop di riavvii in cui
 		// non viene mai committato nulla. Il controllo sta qui e non in ProducerTuning.Validate perché
 		// incrocia i due blocchi ed è specifico della modalità, che a quel livello non è nota.
+		//
+		// Da quando TransactionTimeoutMs ha un default della libreria il ramo `ms > 0` è sempre vero:
+		// il controllo gira SEMPRE, invece che solo su chi aveva scritto il knob a mano.
 		if ms := s.Producer.TransactionTimeoutMs; ms > 0 && time.Duration(ms)*time.Millisecond <= s.Consumer.CutFrequency {
 			return nil, fmt.Errorf("corekafka: processor %q (transform): producer.transaction-timeout-ms (%dms) <= consumer.cut-frequency (%s): la transazione scadrebbe prima della chiusura del batch, con fencing a ogni giro",
 				s.Name, ms, s.Consumer.CutFrequency)
@@ -359,10 +378,14 @@ func (r *runner) restartable(sev driver.Severity) bool {
 
 // runOnce esegue un ciclo di vita completo del client: lo crea, consuma finché può, lo chiude.
 func (r *runner) runOnce(ctx context.Context) error {
-	if r.transformer != nil {
+	switch {
+	case r.transformer != nil && r.spec.AtLeastOnce():
+		return r.runTransformAtLeastOnce(ctx)
+	case r.transformer != nil:
 		return r.runTransform(ctx)
+	default:
+		return r.runHandle(ctx)
 	}
-	return r.runHandle(ctx)
 }
 
 // outcome è la decisione presa sul batch dopo il ritorno del processor.
@@ -578,6 +601,42 @@ func (h handleFlusher) flush(ctx context.Context, batch []*message.Record) error
 	return h.gc.Commit(ctx)
 }
 
+// transformBatch è la parte del transform INDIPENDENTE dal regime di consegna: chiama il
+// Transformer, verifica che ogni record di output abbia una destinazione, classifica l'esito e
+// accoda al risultato i record poison diretti al DLQ. Ritorna cosa produrre e quanti record del
+// batch sono stati elaborati (il batch meno i poison).
+//
+// Sta qui e non duplicata nei due flusher perché ciò che distingue EOS da at-least-once è SOLO come
+// si rende definitivo il risultato — Produce e Commit atomici o in sequenza. Handle e transform sono
+// già divergite una volta per un corpo di flush copiato (l'ordine di valutazione dell'esito, poi
+// unificato in classify): la seconda copia si evita prima di scriverla.
+func (r *runner) transformBatch(ctx context.Context, batch []*message.Record) ([]*message.ProducerRecord, int, error) {
+	out, tErr := r.transformer.Transform(ctx, batch)
+	if err := r.resolveTopics(out); err != nil {
+		// Difetto deterministico del transformer o della config: rigiocarlo darebbe lo stesso esito,
+		// quindi non si produce nulla e l'errore risale (fail-fast).
+		return nil, 0, err
+	}
+
+	// Stesso modello a esiti della modalità handle (classify è condivisa). Cambia solo COME i due
+	// regimi consegnano il DLQ — dentro la transazione o nella stessa Produce degli output — non
+	// quali record ci vadano né con quale causa.
+	oc, pr, cause := classify(tErr, batch, r.spec.Consumer.OnError)
+	poison := poisonRecords(pr)
+	switch oc {
+	case outcomeFail:
+		return nil, 0, cause
+	case outcomeDeadletter:
+		dlq, derr := r.dlqRecords(pr)
+		if derr != nil {
+			return nil, 0, derr
+		}
+		out = append(out, dlq...)
+		deadletteredTotal.WithLabelValues(r.spec.Name).Add(float64(len(poison)))
+	}
+	return out, len(batch) - len(poison), nil
+}
+
 // runTransform: modalità EOS Kafka->Kafka. poll -> accumula -> Begin -> Transform -> Produce -> Commit
 // (atomico) o Abort. Un errore abortisce e forza il replay.
 func (r *runner) runTransform(ctx context.Context) error {
@@ -609,31 +668,12 @@ func (t transformFlusher) flush(ctx context.Context, batch []*message.Record) er
 	if err := t.sess.Begin(ctx); err != nil {
 		return err
 	}
-	out, tErr := r.transformer.Transform(ctx, batch)
-	if err := r.resolveTopics(out); err != nil {
-		// Difetto deterministico del transformer o della config: rigiocarlo darebbe lo stesso esito,
-		// quindi si abortisce e l'errore risale (fail-fast) invece di provare a produrre.
+	// Il DLQ è già accodato agli output da transformBatch, quindi resta DENTRO la sessione
+	// transazionale: output "buoni" + record DLQ + commit degli offset sono atomici.
+	out, processed, err := r.transformBatch(ctx, batch)
+	if err != nil {
 		abort()
 		return err
-	}
-
-	// Stesso modello a esiti della modalità handle (classify è condivisa), ma la consegna DLQ
-	// avviene DENTRO la sessione transazionale (append agli output) così l'EOS resta intatto:
-	// output "buoni" + record DLQ + commit offset sono atomici.
-	oc, pr, cause := classify(tErr, batch, r.spec.Consumer.OnError)
-	poison := poisonRecords(pr)
-	switch oc {
-	case outcomeFail:
-		abort()
-		return cause
-	case outcomeDeadletter:
-		dlq, derr := r.dlqRecords(pr)
-		if derr != nil {
-			abort()
-			return derr
-		}
-		out = append(out, dlq...)
-		deadletteredTotal.WithLabelValues(r.spec.Name).Add(float64(len(poison)))
 	}
 
 	if err := t.sess.Produce(ctx, out); err != nil {
@@ -645,7 +685,64 @@ func (t transformFlusher) flush(ctx context.Context, batch []*message.Record) er
 		return err
 	}
 	producedTotal.WithLabelValues(r.spec.Name).Add(float64(len(out)))
-	processedTotal.WithLabelValues(r.spec.Name).Add(float64(len(batch) - len(poison)))
+	processedTotal.WithLabelValues(r.spec.Name).Add(float64(processed))
+	return nil
+}
+
+// runTransformAtLeastOnce: transform SENZA transazione. Consumer di gruppo + producer non
+// transazionale del processor; poll -> accumula -> Transform -> Produce -> commit degli offset.
+//
+// I due esiti sono indipendenti, e il gruppo di output non è nemmeno atomico fra sé: la garanzia è
+// quella della modalità handle, e vale la stessa regola — la scrittura a valle dev'essere
+// idempotente per chiave. Il regime lo sceglie la config (`delivery: at-least-once`), mai il
+// silenzio: vedi newRunner, che qui emette anche l'avviso su cosa si sta rinunciando.
+func (r *runner) runTransformAtLeastOnce(ctx context.Context) error {
+	gc, err := r.factory.NewGroupConsumer(r.spec, r.server)
+	if err != nil {
+		return err
+	}
+	defer gc.Close()
+	// Il producer appartiene al processor (tuning da `processors[].producer`) e nasce QUI, dentro il
+	// tentativo di run: così la supervisione che ricostruisce il consumer dopo un errore
+	// retriable ricostruisce anche lui, invece di riusare un client che potrebbe essere quello
+	// guasto.
+	prod, err := r.factory.NewProcessorProducer(r.spec, r.server)
+	if err != nil {
+		return err
+	}
+	defer prod.Close()
+	return r.consume(ctx, gc, alosTransformFlusher{r: r, gc: gc, prod: prod})
+}
+
+// alosTransformFlusher rende definitivo il batch in modalità transform at-least-once: produce gli
+// output (DLQ incluso) col producer del processor, poi committa gli offset. Due passi distinti, non
+// una transazione.
+type alosTransformFlusher struct {
+	r    *runner
+	gc   driver.GroupConsumer
+	prod driver.Producer
+}
+
+func (a alosTransformFlusher) flush(ctx context.Context, batch []*message.Record) error {
+	r := a.r
+	out, processed, err := r.transformBatch(ctx, batch)
+	if err != nil {
+		return err // niente Produce, niente commit -> replay
+	}
+
+	if err := a.prod.Produce(ctx, out); err != nil {
+		// ATTENZIONE: Produce NON è atomico sul gruppo — parte degli output può essere già sul topic
+		// e parte no. Non committando, il batch viene replayato per intero e ciò che era passato
+		// viene ripubblicato: duplicati, mai buchi. È la garanzia at-least-once, ed è la ragione per
+		// cui questo regime pretende una scrittura a valle idempotente per chiave.
+		return err
+	}
+	if err := a.gc.Commit(ctx); err != nil {
+		// Gli output sono già pubblicati e visibili: al replay verranno ripubblicati.
+		return err
+	}
+	producedTotal.WithLabelValues(r.spec.Name).Add(float64(len(out)))
+	processedTotal.WithLabelValues(r.spec.Name).Add(float64(processed))
 	return nil
 }
 

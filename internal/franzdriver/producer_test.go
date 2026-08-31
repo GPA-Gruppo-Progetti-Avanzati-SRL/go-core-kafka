@@ -94,3 +94,32 @@ func TestFactory_TransactSenzaTransactionalID(t *testing.T) {
 		t.Fatal("una sessione EOS senza transactional-id deve fallire alla costruzione")
 	}
 }
+
+// NewProcessorProducer è il producer non transazionale di UN processor (transform at-least-once):
+// niente transactional.id — non c'è transazione — e il tuning è quello del processor, non di
+// `server.producer`.
+func TestFactory_NewProcessorProducer(t *testing.T) {
+	s := spec.ProcessorSpec{
+		Name: "alos", GroupID: "g", Topics: []string{"in"},
+		Delivery: spec.DeliveryAtLeastOnce,
+		Producer: spec.ProducerTuning{CompressionType: "zstd"},
+	}.Resolve(spec.KafkaServer{})
+
+	p, err := Factory{}.NewProcessorProducer(s, spec.KafkaServer{BootstrapServers: "b:9092"})
+	if err != nil {
+		t.Fatalf("NewProcessorProducer: %v", err)
+	}
+	defer p.Close()
+
+	// La verifica sulle opzioni passa dal builder, che è dove la traduzione avviene.
+	b, err := producerOpts("", "processor "+s.Name, s.Producer, spec.KafkaServer{BootstrapServers: "b:9092"})
+	if err != nil {
+		t.Fatalf("producerOpts: %v", err)
+	}
+	if _, ok := b.applied["transactional.id"]; ok {
+		t.Error("transactional.id impostato su un producer non transazionale")
+	}
+	if got := b.applied["compression.type"]; got != "zstd" {
+		t.Errorf("compression.type = %q, atteso zstd (tuning del processor, non di server.producer)", got)
+	}
+}

@@ -413,3 +413,121 @@ func TestValidateKafkaProperties(t *testing.T) {
 		})
 	}
 }
+
+// I default della LIBRERIA — quelli che esistono perché librdkafka e franz-go NON concordano — sono
+// pinnati qui in tabella: è il posto in cui aggiungere il prossimo knob divergente, e l'unico in cui
+// si vede in un colpo solo quali siano.
+//
+// La colonna "sovrascritto" è metà del contratto: un default che vincesse sul valore scritto
+// dall'app non sarebbe un default, sarebbe un'imposizione.
+func TestWithDefaults_KnobDivergentiFraDriver(t *testing.T) {
+	c := ConsumerTuning{}.WithDefaults()
+	p := ProducerTuning{}.WithDefaults()
+
+	tests := []struct {
+		knob      string
+		got, want any
+	}{
+		{"consumer.isolation-level", c.IsolationLevel, DefaultIsolationLevel},
+		{"consumer.partition-assignment-strategy", c.PartitionAssignmentStrategy, DefaultAssignmentStrategy},
+		{"consumer.max-poll-interval-ms", c.MaxPollIntervalMs, DefaultMaxPollIntervalMs},
+		{"producer.compression-type", p.CompressionType, DefaultCompressionType},
+		{"producer.transaction-timeout-ms", p.TransactionTimeoutMs, DefaultTransactionTimeoutMs},
+	}
+	for _, tc := range tests {
+		t.Run(tc.knob, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Errorf("%s = %v, atteso %v: senza questo default il knob resterebbe a quello del client, e i due client non concordano", tc.knob, tc.got, tc.want)
+			}
+		})
+	}
+
+	// Un valore esplicito dell'app vince sempre.
+	c2 := ConsumerTuning{
+		IsolationLevel:              "read_uncommitted",
+		PartitionAssignmentStrategy: "range",
+		MaxPollIntervalMs:           120000,
+	}.WithDefaults()
+	p2 := ProducerTuning{CompressionType: "zstd", TransactionTimeoutMs: 15000}.WithDefaults()
+	for _, tc := range []struct {
+		knob      string
+		got, want any
+	}{
+		{"consumer.isolation-level", c2.IsolationLevel, "read_uncommitted"},
+		{"consumer.partition-assignment-strategy", c2.PartitionAssignmentStrategy, "range"},
+		{"consumer.max-poll-interval-ms", c2.MaxPollIntervalMs, 120000},
+		{"producer.compression-type", p2.CompressionType, "zstd"},
+		{"producer.transaction-timeout-ms", p2.TransactionTimeoutMs, 15000},
+	} {
+		t.Run("sovrascritto/"+tc.knob, func(t *testing.T) {
+			if tc.got != tc.want {
+				t.Errorf("%s = %v, atteso %v: il default non deve vincere sul valore scritto dall'app", tc.knob, tc.got, tc.want)
+			}
+		})
+	}
+}
+
+// client-id: senza, ci si presenta al broker come "rdkafka" o "kgo" a seconda del driver. Il default
+// è l'AppName, e non tocca i blocchi Consumer/Producer — che sono le sorgenti dell'eredità, dove un
+// default renderebbe indistinguibile "non scritto" da "scritto al default".
+func TestKafkaServerWithDefaults_SoloClientID(t *testing.T) {
+	core.AppName = "mia-app"
+	k := KafkaServer{BootstrapServers: "b:9092"}.WithDefaults()
+	if k.ClientID != "mia-app" {
+		t.Errorf("client-id = %q, atteso mia-app", k.ClientID)
+	}
+	if !core.IsZeroStruct(k.Consumer) || !k.Producer.IsZero() {
+		t.Error("WithDefaults non deve toccare i blocchi consumer/producer: sono le sorgenti dell'eredità")
+	}
+
+	k2 := KafkaServer{BootstrapServers: "b:9092", ClientID: "esplicito"}.WithDefaults()
+	if k2.ClientID != "esplicito" {
+		t.Errorf("client-id = %q, atteso esplicito", k2.ClientID)
+	}
+}
+
+// `delivery` è un campo di IDENTITÀ del processor: non eredita da `server` (non esiste lì) e
+// sopravvive a Resolve, che tocca solo i tre blocchi di tuning.
+func TestDelivery_IdentitaNonEreditabile(t *testing.T) {
+	s := ProcessorSpec{
+		Name: "alos", GroupID: "g", Topics: []string{"in"},
+		Delivery: DeliveryAtLeastOnce,
+	}.Resolve(KafkaServer{})
+
+	if s.Delivery != DeliveryAtLeastOnce {
+		t.Errorf("Delivery = %q, atteso %q: Resolve non deve toccare i campi di identità", s.Delivery, DeliveryAtLeastOnce)
+	}
+	if !s.AtLeastOnce() {
+		t.Error("AtLeastOnce() = false su delivery=at-least-once")
+	}
+
+	// Il vuoto vale exactly-once: la garanzia FORTE è quella che si ottiene non scrivendo nulla.
+	if (ProcessorSpec{}).AtLeastOnce() {
+		t.Error("AtLeastOnce() = true su delivery vuoto: il default deve essere l'EOS")
+	}
+}
+
+func TestDelivery_ValoreNonValidoFermaAvvio(t *testing.T) {
+	// Il tag `oneof` gira su ValidateProcessor, cioè sullo spec GREZZO: un typo non degrada in
+	// silenzio nel regime debole, ferma l'avvio.
+	base := ProcessorSpec{Name: "p", GroupID: "g", Topics: []string{"in"}}
+	for _, tc := range []struct {
+		delivery string
+		wantErr  bool
+	}{
+		{"", false},
+		{DeliveryExactlyOnce, false},
+		{DeliveryAtLeastOnce, false},
+		{"at-leastonce", true},
+		{"atleast-once", true},
+		{"AT-LEAST-ONCE", true},
+	} {
+		t.Run(tc.delivery, func(t *testing.T) {
+			s := base
+			s.Delivery = tc.delivery
+			if err := ValidateProcessor(s); tc.wantErr != (err != nil) {
+				t.Fatalf("delivery=%q: wantErr=%v, err=%v", tc.delivery, tc.wantErr, err)
+			}
+		})
+	}
+}

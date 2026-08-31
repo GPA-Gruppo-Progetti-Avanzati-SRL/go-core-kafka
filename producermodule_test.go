@@ -32,6 +32,10 @@ func (f *fakeFactory) NewProducer(spec.KafkaServer, spec.ProducerTuning) (driver
 	return &fakeDriverProducer{}, nil
 }
 
+func (f *fakeFactory) NewProcessorProducer(spec.ProcessorSpec, spec.KafkaServer) (driver.Producer, error) {
+	return &fakeDriverProducer{}, nil
+}
+
 func (f *fakeFactory) NewTxProducer(_ spec.KafkaServer, _ spec.ProducerTuning, id string) (driver.TxProducer, error) {
 	f.tx = true
 	f.txID = id

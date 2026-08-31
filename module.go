@@ -99,7 +99,9 @@ func Module(cfg *Config, register func(), opts ...Option) {
 	processor.Apply(register, byName, o.modes)
 
 	core.ModuleClosed("kafka", func() {
-		core.Supply(cfg.Server, o.modes...)
+		// WithDefaults sui soli campi di connessione (client-id): è l'unico punto attraversato da
+		// tutti i client del sottosistema, quindi l'unico in cui scriverlo una volta sola.
+		core.Supply(cfg.Server.WithDefaults(), o.modes...)
 		core.Supply(cfg.Server.Producer, o.modes...)
 		// La lista è GREZZA — l'engine ispeziona i blocchi non risolti per attribuire errori e avvisi
 		// a chi li ha scritti, e la risoluzione la rifà lui — ma già FILTRATA: un processor

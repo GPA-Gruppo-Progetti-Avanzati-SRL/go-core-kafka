@@ -48,12 +48,19 @@ func TestConsumerConfigMap_Minimale(t *testing.T) {
 	// Invariante dell'engine: il commit è manuale, sempre.
 	mustEqual(t, cm, "enable.auto.commit", false)
 
-	// I knob non valorizzati NON devono comparire: scriverne lo zero imporrebbe "0" dove zero ha un
-	// significato diverso dal default.
+	// Default della LIBRERIA: questi tre sono scritti anche senza che l'app li configuri, perché è
+	// su di essi che librdkafka e franz-go NON concordano (franz-go: read_uncommitted,
+	// cooperative-sticky, rebalance timeout 60s). Lasciarli al default del client significava che
+	// lo stesso YAML cambiava semantica cambiando driver.
+	mustEqual(t, cm, "isolation.level", "read_committed")
+	mustEqual(t, cm, "partition.assignment.strategy", "cooperative-sticky")
+	mustEqual(t, cm, "max.poll.interval.ms", 300000)
+
+	// Gli altri knob non valorizzati NON devono comparire: scriverne lo zero imporrebbe "0" dove
+	// zero ha un significato diverso dal default.
 	for _, k := range []string{
 		"session.timeout.ms", "heartbeat.interval.ms", "fetch.min.bytes", "fetch.max.bytes",
 		"fetch.wait.max.ms", "max.partition.fetch.bytes", "queued.max.messages.kbytes",
-		"max.poll.interval.ms", "partition.assignment.strategy", "isolation.level",
 		"client.id", "debug", "metadata.max.age.ms", "connections.max.idle.ms",
 		"socket.keepalive.enable", "security.protocol", "sasl.mechanism", "ssl.ca.location",
 	} {
@@ -182,9 +189,16 @@ func TestProducerConfigMap_NonTransazionale(t *testing.T) {
 	// Default storico: il producer è idempotente se non lo si disattiva esplicitamente.
 	mustEqual(t, cm, "enable.idempotence", true)
 	mustAbsent(t, cm, "transactional.id")
-	for _, k := range []string{"acks", "compression.type", "linger.ms", "batch.size"} {
+	for _, k := range []string{"acks", "linger.ms", "batch.size"} {
 		mustAbsent(t, cm, k)
 	}
+	// compression.type è scritto anche senza configurazione: franz-go offre snappy di default,
+	// quindi senza un default della libreria lo stesso YAML avrebbe scritto sul topic record
+	// compressi o no a seconda del driver.
+	mustEqual(t, cm, "compression.type", "none")
+	// transaction.timeout.ms ha un default della libreria (i due client divergono, 60s vs 40s) ma
+	// resta fuori dal producer NON transazionale: là non ha destinatario.
+	mustAbsent(t, cm, "transaction.timeout.ms")
 	// delivery.timeout.ms è l'ECCEZIONE alla regola "un knob non valorizzato resta al default di
 	// librdkafka": WithDefaults lo riempie, perché è ciò che garantisce che un delivery report arrivi
 	// — chi lo attende non deve poter restare appeso per una config incompleta.
