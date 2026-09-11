@@ -15,8 +15,9 @@ func dlqSpec(name, dlq string, disabled bool) spec.ProcessorSpec {
 	return s
 }
 
-// ActiveProcessors è l'UNICO punto in cui la lista `processors` viene filtrata: se il filtro tornasse
-// a esistere anche a valle (nell'engine, come prima) le due copie potrebbero divergere.
+// ActiveProcessors è l'unico punto in cui vive la metà di config del filtro (`disabled:`): se tornasse
+// a esistere anche a valle (nell'engine, come prima) le due copie potrebbero divergere. L'altra metà —
+// i modes del register — la sottrae removeExcluded, qui sotto.
 func TestActiveProcessors(t *testing.T) {
 	cfg := Config{
 		Processors: []spec.ProcessorSpec{dlqSpec("a", "", false), dlqSpec("b", "", true), dlqSpec("c", "", false)},
@@ -123,5 +124,43 @@ func TestWithDriver(t *testing.T) {
 	o.driver()
 	if called != 1 {
 		t.Errorf("driver invocato %d volte, attesa 1", called)
+	}
+}
+
+// removeExcluded è la seconda metà del filtro di attivazione: ciò che il register ha spento col
+// proprio gating per mode deve sparire dalla lista PRIMA che qualcuno la legga. Senza, il processor
+// restava negli spec passati all'engine mentre il suo costruttore non era stato fornito, e
+// consumer.newRunner falliva con "nessun processor registrato" — cioè ogni uso dei modes del register
+// rompeva l'avvio invece di disattivare il processor.
+func TestRemoveExcluded(t *testing.T) {
+	active := []spec.ProcessorSpec{dlqSpec("a", "", false), dlqSpec("b", "", false), dlqSpec("c", "", false)}
+
+	got := removeExcluded(active, []string{"b"})
+
+	if len(got) != 2 || got[0].Name != "a" || got[1].Name != "c" {
+		t.Fatalf("attivi = %v, attesi a e c nell'ordine di config", got)
+	}
+}
+
+// Nessun escluso: la lista deve tornare com'è. È il caso di ogni app che non passa modes al register,
+// cioè la retrocompatibilità.
+func TestRemoveExcluded_NessunoEscluso(t *testing.T) {
+	active := []spec.ProcessorSpec{dlqSpec("a", "", false)}
+
+	if got := removeExcluded(active, nil); len(got) != 1 || got[0].Name != "a" {
+		t.Fatalf("attivi = %v, atteso [a] invariato", got)
+	}
+}
+
+// Un processor escluso dal mode non deve far registrare il Producer del DLQ: il suo deadletter-topic
+// non ha più un consumer che lo alimenti. È l'altra lettura di `active` dopo la sottrazione, e il
+// gemello di TestNeedsDeadletterProducer_IgnoraIDisabilitati.
+func TestNeedsDeadletterProducer_IgnoraIEsclusiDalMode(t *testing.T) {
+	cfg := Config{Processors: []spec.ProcessorSpec{dlqSpec("solo-io", "dlq", false)}}
+
+	active := removeExcluded(cfg.ActiveProcessors(), []string{"solo-io"})
+
+	if needsDeadletterProducer(active, cfg.Server) {
+		t.Error("needsDeadletterProducer = true, atteso false: l'unico processor col DLQ è escluso dal mode")
 	}
 }

@@ -38,6 +38,13 @@ CGO_ENABLED=0 go build $(go list ./... | grep -v confluent)
 > **L'attivazione è comandata dalla lista `processors` di config**: un processore registrato ma **non
 > presente** in `processors` non viene istanziato (solo un log info). Un processor con **`disabled: true`**
 > non viene attivato (per spegnerlo senza rimuoverlo dalla config).
+>
+> **E dai modes del register**: `RegisterHandler[T]("nome", engine.Worker)` limita *quel* processor ai
+> `core.Mode` indicati (nessun mode = ogni mode). È il gate per-processor, fra `corekafka.WithModes`
+> (che spegne l'intero sottosistema) e `disabled:` (che spegne il processor in ogni mode): serve quando
+> un solo YAML alimenta più processi dello stesso deployment, uno per `MODE`. Un processor escluso dal
+> mode è **disattivato come da `disabled: true`** — niente costruttore, niente runner, un log info che
+> dice perché — mai un errore di avvio.
 
 
 - **`handle`** (default) — *at-least-once*. poll → `Handler.Handle(batch) error` → commit degli offset
@@ -129,16 +136,14 @@ func Register() {
 }
 ```
 
+Un terzo argomento variadico limita il singolo processor ai `core.Mode` indicati — `RegisterHandler[H]("ingest", engine.Worker)` — e chi è escluso viene **disattivato** come da `disabled: true`, non è un errore. Vedi "Solo i processor attivi entrano nel grafo fx".
+
 Il riferimento (`consumer.Register`, **senza parentesi**) si passa a `Module` esattamente dove `Module`
 viene chiamato — nella **composition root** (`main.go`), l'unico punto che deve conoscere sia
 l'infra sia la business logic (vedi sezione Wiring più sotto). `services` resta infra-only: non importa
 mai `app/consumer`. Nessun registry globale persistente, nessun ordine `init()`/`main()` da rispettare:
 `Register` gira sincronamente dentro `Module`, sempre nello stesso punto. `main.go` non chiama più
 `Register`.
-
-Per Handler/Transformer con costruzione non banale restano `corekafka.ProvideHandler(constructor)` /
-`corekafka.ProvideTransformer(constructor)` (costruttore fx che ritorna la registrazione direttamente;
-sempre EAGER, chiamabili anche fuori da `Register`/`Module`).
 
 ## Scelta del driver
 
@@ -389,9 +394,20 @@ func main() {
 alla funzione dell'app, chiamato da `Module` stesso — non un side-effect implicito da qualche `init()`.
 
 Opzioni di `Module`: `WithDriver(...)` (**obbligatoria**, sceglie il client Kafka),
-`WithModes(...)` (gate per `core.Mode`), `WithProducer()` (espone all'app il producer del processo:
-vedi "Il producer"), `WithModule(...)` (componenti extra come `ModuleFunc`, gate-ati sugli stessi
-modes).
+`WithModes(...)` (gate per `core.Mode` dell'**intero sottosistema**), `WithProducer()` (espone all'app
+il producer del processo: vedi "Il producer"), `WithModule(...)` (componenti extra come `ModuleFunc`,
+gate-ati sugli stessi modes).
+
+I due gate per `core.Mode` sono a granularità diversa e si compongono: `WithModes` decide se il
+sottosistema Kafka esiste in questo processo, i modes di `RegisterHandler`/`RegisterTransformer`
+decidono quali processor sono attivi dentro un sottosistema acceso.
+
+```go
+func Register() {
+    corekafka.RegisterHandler[ingest.Handler]("ingest", engine.Worker)
+    corekafka.RegisterTransformer[routing.Transformer]("routing", engine.Scheduler)
+}
+```
 
 Le registrazioni stanno in un `core.ModuleClosed("kafka")`: Kafka è un **sottosistema chiuso** —
 consuma i seam dell'app (`Handler`/`Transformer`) e non le espone nulla in cambio, quindi
@@ -403,12 +419,21 @@ Kafka→Kafka), che è il seam previsto.
 
 ### Solo i processor attivi entrano nel grafo fx
 
-`Module` calcola l'insieme dei processor **attivi** (presenti in `processors[]` e non `disabled`) e poi
-chiama `register()`: dentro, `RegisterHandler`/`RegisterTransformer` forniscono a fx SOLO il processor
-dei processor attivi (`processor.Apply`). Le dipendenze di un processor spento (es. un data layer Mongo)
-non entrano quindi nel grafo e **non vengono mai connesse** — altrimenti fx costruirebbe eagerly tutti
-i membri del value group, quindi anche i backend dei consumer disattivati. Un nome registrato ma
-assente da `processors[]` produce solo un log info ("costruzione saltata"), nessun errore.
+`Module` calcola l'insieme dei processor **attivi** — presenti in `processors[]`, non `disabled`, e
+ammessi dai modes del loro register — e poi chiama `register()`: dentro,
+`RegisterHandler`/`RegisterTransformer` forniscono a fx SOLO i processor attivi (`processor.Apply`). Le
+dipendenze di un processor spento (es. un data layer Mongo) non entrano quindi nel grafo e **non
+vengono mai connesse** — altrimenti fx costruirebbe eagerly tutti i membri del value group, quindi
+anche i backend dei consumer disattivati. Un nome registrato ma assente da `processors[]` produce solo
+un log info ("costruzione saltata"), nessun errore.
+
+Le due condizioni stanno in posti diversi — `disabled:` nello YAML, i modes nel `register.go` — e si
+incontrano in un punto solo: `Config.ActiveProcessors` applica la prima, `processor.Apply` **riporta**
+a `Module` i nomi che la seconda ha escluso, e `Module` li sottrae dalla lista prima che qualcuno la
+legga. Questo perché la decisione deve arrivare a **entrambi** i lati — il costruttore e la lista degli
+spec che comanda i runner — e un processor attivo su un lato solo è esattamente ciò che faceva fallire
+l'avvio con `nessun processor registrato`. Conseguenza voluta: un processor escluso dal mode non
+pretende nemmeno il Producer del DLQ col suo `deadletter-topic`.
 
 ## Il producer
 
@@ -430,7 +455,9 @@ corekafka.ProducerModule(&svc.Kafka,
 configurazione Kafka di un'applicazione è una e sola, e l'unica differenza fra i due casi è la
 sezione `processors:` — che `ProducerModule` **ignora**, con un log Info e non un errore. È
 deliberato: la stessa sezione serve due processi dello stesso deployment (uno per `MODE`), e farla
-fallire vorrebbe dire che la config univoca non si può usare.
+fallire vorrebbe dire che la config univoca non si può usare. Per lo stesso motivo, quando **più
+processi consumano** dalla stessa lista, a scegliere chi consuma cosa sono i modes del register (vedi
+"Solo i processor attivi entrano nel grafo fx") — non una seconda copia della config.
 
 L'app inietta `corekafka.IProducer`:
 
@@ -632,7 +659,9 @@ services:
         # init-transactions-timeout: 60s
 
     processors:
-      # nessun campo "mode": la modalità è derivata da RegisterHandler/RegisterTransformer
+      # nessun campo "mode": la MODALITÀ (handle/transform) è derivata da
+      # RegisterHandler/RegisterTransformer. E nemmeno un campo per il core.Mode: quello lo limitano
+      # i modes passati al register — RegisterHandler[H]("handler", engine.Worker).
       - name: handler               # RegisterHandler[handler.Handler]("handler") -> handle
         # disabled: true            # → non attiva questo processor (senza rimuoverlo)
         topics: [gpa.events]

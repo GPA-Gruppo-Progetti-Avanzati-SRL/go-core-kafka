@@ -99,8 +99,7 @@ func DeadLetter(cause error, recs ...*Record) error {
 
 // BindProps mappa le properties di un processor sui campi di target taggati `prop:` (con `default:` e
 // `validate:` per campo). È il meccanismo usato automaticamente da RegisterHandler/RegisterTransformer
-// sui campi dell'Handler/Transformer: serve solo per il percorso manuale (un Configure scritto a mano o
-// un costruttore passato a ProvideHandler/ProvideTransformer).
+// sui campi dell'Handler/Transformer: serve solo per il percorso manuale (un Configure scritto a mano).
 func BindProps(target any, props Properties) error { return core.BindProps(target, props) }
 
 // PropertiesFromContext ritorna le Properties del processor corrente (dentro Handle/Transform/Mapper).
@@ -119,6 +118,9 @@ const (
 
 // RegisterHandler registra un tipo struct T come Handler (modalità handle) per il consumer indicato.
 // Va chiamata SOLO dall'interno della funzione passata a Module. In dualità con RegisterTransformer.
+//
+// modes limita QUESTO processor ai core.Mode indicati (vuoto = ogni mode): un processor escluso è
+// disattivato come da `disabled: true`, non un errore di avvio.
 func RegisterHandler[T any, PT interface {
 	*T
 	processor.Handler
@@ -133,11 +135,4 @@ func RegisterTransformer[T any, PT interface {
 	processor.Transformer
 }](consumerName string, modes ...string) {
 	processor.RegisterTransformer[T, PT](consumerName, modes...)
-}
-
-// ProvideHandler / ProvideTransformer registrano un costruttore fx che ritorna la relativa
-// registrazione, per Handler/Transformer con dipendenze non banali.
-func ProvideHandler(constructor any, modes ...string) { processor.Provide(constructor, modes...) }
-func ProvideTransformer(constructor any, modes ...string) {
-	processor.ProvideTransformer(constructor, modes...)
 }

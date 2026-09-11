@@ -9,6 +9,8 @@
 package corekafka
 
 import (
+	"slices"
+
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/consumer"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/processor"
@@ -82,8 +84,11 @@ func Module(cfg *Config, register func(), opts ...Option) {
 	}
 	requireDriver(&o, "corekafka.Module")
 
-	// Un solo filtro per tutto il wiring (vedi Config.ActiveProcessors): ciò che passa di qui è
-	// attivo, e nessuno più a valle deve chiederselo.
+	// Un solo filtro per tutto il wiring: ciò che passa di qui è attivo, e nessuno più a valle deve
+	// chiederselo. Le condizioni sono due e stanno in posti diversi — presente e non `disabled` in
+	// config (Config.ActiveProcessors) e ammesso dai modes del register (processor.Apply, che li
+	// riporta qui) — e questo è l'unico punto che le vede entrambe: è la ragione per cui la
+	// sottrazione sta qui e non dentro uno dei due.
 	//
 	// Solo i processor attivi vengono forniti a fx, così le dipendenze di un processor spento (es. il
 	// data layer Mongo) non entrano nel grafo e non vengono mai connesse. Fatto fuori dallo scope
@@ -96,7 +101,10 @@ func Module(cfg *Config, register func(), opts ...Option) {
 	for _, s := range active {
 		byName[s.Name] = s
 	}
-	processor.Apply(register, byName, o.modes)
+	// Gli esclusi dai modes del register escono dalla lista PRIMA che qualcuno la legga: la Supply che
+	// comanda i runner e needsDeadletterProducer. Un processor spento in questo mode non deve né far
+	// partire un consumer né pretendere il Producer del DLQ col suo deadletter-topic.
+	active = removeExcluded(active, processor.Apply(register, byName, o.modes))
 
 	core.ModuleClosed("kafka", func() {
 		// WithDefaults sui soli campi di connessione (client-id): è l'unico punto attraversato da
@@ -105,7 +113,7 @@ func Module(cfg *Config, register func(), opts ...Option) {
 		core.Supply(cfg.Server.Producer, o.modes...)
 		// La lista è GREZZA — l'engine ispeziona i blocchi non risolti per attribuire errori e avvisi
 		// a chi li ha scritti, e la risoluzione la rifà lui — ma già FILTRATA: un processor
-		// disabilitato non arriva nemmeno all'engine.
+		// disabilitato o escluso dai modes del suo register non arriva nemmeno all'engine.
 		core.Supply(active, o.modes...)
 
 		// Il driver eredita il gating del Module: la stessa condizione che core.Provide applicherebbe
@@ -147,6 +155,21 @@ func requireDriver(o *options, entryPoint string) {
 			"(go-core-kafka/driver/confluent, richiede CGO_ENABLED=1) oppure " +
 			"corekafka.WithDriver(franzdriver.Driver) (go-core-kafka/driver/franz, puro Go)")
 	}
+}
+
+// removeExcluded toglie dalla lista i processor che il register ha escluso col proprio gating per
+// mode. È la seconda metà del filtro di attivazione — la prima è Config.ActiveProcessors — e sta qui
+// perché questo è l'unico punto che vede sia la config sia l'esito della registrazione.
+//
+// È una funzione e non tre righe nella closure del wiring per la stessa ragione di
+// needsDeadletterProducer: è una decisione, quindi va testata senza costruire un grafo fx.
+func removeExcluded(active []spec.ProcessorSpec, excluded []string) []spec.ProcessorSpec {
+	if len(excluded) == 0 {
+		return active
+	}
+	return slices.DeleteFunc(active, func(s spec.ProcessorSpec) bool {
+		return slices.Contains(excluded, s.Name)
+	})
 }
 
 // needsDeadletterProducer dice se serve il Producer condiviso (non transazionale), che alimenta il DLQ

@@ -25,7 +25,7 @@ Ciò che l'`Handler`/`Transformer` ritorna è classificato da un'unica funzione 
 | `nil` | **commit** degli offset |
 | `corekafka.DeadLetter(cause, recs...)` | i record vanno sul **deadletter-topic** e gli offset sono committati. La `cause` etichetta l'intero gruppo |
 | `corekafka.PoisonRecords` (da `Converted.DeadLetter()`) | come sopra, ma **la causa è per record**: quella del singolo record finisce nel *suo* header `corekafka-dlq-error` |
-| `corekafka.ErrFailFast` (`processor/processor.go:78`) | **nessun commit**: il batch viene replayato. È la richiesta esplicita di replay |
+| `corekafka.ErrFailFast` (`processor/processor.go:40`) | **nessun commit**: il batch viene replayato. È la richiesta esplicita di replay |
 | qualsiasi altro errore | decide la policy `consumer.on-error` dello spec: `fail-fast` (default, il processo esce) oppure `deadletter` |
 
 **Regola per chi scrive un Handler:** nella `conv` di `corekafka.Convert` vanno solo gli errori
@@ -74,7 +74,7 @@ Metriche correlate: `corekafka_consumer_restarts_total{consumer,severity}`,
 
 | Messaggio | Origine | Causa |
 |---|---|---|
-| `corekafka: processor %q: esauriti i %d tentativi di riavvio: %w` | `consumer/consumer.go:345` | budget `restart.max-attempts` esaurito (default **5**, ~31s di insistenza). L'errore risale, il processo esce e il recovery passa all'orchestratore |
+| `corekafka: processor %q: esauriti i %d tentativi di riavvio: %w` | `consumer/consumer.go:396` | budget `restart.max-attempts` esaurito (default **5**, ~31s di insistenza). L'errore risale, il processo esce e il recovery passa all'orchestratore |
 
 ## 5. Errori di avvio (l'app non parte)
 
@@ -82,21 +82,21 @@ Metriche correlate: `corekafka_consumer_restarts_total{consumer,severity}`,
 
 | Messaggio | Origine |
 |---|---|
-| `corekafka.Module: WithDriver è obbligatoria` | `module.go:79` — con i due import (`driver/confluent`, `driver/franz`) nel messaggio |
-| `corekafka: RegisterHandler/RegisterTransformer chiamata fuori dalla funzione passata a Module` | `processor/processor.go:195` |
+| `corekafka.Module: WithDriver è obbligatoria` | `module.go:154` — con i due import (`driver/confluent`, `driver/franz`) nel messaggio |
+| `corekafka: RegisterHandler/RegisterTransformer chiamata fuori dalla funzione passata a Module` | `processor/processor.go:209` |
 
 ### Coerenza del processor (`consumer/consumer.go`, messaggi prefissati `corekafka: processor %q:`)
 
 | Messaggio | Riga | Causa |
 |---|---|---|
-| `registrato sia come Handler sia come Transformer (ambiguo)` | 242 | la modalità è derivata dalla registrazione: due registrazioni = nessuna modalità deducibile |
-| `nessun processor registrato` | 295 | voce in `processors:` senza `RegisterHandler`/`RegisterTransformer` corrispondente |
-| `consumer.on-error=deadletter richiede consumer.deadletter-topic` | 258 | policy senza destinazione |
-| `consumer.deadletter-topic impostato richiede il Producer` | 264 | manca `corekafka.WithProducer` |
-| `(transform): transactional-id obbligatorio` | 281 | EOS senza identità transazionale (regime di default: `delivery` assente o `exactly-once`) |
-| `(transform, delivery=at-least-once): transactional-id non ammesso` | 273 | l'id non ha destinatario, non c'è nessuna transazione. Errore e non avviso: chi l'ha scritto crede di avere l'EOS |
-| `(transform): producer.transaction-timeout-ms <= consumer.cut-frequency` | 291 | la transazione scadrebbe prima della chiusura del batch: fencing a ogni giro. Non si applica in `at-least-once` |
-| `Configure: %w` | 308 | la `Configurable` del processor ha rifiutato le properties |
+| `registrato sia come Handler sia come Transformer (ambiguo)` | 244 | la modalità è derivata dalla registrazione: due registrazioni = nessuna modalità deducibile |
+| `nessun processor registrato` | 297 | voce in `processors:` senza `RegisterHandler`/`RegisterTransformer` corrispondente. **Non** è il caso di un register escluso dai suoi modes: quello disattiva il processor (log Info) |
+| `consumer.on-error=deadletter richiede consumer.deadletter-topic` | 260 | policy senza destinazione |
+| `consumer.deadletter-topic impostato richiede il Producer` | 266 | manca `corekafka.WithProducer` |
+| `(transform): transactional-id obbligatorio` | 283 | EOS senza identità transazionale (regime di default: `delivery` assente o `exactly-once`) |
+| `(transform, delivery=at-least-once): transactional-id non ammesso` | 275 | l'id non ha destinatario, non c'è nessuna transazione. Errore e non avviso: chi l'ha scritto crede di avere l'EOS |
+| `(transform): producer.transaction-timeout-ms <= consumer.cut-frequency` | 293 | la transazione scadrebbe prima della chiusura del batch: fencing a ogni giro. Non si applica in `at-least-once` |
+| `Configure: %w` | 310 | la `Configurable` del processor ha rifiutato le properties |
 
 ### Configurazione (`spec/`)
 
@@ -127,5 +127,5 @@ li elenca: sono vocabolario della libreria, e un limite del driver si documenta.
 | `delivery report non ricevuti entro %s: %d/%d` | `internal/confluentdriver/produce.go:75` | `retriable` — i record non sono né confermati né perduti: si replaya. Il bound viene da `producer.delivery-timeout` (default libreria 2m) |
 | `attesa dei delivery report interrotta con %d/%d ricevuti` | `produce.go:72` | `retriable` — context cancellato |
 | `flush incompleto alla chiusura: %d record ancora in coda` | `internal/confluentdriver/producer.go:31` | in shutdown |
-| `il record di output #%d non ha Topic e default-output-topic non è configurato` | `consumer/consumer.go:832` | errore del Transformer |
-| `DeadLetter richiesto ma deadletter-topic assente` | `consumer/consumer.go:754` | l'handler ha chiesto il DLQ su un processor che non ne ha uno |
+| `il record di output #%d non ha Topic e default-output-topic non è configurato` | `consumer/consumer.go:899` | errore del Transformer |
+| `DeadLetter richiesto ma deadletter-topic assente` | `consumer/consumer.go:821` | l'handler ha chiesto il DLQ su un processor che non ne ha uno |

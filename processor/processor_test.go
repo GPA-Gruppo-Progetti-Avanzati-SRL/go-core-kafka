@@ -44,14 +44,20 @@ func TestErrFailFast_IsWrappable(t *testing.T) {
 func TestApply_ProvidesOnlyActiveConsumers(t *testing.T) {
 	var provided []string
 	register := func() {
-		provideIfActive("attivo", func(spec.ProcessorSpec) { provided = append(provided, "attivo") })
-		provideIfActive("spento", func(spec.ProcessorSpec) { provided = append(provided, "spento") })
+		provideIfActive("attivo", nil, func(spec.ProcessorSpec) { provided = append(provided, "attivo") })
+		provideIfActive("spento", nil, func(spec.ProcessorSpec) { provided = append(provided, "spento") })
 	}
 
-	Apply(register, map[string]spec.ProcessorSpec{"attivo": {Name: "attivo"}}, nil)
+	excluded := Apply(register, map[string]spec.ProcessorSpec{"attivo": {Name: "attivo"}}, nil)
 
 	if len(provided) != 1 || provided[0] != "attivo" {
 		t.Fatalf("atteso solo 'attivo' fornito, ottenuto %v", provided)
+	}
+	// "spento" è già fuori dalla lista che Module ha passato: sottrarlo una seconda volta non avrebbe
+	// nulla da togliere. Gli esclusi sono SOLO quelli che il mode ha tolto a un processor che la config
+	// ammetteva — è la parte che Module da solo non può sapere.
+	if len(excluded) != 0 {
+		t.Fatalf("excluded = %v, atteso vuoto: un processor assente dalla config non è un escluso per mode", excluded)
 	}
 }
 
@@ -77,7 +83,75 @@ func TestProvideIfActive_PanicsOutsideApply(t *testing.T) {
 			t.Fatal("atteso panic se chiamata fuori dalla funzione passata ad Apply")
 		}
 	}()
-	provideIfActive("x", func(spec.ProcessorSpec) {})
+	provideIfActive("x", nil, func(spec.ProcessorSpec) {})
+}
+
+// withMode imposta il core.Mode corrente per la durata del test. È una var di package di go-core-app,
+// quindi va ripristinata: i test del pacchetto la condividono.
+func withMode(t *testing.T, mode string) {
+	t.Helper()
+	prev := core.Mode
+	core.Mode = mode
+	t.Cleanup(func() { core.Mode = prev })
+}
+
+// Il gating per-processor deve spegnere ENTRAMBI i lati: niente costruttore (questo lo faceva già) e
+// niente voce nella lista che comanda i runner. Il secondo passa dal valore di ritorno di Apply, ed è
+// ciò che mancava: il processor restava negli spec e consumer.newRunner cadeva nel ramo "nessun
+// processor registrato", cioè ogni uso dei modes del register rompeva l'avvio.
+func TestApply_RiportaGliEsclusiDalRegister(t *testing.T) {
+	withMode(t, "WORKER")
+
+	var provided []string
+	register := func() {
+		provideIfActive("mio", []string{"API"}, func(spec.ProcessorSpec) { provided = append(provided, "mio") })
+	}
+
+	excluded := Apply(register, map[string]spec.ProcessorSpec{"mio": {Name: "mio"}}, nil)
+
+	if len(provided) != 0 {
+		t.Fatalf("provided = %v, atteso nessun costruttore: il mode non corrisponde", provided)
+	}
+	if len(excluded) != 1 || excluded[0] != "mio" {
+		t.Fatalf("excluded = %v, atteso [mio]: senza questo il processor resterebbe fra i runner", excluded)
+	}
+}
+
+// Il rovescio: col mode corrispondente il processor è attivo e non c'è nulla da sottrarre.
+func TestApply_ModeCorrispondenteRegistra(t *testing.T) {
+	withMode(t, "WORKER")
+
+	var provided []string
+	register := func() {
+		provideIfActive("mio", []string{"API", "WORKER"}, func(spec.ProcessorSpec) { provided = append(provided, "mio") })
+	}
+
+	excluded := Apply(register, map[string]spec.ProcessorSpec{"mio": {Name: "mio"}}, nil)
+
+	if len(provided) != 1 || provided[0] != "mio" {
+		t.Fatalf("provided = %v, atteso [mio]", provided)
+	}
+	if len(excluded) != 0 {
+		t.Fatalf("excluded = %v, atteso vuoto", excluded)
+	}
+}
+
+// modes vuoto = attivo in ogni mode: è la retrocompatibilità di chi non passa nulla, e viene gratis da
+// core.IsMode() senza argomenti. Se si rompesse, ogni app esistente smetterebbe di registrare.
+func TestApply_ModesVuotoSempreAttivo(t *testing.T) {
+	withMode(t, "UN-MODE-QUALSIASI")
+
+	var provided []string
+	register := func() {
+		provideIfActive("mio", nil, func(spec.ProcessorSpec) { provided = append(provided, "mio") })
+	}
+
+	if excluded := Apply(register, map[string]spec.ProcessorSpec{"mio": {Name: "mio"}}, nil); len(excluded) != 0 {
+		t.Fatalf("excluded = %v, atteso vuoto", excluded)
+	}
+	if len(provided) != 1 {
+		t.Fatalf("provided = %v, atteso [mio]", provided)
+	}
 }
 
 // --- integrazione col meccanismo di go-core-app -----------------------------------------------------

@@ -14,13 +14,16 @@ import (
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 	"github.com/rs/zerolog/log"
-	"go.uber.org/fx"
 )
 
-// Gruppi fx in cui confluiscono le registrazioni.
+// Gruppi fx in cui confluiscono le registrazioni. Non esportati: l'unico sito di registrazione è
+// RegisterHandler/RegisterTransformer, quindi fuori da qui il nome del gruppo non serve a nessuno —
+// serviva alle vecchie Provide/ProvideTransformer, che annotavano a mano un costruttore dell'app.
+// consumer.params li nomina come stringhe letterali nei tag `group:`, che è l'unica forma che un tag
+// di struct ammette.
 const (
-	HandlerGroup     = "kafka_handlers"
-	TransformerGroup = "kafka_transformers"
+	handlerGroup     = "kafka_handlers"
+	transformerGroup = "kafka_transformers"
 )
 
 // Handler è il contratto della modalità handle (at-least-once). Riceve un batch di record già pollati;
@@ -105,17 +108,6 @@ type TransformerRegistration struct {
 	Transformer Transformer
 }
 
-// Provide registra un costruttore che ritorna una HandlerRegistration nel value group kafka_handlers.
-// Il costruttore può dichiarare qualunque dipendenza fx-iniettabile. modes opzionale (mode-gating).
-func Provide(constructor any, modes ...string) {
-	core.Provide(fx.Annotate(constructor, fx.ResultTags(`group:"`+HandlerGroup+`"`)), modes...)
-}
-
-// ProvideTransformer è l'analogo di Provide per il gruppo kafka_transformers.
-func ProvideTransformer(constructor any, modes ...string) {
-	core.Provide(fx.Annotate(constructor, fx.ResultTags(`group:"`+TransformerGroup+`"`)), modes...)
-}
-
 // RegisterHandler registra un tipo struct T come Handler per il processor indicato. T deve
 // implementare Handler (via receiver a puntatore) e dichiarare i suoi campi con i tag di go-core-app:
 //
@@ -142,26 +134,36 @@ func ProvideTransformer(constructor any, modes ...string) {
 // fornito a fx SOLO se il processor è attivo nella lista `processors` di config. Un processor
 // disabilitato/assente non fa costruire nulla: le sue dipendenze non entrano nel grafo fx e non
 // vengono mai connesse.
+//
+// modes limita QUESTO processor ai core.Mode indicati; vuoto = attivo in ogni mode. È il gate
+// per-processor, che sta fra corekafka.WithModes (spegne l'intero sottosistema) e `disabled:` in
+// config (spegne il processor in ogni mode): serve quando un solo YAML alimenta più processi dello
+// stesso deployment, uno per MODE, e ognuno consuma i propri topic. Un processor escluso da qui è
+// DISATTIVATO come se fosse `disabled: true` — niente costruttore e niente runner, con un log Info che
+// dice perché — e non un errore di avvio.
+//
+//	processor.RegisterHandler[myHandler]("condizione", engine.Worker)
 func RegisterHandler[T any, PT interface {
 	*T
 	Handler
 }](consumerName string, modes ...string) {
-	provideIfActive(consumerName, func(s spec.ProcessorSpec) {
+	provideIfActive(consumerName, modes, func(s spec.ProcessorSpec) {
 		core.ProvideStruct(func(p *T) HandlerRegistration {
 			return HandlerRegistration{Consumer: consumerName, Handler: PT(p)}
-		}, owner(consumerName), s.Properties, HandlerGroup, modes...)
+		}, owner(consumerName), s.Properties, handlerGroup)
 	})
 }
 
-// RegisterTransformer è l'analogo di RegisterHandler per la modalità EOS: T deve implementare Transformer.
+// RegisterTransformer è l'analogo di RegisterHandler per la modalità EOS: T deve implementare
+// Transformer. Stessa semantica dei modes.
 func RegisterTransformer[T any, PT interface {
 	*T
 	Transformer
 }](consumerName string, modes ...string) {
-	provideIfActive(consumerName, func(s spec.ProcessorSpec) {
+	provideIfActive(consumerName, modes, func(s spec.ProcessorSpec) {
 		core.ProvideStruct(func(p *T) TransformerRegistration {
 			return TransformerRegistration{Consumer: consumerName, Transformer: PT(p)}
-		}, owner(consumerName), s.Properties, TransformerGroup, modes...)
+		}, owner(consumerName), s.Properties, transformerGroup)
 	})
 }
 
@@ -190,25 +192,54 @@ func owner(consumerName string) string {
 // wrapper di registrazione mappa le sue Properties sui campi `prop:` del processor (core.BindProps).
 var activeConsumers map[string]spec.ProcessorSpec // valido solo durante l'esecuzione sincrona di Apply; nil altrimenti
 
-func provideIfActive(consumerName string, provide func(spec.ProcessorSpec)) {
+// excludedByMode raccoglie i processor che il register ha escluso dal core.Mode corrente. Apply lo
+// riporta a corekafka.Module, che li sottrae dalla lista degli spec: senza quel ritorno il processor
+// resterebbe nella lista dei runner mentre il suo costruttore non e' stato fornito, e
+// consumer.newRunner cadrebbe nel ramo "nessun processor registrato" — cioe' i modes qui erano l'unico
+// gate capace di spegnere un lato solo dei due, e ogni valore non vuoto rompeva il boot.
+var excludedByMode []string // valido solo durante l'esecuzione sincrona di Apply; nil altrimenti
+
+// provideIfActive fornisce il costruttore del processor solo se e' attivo, dove "attivo" e' la
+// congiunzione delle due condizioni che stanno in posti diversi: presente e non `disabled` in config
+// (lo ha gia' deciso Config.ActiveProcessors, ed e' cio' che activeConsumers contiene) e ammesso dai
+// modes passati al register. Il secondo caso non e' un errore: il processor viene DISATTIVATO, come se
+// fosse `disabled: true`.
+func provideIfActive(consumerName string, modes []string, provide func(spec.ProcessorSpec)) {
 	if activeConsumers == nil {
 		panic("corekafka: RegisterHandler/RegisterTransformer chiamata fuori dalla funzione passata a Module")
 	}
-	if s, ok := activeConsumers[consumerName]; ok {
-		provide(s)
+	s, ok := activeConsumers[consumerName]
+	if !ok {
+		log.Info().Str("consumer", consumerName).Msg("corekafka: processor registrato ma consumer non attivo in config: costruzione saltata (dipendenze non istanziate)")
 		return
 	}
-	log.Info().Str("consumer", consumerName).Msg("corekafka: processor registrato ma consumer non attivo in config: costruzione saltata (dipendenze non istanziate)")
+	if !core.IsMode(modes...) {
+		excludedByMode = append(excludedByMode, consumerName)
+		log.Info().Str("consumer", consumerName).Strs("modes", modes).
+			Msg("corekafka: processor non attivo in questo MODE, non attivato (dipendenze non istanziate)")
+		return
+	}
+	provide(s)
 }
 
 // Apply chiama register() con l'insieme dei processor attivi disponibile a RegisterHandler/
 // RegisterTransformer: le chiamate al loro interno forniscono a fx solo i processor attivi. Chiamata
 // una sola volta da corekafka.Module.
-func Apply(register func(), active map[string]spec.ProcessorSpec, modes []string) {
+//
+// Ritorna i nomi dei processor che il register ha escluso col proprio gating per mode, perche' sono
+// l'unica parte della decisione che corekafka.Module non puo' conoscere da solo: la sua lista viene
+// dalla config, i modes stanno nel codice di registrazione. Module li sottrae, e da li' in poi i due
+// lati — costruttori e runner — dicono la stessa cosa.
+//
+// Il `modes` di questa funzione e' invece quello del SOTTOSISTEMA (corekafka.WithModes): se non
+// corrisponde non si registra nulla, quindi non c'e' nemmeno una lista da sottrarre.
+func Apply(register func(), active map[string]spec.ProcessorSpec, modes []string) []string {
 	if !core.IsMode(modes...) {
-		return // sottosistema non attivo in questo Mode: non fornire nulla
+		return nil // sottosistema non attivo in questo Mode: non fornire nulla
 	}
 	activeConsumers = active
-	defer func() { activeConsumers = nil }()
+	excludedByMode = nil
+	defer func() { activeConsumers, excludedByMode = nil, nil }()
 	register()
+	return excludedByMode
 }

@@ -24,12 +24,17 @@ type Config struct {
 	Processors []spec.ProcessorSpec `yaml:"processors" mapstructure:"processors" json:"processors"`
 }
 
-// ActiveProcessors ritorna i processor ATTIVI — presenti nella lista e non disabled — nell'ordine di
-// config e NON risolti.
+// ActiveProcessors ritorna i processor attivi PER LA CONFIG — presenti nella lista e non disabled —
+// nell'ordine di config e NON risolti.
 //
-// È l'UNICO punto in cui vive la regola di attivazione: da qui in poi "attivo" è un fatto acquisito e
-// non una condizione da ri-valutare. Prima il filtro era scritto due volte — qui e all'ingresso
-// dell'engine — e una regola duplicata è una regola che può divergere.
+// È l'unico punto in cui vive la METÀ della regola di attivazione che si legge nello YAML: da qui in
+// poi "presente e non disabilitato" è un fatto acquisito e non una condizione da ri-valutare. Prima il
+// filtro era scritto due volte — qui e all'ingresso dell'engine — e una regola duplicata è una regola
+// che può divergere.
+//
+// L'altra metà sta nel codice e non qui: i modes passati a RegisterHandler/RegisterTransformer, che
+// solo processor.Apply può valutare (li conosce la funzione di registrazione, non la config).
+// corekafka.Module li sottrae da questa lista — è l'unico punto che vede entrambe le metà.
 //
 // Non risolti di proposito: l'engine ha bisogno dei blocchi GREZZI per attribuire errori e avvisi a
 // chi li ha scritti (le kafka-properties del processor, il blocco `producer` scritto o assente), e la

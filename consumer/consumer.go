@@ -133,8 +133,9 @@ func NewConsumers(p params) (*Consumers, error) {
 		return nil, err
 	}
 
-	// Gli spec arrivano già FILTRATI da Config.ActiveProcessors — che è l'unico punto in cui la
-	// regola di attivazione è scritta — quindi qui non si ri-decide chi è attivo: si costruisce.
+	// Gli spec arrivano già FILTRATI da corekafka.Module — che è l'unico punto in cui le due metà
+	// della regola di attivazione si incontrano (`disabled:` in config e i modes del register) —
+	// quindi qui non si ri-decide chi è attivo: si costruisce.
 	runners := make([]*runner, 0, len(p.Specs))
 	for _, raw := range p.Specs {
 		r, err := newRunner(raw, p.Server, sm, p.Factory, p.DLQ)
