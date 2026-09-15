@@ -3,6 +3,7 @@ package confluentdriver
 import (
 	"errors"
 
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/rs/zerolog/log"
 )
@@ -34,7 +35,11 @@ var errRebalanced = errors.New("rebalance: partizioni revocate, batch in volo sc
 type rebalanceObserver struct {
 	name    string
 	offsets *offsetTracker
-	revoked bool
+	// revoked sono le partizioni perse dall'ultima revoca non ancora consegnata all'engine. nil =
+	// nessuna revoca in attesa. La lista è il valore, non un booleano, perché con il protocollo
+	// cooperativo la revoca è PARZIALE: sapere QUALI partizioni sono andate è ciò che permette di
+	// non buttare i record delle altre.
+	revoked []driver.TopicPartition
 }
 
 func (o *rebalanceObserver) callback(_ *kafka.Consumer, ev kafka.Event) error {
@@ -43,8 +48,15 @@ func (o *rebalanceObserver) callback(_ *kafka.Consumer, ev kafka.Event) error {
 		log.Info().Str("consumer", o.name).Int("partitions", len(e.Partitions)).
 			Str("assignment", e.String()).Msg("corekafka: partizioni assegnate")
 	case kafka.RevokedPartitions:
-		o.offsets.reset()
-		o.revoked = true
+		parts := toTopicPartitions(e.Partitions)
+		// Scarto degli offset delle SOLE partizioni revocate: committarli dichiarerebbe elaborati
+		// record che il nuovo owner sta rileggendo. Le altre partizioni sono ancora nostre e i loro
+		// offset restano tracciati — i record corrispondenti sono nel batch dell'engine, che li
+		// elaborerà e committerà normalmente.
+		o.offsets.resetPartitions(parts)
+		// Le revoche si accumulano finché l'engine non le raccoglie: due rebalance fra due poll sono
+		// improbabili ma non impossibili, e perderne una significherebbe non filtrare quei record.
+		o.revoked = append(o.revoked, parts...)
 		log.Info().Str("consumer", o.name).Int("partitions", len(e.Partitions)).
 			Str("assignment", e.String()).
 			Msg("corekafka: partizioni revocate")
@@ -52,12 +64,29 @@ func (o *rebalanceObserver) callback(_ *kafka.Consumer, ev kafka.Event) error {
 	return nil
 }
 
-// takeRevoked consuma il flag: ritorna true una sola volta per rebalance, così l'engine scarta il
-// batch una volta e riprende a consumare.
-func (o *rebalanceObserver) takeRevoked() bool {
-	if !o.revoked {
-		return false
+// takeRevoked consuma le partizioni revocate: le ritorna una sola volta per rebalance, così l'engine
+// filtra il batch una volta e riprende a consumare.
+func (o *rebalanceObserver) takeRevoked() []driver.TopicPartition {
+	parts := o.revoked
+	o.revoked = nil
+	return parts
+}
+
+// putBack rimette le partizioni non ancora consegnate all'engine: serve quando il client ha
+// consegnato un messaggio nella stessa chiamata della revoca. Il messaggio si consegna comunque (è
+// già uscito dalla coda: buttarlo sarebbe perderlo) e il reset si segnala al giro successivo.
+func (o *rebalanceObserver) putBack(parts []driver.TopicPartition) {
+	o.revoked = append(parts, o.revoked...)
+}
+
+// toTopicPartitions traduce le partizioni del client nei termini neutri del driver.
+func toTopicPartitions(parts []kafka.TopicPartition) []driver.TopicPartition {
+	out := make([]driver.TopicPartition, 0, len(parts))
+	for _, p := range parts {
+		if p.Topic == nil {
+			continue
+		}
+		out = append(out, driver.TopicPartition{Topic: *p.Topic, Partition: p.Partition})
 	}
-	o.revoked = false
-	return true
+	return out
 }

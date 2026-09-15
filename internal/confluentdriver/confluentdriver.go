@@ -38,6 +38,10 @@ func (Factory) NewGroupConsumer(s spec.ProcessorSpec, k spec.KafkaServer) (drive
 	if err != nil {
 		return nil, err
 	}
+	// Il reset parziale vale solo qui: in modalità handle il batch è una collezione di record
+	// indipendenti, quindi perderne una partizione non invalida le altre. In EOS il batch è l'unità
+	// della transazione (vedi groupSession.partial).
+	gs.partial = true
 	return &groupConsumer{groupSession: gs}, nil
 }
 

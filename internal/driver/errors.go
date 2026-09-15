@@ -56,6 +56,13 @@ func (s Severity) String() string {
 	}
 }
 
+// TopicPartition identifica una partizione nei termini neutri del driver: è ciò che serve all'engine
+// per sapere QUALI record del batch in volo non sono più suoi.
+type TopicPartition struct {
+	Topic     string
+	Partition int32
+}
+
 // Error è l'errore del driver con la sua severità. Op è l'operazione che ha fallito ("poll",
 // "commit", "produce", "begin", ...): finisce nel messaggio e nel log, così un errore non richiede
 // di risalire lo stack per capire dove è nato.
@@ -63,6 +70,22 @@ type Error struct {
 	Sev Severity
 	Op  string
 	Err error
+
+	// Revoked è valorizzato SOLO su un SeverityReset nato da una revoca di partizioni, e cambia il
+	// significato del reset: non "scarta tutto il batch" ma "di quel batch hai perso QUESTE
+	// partizioni, il resto è ancora tuo".
+	//
+	// La differenza non è un'ottimizzazione: con un rebalance cooperativo la revoca è PARZIALE, e i
+	// record delle partizioni RITENUTE non tornano indietro se li si butta — la posizione di fetch
+	// non si riavvolge e il commit successivo ci passa sopra. Scartarli è perdere messaggi
+	// (misurato: 305 record su una corsa contro un broker vero).
+	//
+	// Contratto: quando è valorizzato, il driver ha GIÀ scartato gli offset tracciati delle
+	// partizioni elencate (lo fa il rebalance callback, che è il solo posto in cui la lista esiste),
+	// quindi l'engine NON deve chiamare Discard — che butterebbe anche il resto — ma solo filtrare
+	// il proprio batch. Vuoto o assente = semantica di sempre: non si sa cosa si è perso, si scarta
+	// tutto.
+	Revoked []TopicPartition
 }
 
 func (e *Error) Error() string {
@@ -80,6 +103,23 @@ func SeverityOf(err error) Severity {
 		return de.Sev
 	}
 	return SeverityBusiness
+}
+
+// NewRevokeError costruisce il reset PARZIALE di una revoca: porta con sé le partizioni perse.
+// Vedi Error.Revoked per il contratto.
+func NewRevokeError(op string, err error, revoked []TopicPartition) *Error {
+	return &Error{Sev: SeverityReset, Op: op, Err: err, Revoked: revoked}
+}
+
+// RevokedOf ritorna le partizioni revocate portate da un reset parziale. ok=false significa "scarta
+// tutto": o l'errore non viene dal driver, o il driver non sa quali partizioni siano coinvolte
+// (generation superata, poll interval scaduto, abort EOS).
+func RevokedOf(err error) ([]TopicPartition, bool) {
+	var de *Error
+	if !errors.As(err, &de) || len(de.Revoked) == 0 {
+		return nil, false
+	}
+	return de.Revoked, true
 }
 
 // NewError costruisce un errore del driver. Usata dalle implementazioni (internal/confluentdriver):

@@ -496,12 +496,27 @@ func (r *runner) absorb(ctx context.Context, err error, s driver.Session, batch 
 	if sev != driver.SeverityReset && sev != driver.SeverityAbort {
 		return false
 	}
-	// Scartare il batch non è solo troncare la slice: gli offset di quei record sono tracciati DENTRO
-	// il driver, e senza Discard il Commit successivo li confermerebbe — record dichiarati elaborati
-	// che nessuno ha elaborato, cioè un buco, l'opposto di quello che questa funzione promette.
-	// Il rebalance callback azzera già il tracker alla revoca, ma un SeverityReset può risalire da
-	// Poll/Commit SENZA revoca (ErrIllegalGeneration, ErrUnknownMemberID, ErrMaxPollExceeded); in EOS
-	// Discard abortisce anche la transazione, che altrimenti resterebbe aperta.
+
+	// Revoca PARZIALE: il driver dice QUALI partizioni abbiamo perso, e solo i record di quelle vanno
+	// buttati. Gli altri sono ancora nostri — stessa partizione, stesso owner, offset non committati
+	// — e buttarli li PERDE: la posizione di fetch non si riavvolge, quindi nessuno li rileggerebbe e
+	// il commit del batch successivo ci passerebbe sopra. Qui non si chiama Discard: gli offset delle
+	// partizioni perse li ha già scartati il rebalance callback (è il solo posto in cui la lista
+	// esiste), e Discard butterebbe anche quelli delle partizioni ritenute.
+	if revoked, ok := driver.RevokedOf(err); ok {
+		n := dropRevoked(batch, revoked)
+		batchDiscardedTotal.WithLabelValues(r.spec.Name, sev.String()).Add(float64(n))
+		log.Info().Err(err).Str("consumer", r.spec.Name).
+			Int("records", n).Int("kept", len(*batch)).Int("partitions", len(revoked)).
+			Msg("corekafka: partizioni revocate, scartati i loro record dal batch in volo")
+		return true
+	}
+
+	// Non si sa cosa si è perso (generation superata, poll interval scaduto, abort EOS): si scarta
+	// tutto. Scartare il batch non è solo troncare la slice: gli offset di quei record sono tracciati
+	// DENTRO il driver, e senza Discard il Commit successivo li confermerebbe — record dichiarati
+	// elaborati che nessuno ha elaborato, cioè un buco, l'opposto di quello che questa funzione
+	// promette. In EOS Discard abortisce anche la transazione, che altrimenti resterebbe aperta.
 	s.Discard(ctx)
 	n := len(*batch)
 	*batch = (*batch)[:0]
@@ -509,6 +524,26 @@ func (r *runner) absorb(ctx context.Context, err error, s driver.Session, batch 
 	log.Info().Err(err).Str("consumer", r.spec.Name).Int("records", n).
 		Msg("corekafka: batch scartato senza commit, il consumo prosegue")
 	return true
+}
+
+// dropRevoked toglie dal batch i record delle partizioni revocate, conservando l'ordine di quelli che
+// restano, e ritorna quanti ne ha tolti. Filtra in place: la slice è quella del loop di consumo, e
+// riallocarla a ogni rebalance sarebbe un costo inutile su un cammino che deve solo perdere meno.
+func dropRevoked(batch *[]*message.Record, revoked []driver.TopicPartition) int {
+	lost := make(map[driver.TopicPartition]struct{}, len(revoked))
+	for _, p := range revoked {
+		lost[p] = struct{}{}
+	}
+	kept := (*batch)[:0]
+	for _, rec := range *batch {
+		if _, gone := lost[driver.TopicPartition{Topic: rec.Topic, Partition: rec.Partition}]; gone {
+			continue
+		}
+		kept = append(kept, rec)
+	}
+	dropped := len(*batch) - len(kept)
+	*batch = kept
+	return dropped
 }
 
 // sendDeadletter produce i record sul topic DLQ dello spec. Ritorna errore (→ fail-fast) se il DLQ

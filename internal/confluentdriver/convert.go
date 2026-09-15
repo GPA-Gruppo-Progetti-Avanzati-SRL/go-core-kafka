@@ -3,6 +3,7 @@ package confluentdriver
 import (
 	"strconv"
 
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
@@ -77,3 +78,12 @@ func (t *offsetTracker) commitOffsets() []kafka.TopicPartition {
 func (t *offsetTracker) empty() bool { return len(t.m) == 0 }
 
 func (t *offsetTracker) reset() { t.m = make(map[string]kafka.TopicPartition) }
+
+// resetPartitions scarta gli offset tracciati delle sole partizioni indicate. È lo scarto di una
+// revoca PARZIALE: le partizioni che restano nostre conservano i loro offset, perché i record
+// corrispondenti sono ancora nel batch dell'engine e verranno elaborati e committati normalmente.
+func (t *offsetTracker) resetPartitions(parts []driver.TopicPartition) {
+	for _, p := range parts {
+		delete(t.m, p.Topic+"/"+strconv.Itoa(int(p.Partition)))
+	}
+}

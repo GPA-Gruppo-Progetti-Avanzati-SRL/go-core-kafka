@@ -7,15 +7,16 @@ import (
 )
 
 // Il rebalance observer è metà della garanzia "duplicati, mai buchi": alla revoca butta gli offset
-// tracciati e alza il flag che il Poll successivo trasforma in SeverityReset. Se il flag non venisse
-// alzato l'engine committerebbe un batch che il nuovo owner sta rileggendo.
+// tracciati delle partizioni perse e registra quali sono, così il Poll successivo può trasformarle in
+// un SeverityReset parziale. Senza quella segnalazione l'engine committerebbe record che il nuovo
+// owner sta rileggendo.
 func TestRebalanceObserver_RevocaScartaGliOffsetEAlzaIlFlag(t *testing.T) {
 	tr := newOffsetTracker()
 	tr.track(tp("t", 0, 5))
 	o := &rebalanceObserver{name: "test", offsets: tr}
 
-	if o.takeRevoked() {
-		t.Fatal("flag alzato senza revoca")
+	if len(o.takeRevoked()) > 0 {
+		t.Fatal("revoca segnalata senza revoca")
 	}
 	if err := o.callback(nil, kafka.RevokedPartitions{Partitions: []kafka.TopicPartition{tp("t", 0, 5)}}); err != nil {
 		t.Fatalf("callback: %v", err)
@@ -23,12 +24,12 @@ func TestRebalanceObserver_RevocaScartaGliOffsetEAlzaIlFlag(t *testing.T) {
 	if !tr.empty() {
 		t.Error("offset non scartati alla revoca: committarli dichiarerebbe elaborati record che il nuovo owner sta rileggendo")
 	}
-	if !o.takeRevoked() {
-		t.Error("il flag di revoca non è stato alzato: l'engine non scarterebbe il batch in volo")
+	if len(o.takeRevoked()) != 1 {
+		t.Error("la revoca non è stata segnalata: l'engine non scarterebbe i record di quelle partizioni")
 	}
-	// Il flag si consuma: una sola revoca non deve far scartare due batch.
-	if o.takeRevoked() {
-		t.Error("takeRevoked ha ritornato true due volte per la stessa revoca")
+	// La revoca si consuma: una sola revoca non deve far filtrare due batch.
+	if len(o.takeRevoked()) > 0 {
+		t.Error("takeRevoked ha segnalato due volte la stessa revoca")
 	}
 }
 
@@ -45,7 +46,7 @@ func TestRebalanceObserver_AssegnazioneNonToccaGliOffset(t *testing.T) {
 	if tr.empty() {
 		t.Error("offset scartati su AssignedPartitions")
 	}
-	if o.takeRevoked() {
-		t.Error("flag di revoca alzato da un'assegnazione")
+	if len(o.takeRevoked()) > 0 {
+		t.Error("revoca segnalata da un'assegnazione")
 	}
 }
