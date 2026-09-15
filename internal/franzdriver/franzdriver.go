@@ -37,7 +37,8 @@ func (Factory) NewGroupConsumer(s spec.ProcessorSpec, k spec.KafkaServer) (drive
 	if err != nil {
 		return nil, err
 	}
-	b.add(kgo.OnPartitionsRevoked(rb.onRevoked), kgo.OnPartitionsLost(rb.onLost))
+	b.add(kgo.OnPartitionsRevoked(rb.onRevoked), kgo.OnPartitionsLost(rb.onLost),
+		kgo.OnPartitionsAssigned(rb.onAssigned))
 
 	cl, err := kgo.NewClient(b.opts...)
 	if err != nil {
@@ -45,8 +46,13 @@ func (Factory) NewGroupConsumer(s spec.ProcessorSpec, k spec.KafkaServer) (drive
 		return nil, driver.NewError(driver.SeverityPermanent, "new-consumer",
 			fmt.Errorf("franzdriver: NewClient %q: %w", s.Name, err))
 	}
+	sess := newSession(s, cl, rb)
+	// Il reset parziale vale solo qui: in modalità handle il batch è una collezione di record
+	// indipendenti, quindi perderne una partizione non invalida le altre. In EOS il batch è l'unità
+	// della transazione (vedi session.partial).
+	sess.partial = true
 	return &groupConsumer{
-		session: newSession(s, cl, rb),
+		session: sess,
 		cl:      cl,
 		offsets: newOffsetTracker(),
 	}, nil

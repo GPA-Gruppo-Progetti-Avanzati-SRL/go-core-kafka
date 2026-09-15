@@ -3,6 +3,7 @@ package franzdriver
 import (
 	"strconv"
 
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
@@ -51,10 +52,15 @@ func toKgoRecord(r *message.ProducerRecord) *kgo.Record {
 // vuole ricevere al commit.
 type offsetTracker struct {
 	m map[string]*kgo.Record
+	// first è il PRIMO record consegnato dall'ultimo commit, per partizione: è il punto da cui quella
+	// partizione dovrebbe ripartire se il batch venisse buttato, e la barriera oltre cui il commit
+	// non può andare. Il massimo dice fin dove si è arrivati, il minimo dice da dove si dovrebbe
+	// tornare — servono entrambi.
+	first map[string]*kgo.Record
 }
 
 func newOffsetTracker() *offsetTracker {
-	return &offsetTracker{m: make(map[string]*kgo.Record)}
+	return &offsetTracker{m: make(map[string]*kgo.Record), first: make(map[string]*kgo.Record)}
 }
 
 func (t *offsetTracker) track(r *kgo.Record) {
@@ -62,6 +68,20 @@ func (t *offsetTracker) track(r *kgo.Record) {
 	if cur, ok := t.m[key]; !ok || r.Offset > cur.Offset {
 		t.m[key] = r
 	}
+	if cur, ok := t.first[key]; !ok || r.Offset < cur.Offset {
+		t.first[key] = r
+	}
+}
+
+// firstOf ritorna, per le partizioni indicate, il primo record consegnato e non ancora committato.
+func (t *offsetTracker) firstOf(parts []driver.TopicPartition) []*kgo.Record {
+	out := make([]*kgo.Record, 0, len(parts))
+	for _, p := range parts {
+		if r, ok := t.first[p.Topic+"/"+strconv.Itoa(int(p.Partition))]; ok {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // records ritorna un record per partizione, quello più avanti: è l'argomento di CommitRecords.
@@ -75,4 +95,18 @@ func (t *offsetTracker) records() []*kgo.Record {
 
 func (t *offsetTracker) empty() bool { return len(t.m) == 0 }
 
-func (t *offsetTracker) reset() { t.m = make(map[string]*kgo.Record) }
+func (t *offsetTracker) reset() {
+	t.m = make(map[string]*kgo.Record)
+	t.first = make(map[string]*kgo.Record)
+}
+
+// resetPartitions scarta gli offset tracciati delle sole partizioni indicate: è lo scarto di una
+// revoca PARZIALE. Le partizioni che restano nostre conservano i loro offset, perché i record
+// corrispondenti sono ancora nel batch dell'engine e verranno elaborati e committati normalmente.
+func (t *offsetTracker) resetPartitions(parts []driver.TopicPartition) {
+	for _, p := range parts {
+		key := p.Topic + "/" + strconv.Itoa(int(p.Partition))
+		delete(t.m, key)
+		delete(t.first, key)
+	}
+}

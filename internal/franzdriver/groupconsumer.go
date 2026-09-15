@@ -4,7 +4,10 @@ import (
 	"context"
 	"time"
 
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
+
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
+	"github.com/rs/zerolog/log"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -13,6 +16,9 @@ import (
 // logica del driver e va verificata senza un broker.
 type groupClient interface {
 	CommitRecords(ctx context.Context, rs ...*kgo.Record) error
+	// SetOffsets riavvolge la posizione di consumo delle partizioni indicate: serve dopo una revoca,
+	// perché franz riprende dalla propria posizione interna e non dall'ultimo commit.
+	SetOffsets(map[string]map[int32]kgo.EpochOffset)
 	Close()
 }
 
@@ -26,10 +32,38 @@ type groupConsumer struct {
 
 // Poll consegna il record all'engine e ne traccia l'offset per il commit successivo.
 func (g *groupConsumer) Poll(ctx context.Context, timeout time.Duration) (*message.Record, error) {
+	// Riavvolgimenti maturati in una callback di assegnazione: si applicano QUI, sulla nostra
+	// goroutine e fuori dalla callback, dove il client ha già stabilito le sue posizioni e non le
+	// sovrascrive più.
+	if set := g.rb.takePending(); set != nil {
+		g.cl.SetOffsets(set)
+		log.Info().Str("consumer", g.name).Interface("rewind", set).
+			Msg("corekafka: partizioni riavvolte all'ultimo commit (lavoro non confermato prima della revoca)")
+	}
+
 	r, err := g.pollRaw(ctx, timeout)
-	if r == nil || err != nil {
+	if err != nil {
+		// Revoca parziale: gli offset delle partizioni perse vanno scartati, o il Commit successivo
+		// li confermerebbe per conto di chi le possiede ora. Si fa QUI e non nella callback del
+		// rebalance perché quella gira sulla goroutine del client: toccare il tracker da lì sarebbe
+		// una data race. Gli offset delle partizioni ritenute restano, perché i loro record sono
+		// ancora nel batch dell'engine.
+		if revoked, ok := driver.RevokedOf(err); ok {
+			// I record consegnati e non ancora committati di quelle partizioni li sta buttando
+			// l'engine: ognuno è un buco, e il primo di essi è insieme la barriera al commit e il
+			// punto da cui riavvolgere.
+			for _, r := range g.offsets.firstOf(revoked) {
+				g.rb.noteGap(r)
+			}
+			g.offsets.resetPartitions(revoked)
+		}
 		return nil, err
 	}
+	if r == nil {
+		return nil, nil
+	}
+	// Il buco è stato riletto: da qui la sequenza è di nuovo completa e il commit può riprendere.
+	g.rb.clearGap(driver.TopicPartition{Topic: r.Topic, Partition: r.Partition}, r.Offset)
 	g.offsets.track(r)
 	return toRecord(r), nil
 }
@@ -46,7 +80,10 @@ func (g *groupConsumer) Commit(ctx context.Context) error {
 		g.release()
 		return nil
 	}
-	if err := g.cl.CommitRecords(ctx, g.offsets.records()...); err != nil {
+	// La barriera vince sul massimo consegnato: se un record di quella partizione è stato buttato
+	// senza essere elaborato, quella partizione non si committa affatto finché il buco non è riletto.
+	recs := g.capped(g.offsets.records())
+	if err := g.cl.CommitRecords(ctx, recs...); err != nil {
 		return wrap("commit", err)
 	}
 	g.offsets.reset()
@@ -60,6 +97,25 @@ func (g *groupConsumer) Commit(ctx context.Context) error {
 func (g *groupConsumer) Discard(context.Context) {
 	g.offsets.reset()
 	g.dropAndRelease()
+}
+
+// capped toglie dal commit i record la cui partizione ha una barriera più bassa: committarli
+// dichiarerebbe elaborato ciò che nessuno ha visto. Non si "abbassa" l'offset — CommitRecords lavora
+// sui record, e l'unico modo di non superare la barriera è non committare affatto quella partizione,
+// lasciando che sia la rilettura a far ripartire il commit da sotto il buco.
+func (g *groupConsumer) capped(recs []*kgo.Record) []*kgo.Record {
+	out := recs[:0]
+	for _, r := range recs {
+		tp := driver.TopicPartition{Topic: r.Topic, Partition: r.Partition}
+		if g.rb.capCommit(tp, r.Offset+1) {
+			log.Warn().Str("consumer", g.name).Str("topic", r.Topic).Int32("partition", r.Partition).
+				Int64("offset", r.Offset).
+				Msg("corekafka: commit trattenuto: un record di questa partizione è stato scartato senza essere elaborato e va riletto prima di poter confermare oltre")
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // Close rilascia il rebalance PRIMA di chiudere il client, e non è un dettaglio di cortesia: con

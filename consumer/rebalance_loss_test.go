@@ -51,16 +51,24 @@
 // driver franz non è immune — BlockRebalanceOnPoll chiude la finestra grande (la revoca non cade
 // durante l'accumulo) ma restano il buffer buttato e il record consegnato con la revoca in volo.
 //
-// DOPO il reset PARZIALE sulle partizioni revocate (driver confluent), stesso broker:
+// DOPO il reset PARZIALE sulle partizioni revocate (entrambi i driver), stesso broker:
 //
-//	confluent/cooperative-sticky  0 buchi (era 320) — PASS. Nel log: "records=237, kept=237", cioè
-//	                              dello stesso batch 237 record delle partizioni cedute tornano al
-//	                              nuovo owner (che li processa: zero buchi, zero duplicati) e 237
-//	                              delle partizioni ritenute restano nel batch e proseguono.
-//	confluent/range               0 buchi (era 3)   — PASS. Revoca totale: "kept=0", si scarta tutto
-//	                              come prima, ed è corretto perché al riassegno si rilegge.
-//	franz/*                       invariato (59 / 7) — il driver franz non ha ancora il parziale: là
-//	                              i record si perdono in session.buf, non nel batch dell'engine.
+//	confluent/cooperative-sticky  0 buchi (era 320) — PASS
+//	confluent/range               0 buchi (era 3)   — PASS
+//	franz/cooperative-sticky      0 buchi (era 59)  — PASS
+//	franz/range                   5..8 buchi (era 7) — FAIL, unico caso aperto
+//
+// Il log del caso cooperativo mostra cosa fa il parziale: "records=237, kept=237", cioè dello stesso
+// batch 237 record delle partizioni cedute tornano al nuovo owner (che li processa: zero buchi E zero
+// duplicati) e 237 delle partizioni ritenute restano nel batch e proseguono. Con revoca totale
+// (range) il log dice "kept=0": si scarta tutto, ed è corretto perché al riassegno si rilegge — vero
+// per il driver confluent, NON per franz (vedi sotto).
+//
+// franz + eager resta aperto: dei buchi, la maggioranza non è mai passata da Poll (scartati=2,
+// buchi=5), cioè sono record fetchati nel buffer del client e buttati alla revoca. Dopo un
+// revoke+reassign eager franz non riparte dall'ultimo commit come fa librdkafka, quindi lì non basta
+// non buttare: serve il rewind esplicito (SetOffsets). Il protocollo di default della libreria è
+// cooperative-sticky, dove entrambi i driver sono puliti.
 //
 // NOTA SUI FAKE: il mock cluster di librdkafka dava 0 buchi in eager — un FALSO NEGATIVO rispetto al
 // broker vero. kfake riproduce invece la stessa firma del broker vero (3 / 51 / 4 buchi). Un fake può

@@ -43,6 +43,19 @@ func newTestSession(f *fakePoller) *session {
 	return &session{name: "ingest", p: f, rb: &rebalanceObserver{name: "ingest"}, maxPoll: 10}
 }
 
+// recordsOn è records() su una partizione scelta: serve ai test della revoca PARZIALE, dove ciò che
+// conta è distinguere le partizioni perse da quelle ritenute.
+func recordsOn(topic string, partition int32, offsets ...int64) kgo.Fetches {
+	parts := make([]kgo.FetchPartition, 0, len(offsets))
+	for _, o := range offsets {
+		parts = append(parts, kgo.FetchPartition{
+			Partition: partition,
+			Records:   []*kgo.Record{{Topic: topic, Partition: partition, Offset: o}},
+		})
+	}
+	return kgo.Fetches{{Topics: []kgo.FetchTopic{{Topic: topic, Partitions: parts}}}}
+}
+
 // Una fetch riempie il buffer e i record vengono consegnati uno alla volta: l'engine chiede un record
 // per volta, il client ne consegna molti, e la differenza la assorbe il buffer — non una fetch per
 // record.
@@ -94,9 +107,78 @@ func TestPollRaw_RevocaScartaBufferEBatch(t *testing.T) {
 	if len(s.buf) != 0 {
 		t.Errorf("buffer = %d record, atteso vuoto: appartengono a partizioni forse non più nostre", len(s.buf))
 	}
-	// Il flag si consuma una volta sola: l'engine scarta il batch e riprende a consumare.
-	if s.rb.takeRevoked() {
-		t.Error("il flag di revoca deve valere una sola volta")
+	// La revoca si consuma una volta sola: l'engine scarta il batch e riprende a consumare.
+	if len(s.rb.takeRevoked()) > 0 {
+		t.Error("la revoca deve valere una sola volta")
+	}
+}
+
+// Revoca PARZIALE (modalità handle): i record bufferizzati delle partizioni RITENUTE devono
+// sopravvivere. Buttarli sarebbe una perdita — sono ancora nostri, seguono gli offset committati, e
+// la posizione di fetch non torna indietro: nessuno li rileggerebbe.
+func TestPollRaw_RevocaParzialeConservaLePartizioniRitenute(t *testing.T) {
+	f := &fakePoller{fetches: []kgo.Fetches{recordsOn("t", 0, 1, 2), recordsOn("t", 1, 10, 11)}}
+	s := newTestSession(f)
+	s.partial = true
+
+	// Due fetch: la prima riempie il buffer con la partizione 0, la seconda con la 1. Dopo i due poll
+	// il buffer contiene un record di ciascuna.
+	for i := 0; i < 3; i++ {
+		if _, err := s.pollRaw(context.Background(), time.Millisecond); err != nil {
+			t.Fatalf("poll %d: %v", i, err)
+		}
+	}
+
+	s.rb.onRevoked(context.Background(), nil, map[string][]int32{"t": {0}})
+
+	_, err := s.pollRaw(context.Background(), time.Millisecond)
+	if driver.SeverityOf(err) != driver.SeverityReset {
+		t.Fatalf("severità = %s, attesa reset", driver.SeverityOf(err))
+	}
+	revoked, ok := driver.RevokedOf(err)
+	if !ok || len(revoked) != 1 || revoked[0] != (driver.TopicPartition{Topic: "t", Partition: 0}) {
+		t.Fatalf("il reset non porta le partizioni perse: %v (ok=%v)", revoked, ok)
+	}
+	for _, r := range s.buf {
+		if r.Partition == 0 {
+			t.Errorf("record della partizione REVOCATA rimasto nel buffer (offset %d): verrebbe consegnato come se fosse ancora nostro", r.Offset)
+		}
+	}
+	if len(s.buf) == 0 {
+		t.Error("buttati anche i record della partizione RITENUTA: nessuno li rileggerebbe, sono persi")
+	}
+}
+
+// In EOS il batch è l'unità della transazione: una revoca la invalida per intero, quindi il buffer si
+// butta tutto e il reset non porta partizioni da filtrare.
+func TestPollRaw_InEOSLaRevocaRestaTotale(t *testing.T) {
+	f := &fakePoller{fetches: []kgo.Fetches{recordsOn("t", 1, 10, 11)}}
+	s := newTestSession(f) // partial = false
+
+	if _, err := s.pollRaw(context.Background(), time.Millisecond); err != nil {
+		t.Fatalf("primo poll: %v", err)
+	}
+	s.rb.onRevoked(context.Background(), nil, map[string][]int32{"t": {0}})
+
+	_, err := s.pollRaw(context.Background(), time.Millisecond)
+	if driver.SeverityOf(err) != driver.SeverityReset {
+		t.Fatalf("severità = %s, attesa reset", driver.SeverityOf(err))
+	}
+	if _, ok := driver.RevokedOf(err); ok {
+		t.Error("in EOS il reset non deve portare le partizioni: il batch va scartato per intero")
+	}
+	if len(s.buf) != 0 {
+		t.Errorf("buffer = %d record, atteso vuoto in EOS", len(s.buf))
+	}
+}
+
+// Una revoca senza partizioni non deve generare un reset: non c'è nulla da invalidare, e scartare il
+// batch butterebbe record che sono ancora interamente nostri.
+func TestObserver_RevocaVuotaNonSegnalaNulla(t *testing.T) {
+	o := &rebalanceObserver{name: "ingest"}
+	o.onRevoked(context.Background(), nil, map[string][]int32{})
+	if got := o.takeRevoked(); len(got) > 0 {
+		t.Errorf("revoca segnalata senza partizioni: %v", got)
 	}
 }
 

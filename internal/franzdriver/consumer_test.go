@@ -20,6 +20,13 @@ type fakeGroupClient struct {
 	// di verificare l'ORDINE fra rilascio e Close, che è ciò che conta (vedi il test sotto).
 	releasedAtClose int
 	poller          *fakePoller
+	setOffsets      []map[string]map[int32]kgo.EpochOffset
+}
+
+// SetOffsets registra i riavvolgimenti chiesti dal driver: è ciò che si verifica nel test del
+// riavvolgimento dopo una revoca.
+func (f *fakeGroupClient) SetOffsets(set map[string]map[int32]kgo.EpochOffset) {
+	f.setOffsets = append(f.setOffsets, set)
 }
 
 func (f *fakeGroupClient) CommitRecords(_ context.Context, rs ...*kgo.Record) error {
