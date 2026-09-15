@@ -30,7 +30,15 @@ func consumerConfigMap(s spec.ProcessorSpec, k spec.KafkaServer) *kafka.ConfigMa
 		"bootstrap.servers":  k.BootstrapServers,
 		"group.id":           s.GroupID,
 		"enable.auto.commit": false,
-		"auto.offset.reset":  c.AutoOffsetReset,
+		// enable.auto.offset.store è false per la stessa ragione, e non è ridondante: il default è
+		// true, quindi librdkafka MEMORIZZA l'offset di ogni record consegnato, elaborato o no.
+		// Finché si committano offset espliciti presi dal tracker quegli offset restano inerti, ma
+		// basterebbe una Commit() al posto di una CommitOffsets(...) — la forma dell'esempio
+		// ufficiale del client, dove però ogni messaggio è elaborato subito — per confermare in un
+		// colpo solo fino all'ultimo record LETTO. In questo consumer l'offset lo decide il flush,
+		// non la consegna.
+		"enable.auto.offset.store": false,
+		"auto.offset.reset":        c.AutoOffsetReset,
 	}
 	typed := map[string]any{
 		"session.timeout.ms":            c.SessionTimeoutMs,

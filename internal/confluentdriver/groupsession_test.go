@@ -35,9 +35,9 @@ func TestDecide_MessaggioInsiemeAllaRevocaVieneConsegnato(t *testing.T) {
 	// il reset si rimanda al poll successivo — dove sarà il filtro sul batch a togliere i record
 	// delle sole partizioni perse.
 	g := newTestSession(true)
-	m := msg("t", 2, 42)
+	m := msg("t", 2, 42) // partizione 2: RITENUTA
 
-	rec, err := g.decide(m, []driver.TopicPartition{part("t", 0)})
+	rec, err := g.decide(m, []driver.TopicPartition{part("t", 0)}, false)
 
 	if err != nil {
 		t.Fatalf("decide = %v, atteso nil: il record va consegnato, non scartato", err)
@@ -46,7 +46,7 @@ func TestDecide_MessaggioInsiemeAllaRevocaVieneConsegnato(t *testing.T) {
 		t.Fatal("il messaggio consegnato insieme alla revoca è stato buttato: è la perdita di un record")
 	}
 	// Il reset non è perso: lo raccoglie il giro dopo.
-	if got := g.rb.takeRevoked(); len(got) != 1 || got[0] != part("t", 0) {
+	if got, _ := g.rb.takeRevoked(); len(got) != 1 || got[0] != part("t", 0) {
 		t.Fatalf("revoca non rimandata al poll successivo: %v", got)
 	}
 }
@@ -55,7 +55,7 @@ func TestDecide_RevocaPortaLePartizioniPerse(t *testing.T) {
 	g := newTestSession(true)
 	revoked := []driver.TopicPartition{part("t", 0), part("t", 1)}
 
-	_, err := g.decide(nil, revoked)
+	_, err := g.decide(nil, revoked, false)
 
 	if driver.SeverityOf(err) != driver.SeverityReset {
 		t.Fatalf("severità = %v, attesa reset", driver.SeverityOf(err))
@@ -74,7 +74,7 @@ func TestDecide_InEOSIlResetRestaTotale(t *testing.T) {
 	// l'engine deve abortire e scartare tutto, non filtrare.
 	g := newTestSession(false)
 
-	_, err := g.decide(nil, []driver.TopicPartition{part("t", 0)})
+	_, err := g.decide(nil, []driver.TopicPartition{part("t", 0)}, false)
 
 	if driver.SeverityOf(err) != driver.SeverityReset {
 		t.Fatalf("severità = %v, attesa reset", driver.SeverityOf(err))
@@ -101,7 +101,7 @@ func TestDecide_EventiCheNonRiguardanoLEngine(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			g := newTestSession(true)
-			rec, err := g.decide(c.ev, nil)
+			rec, err := g.decide(c.ev, nil, false)
 			if rec != nil || err != nil {
 				t.Errorf("decide(%T) = (%v, %v), atteso (nil, nil)", c.ev, rec, err)
 			}
@@ -113,7 +113,7 @@ func TestDecide_MessaggioConsegnato(t *testing.T) {
 	g := newTestSession(true)
 	m := msg("t", 1, 7)
 
-	rec, err := g.decide(m, nil)
+	rec, err := g.decide(m, nil, false)
 	if err != nil {
 		t.Fatalf("decide = %v, atteso nil", err)
 	}
@@ -133,7 +133,7 @@ func TestDecide_ErrorePerPartizioneSulMessaggio(t *testing.T) {
 	m := msg("t", 0, 3)
 	m.TopicPartition.Error = kafka.NewError(kafka.ErrUnknownTopicOrPart, "unknown", false)
 
-	rec, err := g.decide(m, nil)
+	rec, err := g.decide(m, nil, false)
 	if rec != nil {
 		t.Error("consegnato un messaggio che portava un errore di partizione")
 	}
@@ -144,7 +144,7 @@ func TestDecide_ErrorePerPartizioneSulMessaggio(t *testing.T) {
 
 func TestDecide_ErroreDelClientRisale(t *testing.T) {
 	g := newTestSession(true)
-	rec, err := g.decide(kafka.NewError(kafka.ErrAllBrokersDown, "down", false), nil)
+	rec, err := g.decide(kafka.NewError(kafka.ErrAllBrokersDown, "down", false), nil, false)
 	if rec != nil {
 		t.Error("consegnato un record su evento di errore")
 	}
@@ -176,7 +176,44 @@ func TestRebalanceObserver_ScartaSoloGliOffsetDellePartizioniRevocate(t *testing
 	if off != 21 {
 		t.Errorf("offset da committare = %d, atteso 21 (20+1)", off)
 	}
-	if got := o.takeRevoked(); len(got) != 1 || got[0] != part("t", 0) {
+	if got, _ := o.takeRevoked(); len(got) != 1 || got[0] != part("t", 0) {
 		t.Errorf("partizioni revocate = %v, attesa [t/0]", got)
+	}
+}
+
+func TestDecide_MessaggioDiUnaPartizioneRevocataNonVaConsegnato(t *testing.T) {
+	// Il rovescio del test precedente: se la partizione del messaggio è fra quelle PERSE, consegnarlo
+	// sarebbe un errore. Tracciandone l'offset lo si rimetterebbe nel tracker — da cui il callback
+	// l'ha appena tolto — e un taglio del batch prima del poll successivo committerebbe un offset di
+	// una partizione che non è più nostra. Buttarlo è corretto: lo rilegge il nuovo owner.
+	g := newTestSession(true)
+	m := msg("t", 0, 42) // partizione 0: REVOCATA
+
+	rec, err := g.decide(m, []driver.TopicPartition{part("t", 0)}, false)
+
+	if rec != nil {
+		t.Error("consegnato un record di una partizione revocata: il suo offset tornerebbe nel tracker e potrebbe essere committato")
+	}
+	if driver.SeverityOf(err) != driver.SeverityReset {
+		t.Fatalf("severità = %v, attesa reset", driver.SeverityOf(err))
+	}
+	if got, _ := g.rb.takeRevoked(); len(got) > 0 {
+		t.Error("revoca rimandata al poll successivo: non serve, il reset è già stato consegnato ora")
+	}
+}
+
+func TestDecide_AssegnazionePersaRicostruisceLaSessione(t *testing.T) {
+	// Perdere l'assegnazione non è cederla: le partizioni possono già essere di un altro membro e non
+	// si può distinguere ciò che è ancora nostro. Un reset assorbibile lascerebbe in piedi una
+	// sessione di cui non ci si può fidare; serve una severità che faccia ricostruire il client.
+	g := newTestSession(true)
+
+	rec, err := g.decide(msg("t", 0, 7), []driver.TopicPartition{part("t", 0)}, true)
+
+	if rec != nil {
+		t.Error("consegnato un record con l'assegnazione persa")
+	}
+	if driver.SeverityOf(err) != driver.SeverityFatal {
+		t.Fatalf("severità = %v, attesa fatal (ricostruzione della sessione)", driver.SeverityOf(err))
 	}
 }

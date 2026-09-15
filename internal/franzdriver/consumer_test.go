@@ -115,6 +115,17 @@ type fakeTxnClient struct {
 	endErr     error
 	produceErr error
 	closed     bool
+	// committedOffsets/setOffsets: il riavvolgimento dello scarto senza transazione aperta.
+	committedOffsets map[string]map[int32]kgo.EpochOffset
+	setOffsets       []map[string]map[int32]kgo.EpochOffset
+}
+
+func (f *fakeTxnClient) CommittedOffsets() map[string]map[int32]kgo.EpochOffset {
+	return f.committedOffsets
+}
+
+func (f *fakeTxnClient) SetOffsets(set map[string]map[int32]kgo.EpochOffset) {
+	f.setOffsets = append(f.setOffsets, set)
 }
 
 func (f *fakeTxnClient) Begin() error { f.begun++; return nil }

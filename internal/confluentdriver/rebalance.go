@@ -12,6 +12,10 @@ import (
 // è un evento di protocollo che invalida il batch in volo.
 var errRebalanced = errors.New("rebalance: partizioni revocate, batch in volo scartato")
 
+// errAssignmentLost accompagna la perdita involontaria dell'assegnazione: non è una revoca ordinata,
+// e la sessione va ricostruita invece che riusata.
+var errAssignmentLost = errors.New("rebalance: assegnazione persa, sessione da ricostruire")
+
 // rebalanceObserver è il rebalance callback passato a SubscribeTopics. Esiste per un motivo di
 // CORRETTEZZA, non di osservabilità: senza callback, l'offsetTracker può conservare gli offset di
 // partizioni già revocate e committarli (o inviarli alla transazione) quando l'engine chiude il
@@ -40,15 +44,24 @@ type rebalanceObserver struct {
 	// cooperativo la revoca è PARZIALE: sapere QUALI partizioni sono andate è ciò che permette di
 	// non buttare i record delle altre.
 	revoked []driver.TopicPartition
+	// lost dice che le partizioni non sono state cedute ma PERSE (sessione scaduta, poll interval
+	// superato, fencing): possono già essere di un altro membro, quindi non solo il batch è da
+	// buttare — la sessione non è più affidabile e va ricostruita.
+	lost bool
 }
 
-func (o *rebalanceObserver) callback(_ *kafka.Consumer, ev kafka.Event) error {
+func (o *rebalanceObserver) callback(c *kafka.Consumer, ev kafka.Event) error {
 	switch e := ev.(type) {
 	case kafka.AssignedPartitions:
 		log.Info().Str("consumer", o.name).Int("partitions", len(e.Partitions)).
 			Str("assignment", e.String()).Msg("corekafka: partizioni assegnate")
 	case kafka.RevokedPartitions:
 		parts := toTopicPartitions(e.Partitions)
+		// AssignmentLost va letto QUI: la doc di librdkafka dice che il flag è consultabile solo
+		// dentro il rebalance callback, e che le assegnazioni perse sono revocate immediatamente.
+		if c != nil && c.AssignmentLost() {
+			o.lost = true
+		}
 		// Scarto degli offset delle SOLE partizioni revocate: committarli dichiarerebbe elaborati
 		// record che il nuovo owner sta rileggendo. Le altre partizioni sono ancora nostre e i loro
 		// offset restano tracciati — i record corrispondenti sono nel batch dell'engine, che li
@@ -65,11 +78,12 @@ func (o *rebalanceObserver) callback(_ *kafka.Consumer, ev kafka.Event) error {
 }
 
 // takeRevoked consuma le partizioni revocate: le ritorna una sola volta per rebalance, così l'engine
-// filtra il batch una volta e riprende a consumare.
-func (o *rebalanceObserver) takeRevoked() []driver.TopicPartition {
-	parts := o.revoked
-	o.revoked = nil
-	return parts
+// filtra il batch una volta e riprende a consumare. Il secondo valore dice che l'assegnazione è stata
+// PERSA, non ceduta: lì non c'è nulla da filtrare, perché non si è più owner di niente.
+func (o *rebalanceObserver) takeRevoked() ([]driver.TopicPartition, bool) {
+	parts, lost := o.revoked, o.lost
+	o.revoked, o.lost = nil, false
+	return parts, lost
 }
 
 // putBack rimette le partizioni non ancora consegnate all'engine: serve quando il client ha

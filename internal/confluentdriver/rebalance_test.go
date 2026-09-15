@@ -15,7 +15,7 @@ func TestRebalanceObserver_RevocaScartaGliOffsetEAlzaIlFlag(t *testing.T) {
 	tr.track(tp("t", 0, 5))
 	o := &rebalanceObserver{name: "test", offsets: tr}
 
-	if len(o.takeRevoked()) > 0 {
+	if parts, _ := o.takeRevoked(); len(parts) > 0 {
 		t.Fatal("revoca segnalata senza revoca")
 	}
 	if err := o.callback(nil, kafka.RevokedPartitions{Partitions: []kafka.TopicPartition{tp("t", 0, 5)}}); err != nil {
@@ -24,11 +24,11 @@ func TestRebalanceObserver_RevocaScartaGliOffsetEAlzaIlFlag(t *testing.T) {
 	if !tr.empty() {
 		t.Error("offset non scartati alla revoca: committarli dichiarerebbe elaborati record che il nuovo owner sta rileggendo")
 	}
-	if len(o.takeRevoked()) != 1 {
+	if parts, _ := o.takeRevoked(); len(parts) != 1 {
 		t.Error("la revoca non è stata segnalata: l'engine non scarterebbe i record di quelle partizioni")
 	}
 	// La revoca si consuma: una sola revoca non deve far filtrare due batch.
-	if len(o.takeRevoked()) > 0 {
+	if parts, _ := o.takeRevoked(); len(parts) > 0 {
 		t.Error("takeRevoked ha segnalato due volte la stessa revoca")
 	}
 }
@@ -46,7 +46,7 @@ func TestRebalanceObserver_AssegnazioneNonToccaGliOffset(t *testing.T) {
 	if tr.empty() {
 		t.Error("offset scartati su AssignedPartitions")
 	}
-	if len(o.takeRevoked()) > 0 {
+	if parts, _ := o.takeRevoked(); len(parts) > 0 {
 		t.Error("revoca segnalata da un'assegnazione")
 	}
 }

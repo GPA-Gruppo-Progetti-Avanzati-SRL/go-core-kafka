@@ -49,10 +49,17 @@ func toMessage(r *message.ProducerRecord) *kafka.Message {
 // sia al commit at-least-once (GroupConsumer.Commit) sia a SendOffsetsToTransaction (EOS).
 type offsetTracker struct {
 	m map[string]kafka.TopicPartition
+	// first è il PRIMO offset consegnato dall'ultimo commit, per partizione: è il punto da cui
+	// quella partizione va riavvolta se il batch viene buttato. Il massimo dice fin dove si è
+	// arrivati, il minimo da dove si deve tornare — servono entrambi.
+	first map[string]kafka.TopicPartition
 }
 
 func newOffsetTracker() *offsetTracker {
-	return &offsetTracker{m: make(map[string]kafka.TopicPartition)}
+	return &offsetTracker{
+		m:     make(map[string]kafka.TopicPartition),
+		first: make(map[string]kafka.TopicPartition),
+	}
 }
 
 func (t *offsetTracker) track(tp kafka.TopicPartition) {
@@ -63,6 +70,19 @@ func (t *offsetTracker) track(tp kafka.TopicPartition) {
 	if cur, ok := t.m[key]; !ok || tp.Offset > cur.Offset {
 		t.m[key] = tp
 	}
+	if cur, ok := t.first[key]; !ok || tp.Offset < cur.Offset {
+		t.first[key] = tp
+	}
+}
+
+// rewindOffsets ritorna le partizioni da riportare al primo offset non committato: è ciò che serve a
+// SeekPartitions quando il batch viene buttato per intero.
+func (t *offsetTracker) rewindOffsets() []kafka.TopicPartition {
+	out := make([]kafka.TopicPartition, 0, len(t.first))
+	for _, tp := range t.first {
+		out = append(out, tp)
+	}
+	return out
 }
 
 // commitOffsets ritorna le TopicPartition da committare (offset+1 = prossimo da leggere).
@@ -77,13 +97,18 @@ func (t *offsetTracker) commitOffsets() []kafka.TopicPartition {
 
 func (t *offsetTracker) empty() bool { return len(t.m) == 0 }
 
-func (t *offsetTracker) reset() { t.m = make(map[string]kafka.TopicPartition) }
+func (t *offsetTracker) reset() {
+	t.m = make(map[string]kafka.TopicPartition)
+	t.first = make(map[string]kafka.TopicPartition)
+}
 
 // resetPartitions scarta gli offset tracciati delle sole partizioni indicate. È lo scarto di una
 // revoca PARZIALE: le partizioni che restano nostre conservano i loro offset, perché i record
 // corrispondenti sono ancora nel batch dell'engine e verranno elaborati e committati normalmente.
 func (t *offsetTracker) resetPartitions(parts []driver.TopicPartition) {
 	for _, p := range parts {
-		delete(t.m, p.Topic+"/"+strconv.Itoa(int(p.Partition)))
+		key := p.Topic + "/" + strconv.Itoa(int(p.Partition))
+		delete(t.m, key)
+		delete(t.first, key)
 	}
 }

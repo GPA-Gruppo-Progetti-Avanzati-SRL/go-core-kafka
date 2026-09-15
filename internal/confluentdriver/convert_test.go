@@ -1,6 +1,7 @@
 package confluentdriver
 
 import (
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"testing"
 	"time"
 
@@ -144,5 +145,53 @@ func TestToMessage_RoundTrip(t *testing.T) {
 	back := toRecord(&kafka.Message{TopicPartition: m.TopicPartition, Key: m.Key, Value: m.Value, Headers: m.Headers})
 	if got := back.Headers.Values("trace"); len(got) != 2 || got[0] != "uno" || got[1] != "due" {
 		t.Errorf("round trip degli header ripetuti = %v", got)
+	}
+}
+
+// Il riavvolgimento di un batch scartato deve tornare al PRIMO offset non committato, non all'ultimo
+// consegnato: è quello il punto da cui i record vanno riletti.
+func TestOffsetTracker_RewindTornaAlPrimoOffsetNonCommittato(t *testing.T) {
+	tr := newOffsetTracker()
+	for _, off := range []int64{10, 11, 12} {
+		tr.track(tp("t", 0, off))
+	}
+	tr.track(tp("t", 1, 99))
+
+	got := tr.rewindOffsets()
+	if len(got) != 2 {
+		t.Fatalf("partizioni da riavvolgere = %d, attese 2", len(got))
+	}
+	off, ok := find(got, "t", 0)
+	if !ok {
+		t.Fatal("partizione 0 assente dal riavvolgimento")
+	}
+	if off != 10 {
+		t.Errorf("riavvolgimento p0 = %d, atteso 10 (il primo consegnato, non il massimo)", off)
+	}
+
+	// Dopo un commit il punto di riavvolgimento riparte da zero: quei record sono confermati.
+	tr.reset()
+	if len(tr.rewindOffsets()) != 0 {
+		t.Error("il reset non ha azzerato i punti di riavvolgimento")
+	}
+}
+
+// Lo scarto per partizione toglie anche il punto di riavvolgimento: una partizione revocata la
+// rilegge il nuovo owner, riavvolgerla non avrebbe destinatario.
+func TestOffsetTracker_ResetPartitionsTogliePrimoEUltimo(t *testing.T) {
+	tr := newOffsetTracker()
+	tr.track(tp("t", 0, 10))
+	tr.track(tp("t", 1, 20))
+
+	tr.resetPartitions([]driver.TopicPartition{{Topic: "t", Partition: 0}})
+
+	if _, ok := find(tr.rewindOffsets(), "t", 0); ok {
+		t.Error("punto di riavvolgimento della partizione revocata ancora presente")
+	}
+	if _, ok := find(tr.commitOffsets(), "t", 0); ok {
+		t.Error("offset da committare della partizione revocata ancora presente")
+	}
+	if _, ok := find(tr.rewindOffsets(), "t", 1); !ok {
+		t.Error("scartato anche il riavvolgimento di una partizione RITENUTA")
 	}
 }

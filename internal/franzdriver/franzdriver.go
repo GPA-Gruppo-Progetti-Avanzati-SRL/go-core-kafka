@@ -92,8 +92,23 @@ func (Factory) NewTransactSession(s spec.ProcessorSpec, k spec.KafkaServer) (dri
 	}
 	return &transactSession{
 		session: newSession(s, sess, rb),
-		sess:    sess,
+		sess:    txnSession{sess},
 	}, nil
+}
+
+// txnSession adatta la GroupTransactSession di franz al seam txnClient: gli offset (lettura degli
+// ultimi committati e riavvolgimento) stanno sul *kgo.Client sottostante, non sulla sessione, e
+// passare il client nudo renderebbe il seam non fakeable nei test.
+type txnSession struct {
+	*kgo.GroupTransactSession
+}
+
+func (t txnSession) CommittedOffsets() map[string]map[int32]kgo.EpochOffset {
+	return t.Client().CommittedOffsets()
+}
+
+func (t txnSession) SetOffsets(set map[string]map[int32]kgo.EpochOffset) {
+	t.Client().SetOffsets(set)
 }
 
 // NewProducer crea il producer condiviso del processo, non transazionale (DLQ). Non appartiene a

@@ -2,11 +2,13 @@ package confluentdriver
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
+	"github.com/rs/zerolog/log"
 )
 
 // groupSession è la parte comune ai due client del driver: il consumer sottoscritto, il tracker degli
@@ -58,8 +60,12 @@ func (g *groupSession) Poll(_ context.Context, timeout time.Duration) (*message.
 		ms = 1
 	}
 
-	// Il callback del rebalance gira DENTRO questa chiamata, se l'evento estratto era una revoca.
-	msg, err := g.decide(g.c.Poll(ms), g.rb.takeRevoked())
+	// L'ORDINE è vincolante: il callback del rebalance gira DENTRO la Poll, quindi la revoca si
+	// raccoglie DOPO. Raccoglierla prima la sposterebbe di un giro, e il record consegnato in questa
+	// stessa chiamata verrebbe tracciato senza sapere che una revoca è avvenuta.
+	ev := g.c.Poll(ms)
+	revoked, lost := g.rb.takeRevoked()
+	msg, err := g.decide(ev, revoked, lost)
 	if err != nil || msg == nil {
 		return nil, err
 	}
@@ -73,16 +79,30 @@ func (g *groupSession) Poll(_ context.Context, timeout time.Duration) (*message.
 //
 // Ritorna (msg, nil) se c'è un record da consegnare, (nil, err) per un errore o per il reset da
 // rebalance, (nil, nil) quando non c'è nulla — timeout o evento che non riguarda l'engine.
-func (g *groupSession) decide(ev kafka.Event, revoked []driver.TopicPartition) (*kafka.Message, error) {
+func (g *groupSession) decide(ev kafka.Event, revoked []driver.TopicPartition, lost bool) (*kafka.Message, error) {
 	msg, _ := ev.(*kafka.Message)
 
+	if lost {
+		// Assegnazione PERSA: le partizioni possono già essere di un altro membro, quindi non si può
+		// distinguere ciò che è ancora nostro da ciò che non lo è più — nemmeno il messaggio appena
+		// consegnato. Si butta tutto e si RICOSTRUISCE la sessione: un reset assorbibile lascerebbe
+		// in piedi una sessione di cui non ci si può fidare. Il client nuovo riparte dagli ultimi
+		// offset committati: duplicati ammessi, nessun buco.
+		return nil, driver.NewError(driver.SeverityFatal, "poll", errAssignmentLost)
+	}
+
 	if len(revoked) > 0 {
-		if msg != nil {
-			// Un messaggio consegnato insieme alla revoca NON si butta: è già uscito dalla coda del
-			// client, la posizione di fetch non torna indietro, e se appartiene a una partizione
-			// RITENUTA nessuno lo rileggerà mai. Lo consegniamo, e il reset lo segnaliamo al giro
-			// dopo: se la sua partizione era fra le revocate sarà il filtro sul batch a toglierlo, e
-			// lì buttarlo è corretto perché lo rilegge il nuovo owner dall'ultimo commit.
+		// Un messaggio consegnato insieme alla revoca si consegna SOLO se la sua partizione è ancora
+		// nostra: è già uscito dalla coda del client, la posizione di fetch non torna indietro, e
+		// buttarlo lo perderebbe perché nessuno rileggerà quella partizione. Il reset si segnala al
+		// giro dopo.
+		//
+		// Se invece la partizione è fra le revocate il record si BUTTA, e consegnarlo sarebbe un
+		// errore: tracciandone l'offset lo si rimetterebbe nel tracker — da cui il callback l'ha
+		// appena tolto — e un taglio del batch prima del poll successivo committerebbe un offset di
+		// una partizione che non è più nostra, cioè la perdita che il callback esiste per prevenire.
+		// Buttarlo è corretto: lo rilegge il nuovo owner dall'ultimo commit.
+		if msg != nil && !isRevoked(msg.TopicPartition, revoked) {
 			g.rb.putBack(revoked)
 			return g.deliver(msg)
 		}
@@ -105,6 +125,19 @@ func (g *groupSession) decide(ev kafka.Event, revoked []driver.TopicPartition) (
 	// Ogni altro evento (OffsetsCommitted, PartitionEOF, *Stats, OAuthBearerTokenRefresh) e il timeout
 	// (ev == nil): nessun record da consegnare, il loop dell'engine riprova.
 	return nil, nil
+}
+
+// isRevoked dice se la topic-partition del messaggio è fra quelle appena perse.
+func isRevoked(tp kafka.TopicPartition, revoked []driver.TopicPartition) bool {
+	if tp.Topic == nil {
+		return false
+	}
+	for _, p := range revoked {
+		if p.Topic == *tp.Topic && p.Partition == tp.Partition {
+			return true
+		}
+	}
+	return false
 }
 
 // deliver valida il messaggio prima di consegnarlo: un errore per-partizione arriva attaccato al
@@ -130,5 +163,45 @@ func (g *groupSession) resetError(revoked []driver.TopicPartition) error {
 // volo: senza, il Commit successivo confermerebbe record che nessuno ha elaborato (vedi il contratto
 // di driver.Session.Discard). La sessione transazionale la estende con l'abort della transazione.
 func (g *groupSession) Discard(context.Context) {
+	g.rewind()
 	g.offsets.reset()
+}
+
+// rewind riporta la posizione di consumo al primo offset non committato delle partizioni del batch
+// che si sta buttando. Senza, scartare un batch NON significa rileggerlo: la posizione di fetch resta
+// avanti e il commit successivo passa sopra quei record — che nessuno ha elaborato.
+//
+// Per una revoca non serve (le partizioni perse le rilegge il nuovo owner, e quelle ritenute non
+// vengono più buttate: c'è il reset parziale). Serve per gli scarti TOTALI, dove non c'è nessun
+// rebalance a riposizionare il consumo: l'abort di una transazione EOS è il caso principale — la
+// transazione annullata non ha prodotto nulla, quindi quei record vanno rielaborati, non saltati.
+//
+// L'errore per-partizione è ignorato di proposito: una partizione non più assegnata non si può
+// riavvolgere, ed è giusto così — la rilegge chi la possiede ora.
+func (g *groupSession) rewind() {
+	parts := g.offsets.rewindOffsets()
+	if len(parts) == 0 {
+		return
+	}
+	res, err := g.c.SeekPartitions(parts)
+	if err != nil {
+		log.Warn().Err(err).Str("consumer", g.name).Int("partitions", len(parts)).
+			Msg("corekafka: riavvolgimento fallito: i record del batch scartato potrebbero non essere riletti")
+		return
+	}
+	for _, p := range res {
+		if p.Error != nil && !isNotAssigned(p.Error) {
+			log.Warn().Err(p.Error).Str("consumer", g.name).Str("topic", *p.Topic).
+				Int32("partition", p.Partition).Msg("corekafka: riavvolgimento della partizione fallito")
+		}
+	}
+	log.Info().Str("consumer", g.name).Int("partitions", len(parts)).
+		Msg("corekafka: batch scartato, consumo riavvolto al primo offset non committato")
+}
+
+// isNotAssigned riconosce l'errore di una seek su una partizione che non è più nostra: è l'esito
+// atteso dopo una revoca, non un guasto da segnalare.
+func isNotAssigned(err error) bool {
+	var ke kafka.Error
+	return errors.As(err, &ke) && (ke.Code() == kafka.ErrState || ke.Code() == kafka.ErrUnknownPartition)
 }

@@ -51,24 +51,23 @@
 // driver franz non è immune — BlockRebalanceOnPoll chiude la finestra grande (la revoca non cade
 // durante l'accumulo) ma restano il buffer buttato e il record consegnato con la revoca in volo.
 //
-// DOPO il reset PARZIALE sulle partizioni revocate (entrambi i driver), stesso broker:
+// DOPO il reset PARZIALE sulle partizioni revocate (entrambi i driver) + barriera e riavvolgimento
+// su franz, stesso broker — TUTTE E QUATTRO a zero buchi:
 //
-//	confluent/cooperative-sticky  0 buchi (era 320) — PASS
-//	confluent/range               0 buchi (era 3)   — PASS
-//	franz/cooperative-sticky      0 buchi (era 59)  — PASS
-//	franz/range                   5..8 buchi (era 7) — FAIL, unico caso aperto
+//	confluent/cooperative-sticky  0 buchi (era 320), 0 duplicati
+//	confluent/range               0 buchi (era 3),   0 duplicati
+//	franz/cooperative-sticky      0 buchi (era 59),  0 duplicati
+//	franz/range                   0 buchi (era 7),   1059 duplicati
 //
 // Il log del caso cooperativo mostra cosa fa il parziale: "records=237, kept=237", cioè dello stesso
 // batch 237 record delle partizioni cedute tornano al nuovo owner (che li processa: zero buchi E zero
-// duplicati) e 237 delle partizioni ritenute restano nel batch e proseguono. Con revoca totale
-// (range) il log dice "kept=0": si scarta tutto, ed è corretto perché al riassegno si rilegge — vero
-// per il driver confluent, NON per franz (vedi sotto).
+// duplicati) e 237 delle partizioni ritenute restano nel batch e proseguono.
 //
-// franz + eager resta aperto: dei buchi, la maggioranza non è mai passata da Poll (scartati=2,
-// buchi=5), cioè sono record fetchati nel buffer del client e buttati alla revoca. Dopo un
-// revoke+reassign eager franz non riparte dall'ultimo commit come fa librdkafka, quindi lì non basta
-// non buttare: serve il rewind esplicito (SetOffsets). Il protocollo di default della libreria è
-// cooperative-sticky, dove entrambi i driver sono puliti.
+// I 1059 duplicati di franz/range sono il prezzo dichiarato, e la loro sequenza nei log è la
+// dimostrazione del meccanismo: "commit trattenuto" (la barriera impedisce di confermare oltre il
+// buco) -> "partizioni riavvolte" (SetOffsets riporta il consumo all'ultimo commit) -> i record
+// scartati vengono riletti ed elaborati. Servono entrambe le metà, e servono solo a franz: dopo un
+// revoke+reassign eager franz riprende dalla propria posizione interna, librdkafka rilegge da sé.
 //
 // NOTA SUI FAKE: il mock cluster di librdkafka dava 0 buchi in eager — un FALSO NEGATIVO rispetto al
 // broker vero. kfake riproduce invece la stessa firma del broker vero (3 / 51 / 4 buchi). Un fake può

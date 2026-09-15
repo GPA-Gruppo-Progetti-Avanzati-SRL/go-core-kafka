@@ -25,6 +25,11 @@ type txnClient interface {
 	Begin() error
 	ProduceSync(ctx context.Context, rs ...*kgo.Record) kgo.ProduceResults
 	End(ctx context.Context, commit kgo.TransactionEndTry) (bool, error)
+	// CommittedOffsets e SetOffsets servono al riavvolgimento dello scarto quando NON c'è una
+	// transazione da abortire: con una aperta è End(TryAbort) a riportare indietro il consumo, senza
+	// dobbiamo farlo noi (vedi Abort).
+	CommittedOffsets() map[string]map[int32]kgo.EpochOffset
+	SetOffsets(map[string]map[int32]kgo.EpochOffset)
 	Close()
 }
 
@@ -98,6 +103,12 @@ func (t *transactSession) Commit(ctx context.Context) error {
 // transazione è aperta.
 func (t *transactSession) Abort(ctx context.Context) error {
 	if !t.txnOpen {
+		// Nessuna transazione da abortire, ma il batch in volo si sta buttando lo stesso (tipicamente
+		// un errore risalito da Poll prima del primo Begin). Qui il riavvolgimento va fatto a mano:
+		// senza, quei record non verrebbero riletti da nessuno — la posizione di consumo resta
+		// avanti e il commit successivo ci passa sopra. Con una transazione aperta è invece
+		// End(TryAbort) a riportare il consumo agli ultimi offset committati.
+		t.rewindToCommitted()
 		t.dropAndRelease()
 		return nil
 	}
@@ -105,6 +116,18 @@ func (t *transactSession) Abort(ctx context.Context) error {
 	_, err := t.sess.End(ctx, kgo.TryAbort)
 	t.dropAndRelease()
 	return endErr("abort-transaction", err)
+}
+
+// rewindToCommitted riporta il consumo agli ultimi offset committati: è ciò che fa End(TryAbort)
+// quando una transazione è aperta, e che qui va fatto esplicitamente quando non lo è.
+func (t *transactSession) rewindToCommitted() {
+	committed := t.sess.CommittedOffsets()
+	if len(committed) == 0 {
+		return
+	}
+	t.sess.SetOffsets(committed)
+	log.Info().Str("consumer", t.name).Interface("offsets", committed).
+		Msg("corekafka: batch scartato senza transazione aperta, consumo riavvolto agli ultimi offset committati")
 }
 
 // Discard scarta il batch in volo E abortisce la transazione aperta: in EOS le due cose sono la stessa

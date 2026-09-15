@@ -50,6 +50,10 @@ func TestConsumerConfigMap_Minimale(t *testing.T) {
 	mustEqual(t, cm, "auto.offset.reset", "earliest")
 	// Invariante dell'engine: il commit è manuale, sempre.
 	mustEqual(t, cm, "enable.auto.commit", false)
+	// Non ridondante con la precedente: il default è true, quindi senza questa librdkafka memorizza
+	// l'offset di OGNI record consegnato, elaborato o no — e basterebbe una Commit() al posto di una
+	// CommitOffsets(...) per confermare fino all'ultimo record letto.
+	mustEqual(t, cm, "enable.auto.offset.store", false)
 
 	// Default della LIBRERIA: questi tre sono scritti anche senza che l'app li configuri, perché è
 	// su di essi che librdkafka e franz-go NON concordano (franz-go: read_uncommitted,
