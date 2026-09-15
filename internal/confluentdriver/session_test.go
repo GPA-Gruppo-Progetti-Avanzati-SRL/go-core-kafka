@@ -3,6 +3,8 @@ package confluentdriver
 import (
 	"context"
 	"testing"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
 
 func TestTransactSession_AbortSenzaTransazioneApertaEUnNoOp(t *testing.T) {
@@ -10,7 +12,16 @@ func TestTransactSession_AbortSenzaTransazioneApertaEUnNoOp(t *testing.T) {
 	// Poll). Senza il guard su txnOpen chiederebbe al client di abortire una transazione che non
 	// esiste: errore di stato invalido al posto di un no-op, e su una sessione appena creata un nil
 	// deref sul producer.
-	s := &transactSession{groupSession: groupSession{name: "test", offsets: newOffsetTracker()}}
+	// Il consumer serve perché Abort ora RIAVVOLGE il consumo prima di scartare gli offset: senza un
+	// client la seek non avrebbe destinatario. NewConsumer non contatta il broker, e la seek su una
+	// partizione non assegnata fallisce per-partizione — che è l'esito atteso e ignorato.
+	c, err := kafka.NewConsumer(&kafka.ConfigMap{"bootstrap.servers": "127.0.0.1:9", "group.id": "test"})
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+	defer c.Close()
+
+	s := &transactSession{groupSession: groupSession{name: "test", c: c, offsets: newOffsetTracker()}}
 	s.offsets.track(tp("t", 0, 5))
 
 	if err := s.Abort(context.Background()); err != nil {

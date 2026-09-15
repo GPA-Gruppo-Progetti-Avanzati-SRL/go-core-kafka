@@ -56,6 +56,12 @@ func (t *transactSession) Commit(ctx context.Context) error {
 // transazione se non ce n'è una aperta, ma gli offset vanno scartati comunque: è l'altra metà del
 // contratto di Discard.
 func (t *transactSession) Abort(ctx context.Context) error {
+	// Il riavvolgimento va fatto QUI e non basta averlo in groupSession.Discard: questa sessione
+	// sovrascrive Discard, quindi senza questa riga l'abort EOS — che è il caso principale per cui il
+	// riavvolgimento esiste — non riavvolgerebbe nulla. La transazione annullata non ha prodotto
+	// niente, quindi quei record vanno rielaborati: senza tornare indietro nessuno li rileggerebbe e
+	// il commit successivo ci passerebbe sopra.
+	t.rewind()
 	t.offsets.reset()
 	return t.txn.abort(ctx)
 }

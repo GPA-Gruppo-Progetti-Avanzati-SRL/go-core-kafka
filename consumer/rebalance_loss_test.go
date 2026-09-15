@@ -360,9 +360,37 @@ func (f countingFactory) NewGroupConsumer(s spec.ProcessorSpec, k spec.KafkaServ
 	return &countingConsumer{GroupConsumer: gc, d: f.d}, nil
 }
 
+func (f countingFactory) NewTransactSession(s spec.ProcessorSpec, k spec.KafkaServer) (driver.TransactSession, error) {
+	ts, err := f.Factory.NewTransactSession(s, k)
+	if err != nil {
+		return nil, err
+	}
+	return &countingTransact{TransactSession: ts, d: f.d}, nil
+}
+
 type countingConsumer struct {
 	driver.GroupConsumer
 	d *deliveredSet
+}
+
+// countingTransact è il gemello EOS di countingConsumer: la misura al confine del driver serve
+// identica nelle due modalità.
+type countingTransact struct {
+	driver.TransactSession
+	d *deliveredSet
+}
+
+func (c *countingTransact) Poll(ctx context.Context, timeout time.Duration) (*message.Record, error) {
+	r, err := c.TransactSession.Poll(ctx, timeout)
+	if r != nil {
+		c.d.add(offsetKey{r.Partition, r.Offset})
+	}
+	return r, err
+}
+
+func (c *countingTransact) Discard(ctx context.Context) {
+	c.d.discard()
+	c.TransactSession.Discard(ctx)
 }
 
 func (c *countingConsumer) Poll(ctx context.Context, timeout time.Duration) (*message.Record, error) {
