@@ -97,15 +97,22 @@ import (
 	"github.com/twmb/franz-go/pkg/kfake"
 )
 
-const (
+// lossPartitions e produceRate sono var e non const perché il test di scala
+// (rebalance_scale_test.go) riusa queste stesse helper con 12 partizioni e il doppio del rate:
+// duplicare broker, producer e report per cambiare due numeri avrebbe creato la seconda copia che
+// questo file evita apposta.
+var (
 	lossPartitions = 4
-	lossProcessor  = "lossproc"
+	produceRate    = 4 * time.Millisecond // ~250 rec/s: i consumer stanno dietro e il topic si drena
+)
+
+const (
+	lossProcessor = "lossproc"
 
 	// Finestra di accumulo del batch: è la larghezza della finestra in cui una revoca può cogliere
 	// record già usciti dal client e non ancora visti dall'Handler.
 	lossCutFrequency = 3 * time.Second
 
-	produceRate  = 4 * time.Millisecond // ~250 rec/s: i consumer stanno dietro e il topic si drena
 	handlerDelay = 30 * time.Millisecond
 	joinSecond   = 8 * time.Second  // quando entra il consumer B
 	joinThird    = 16 * time.Second // quando entra il consumer C
@@ -278,7 +285,7 @@ func startBroker(t *testing.T, topic string) string {
 
 	c, err := kfake.NewCluster(
 		kfake.NumBrokers(1),
-		kfake.SeedTopics(lossPartitions, topic),
+		kfake.SeedTopics(int32(lossPartitions), topic),
 	)
 	if err != nil {
 		t.Fatalf("kfake: %v", err)

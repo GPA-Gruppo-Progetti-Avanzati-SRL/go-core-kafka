@@ -13,6 +13,17 @@
 // esserci (i consumer read_committed non vedono le transazioni abortite), ma non fanno fallire il
 // test — l'at-least-once è il minimo garantito, l'exactly-once è ciò che si vuole verificare.
 //
+// ESITO AL 2026-09-15, su Redpanda: entrambi i driver 0 buchi e 0 duplicati in output.
+//
+// Il test è VERIFICATO come regressione, non solo passante: togliendo il riavvolgimento dall'abort
+// EOS (transactSession.Abort) la stessa corsa dà 294 buchi — e i numeri tornano da soli, 5343 record
+// consegnati da Poll contro 5049 transform eseguiti, differenza esattamente 294.
+//
+// Su franz si vede anche l'altra metà: "transform eseguiti 6059" su 5540 record distinti, cioè 519
+// rielaborati dopo un riavvolgimento — che in output compaiono UNA volta sola, perché i record di una
+// transazione abortita non sono visibili a un lettore read_committed. Duplicati nell'elaborazione,
+// exactly-once nel risultato.
+//
 // go test -tags mockcluster -run TestEOS -v ./consumer/
 package consumer
 
