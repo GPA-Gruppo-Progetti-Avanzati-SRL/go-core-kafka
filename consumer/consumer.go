@@ -170,7 +170,11 @@ func NewConsumers(p params) (*Consumers, error) {
 					defer func() { done <- struct{}{} }()
 					if err := r.run(ctx); err != nil && ctx.Err() == nil {
 						log.Error().Err(err).Str("consumer", r.spec.Name).Msg("corekafka: consumer terminato con errore, arresto dell'applicazione")
-						_ = p.Shutdowner.Shutdown()
+						// Codice 1: il consumer è morto con un errore, e un orchestratore che legge
+						// l'uscita a 0 la tratterebbe come un arresto riuscito.
+						if shErr := p.Shutdowner.Shutdown(fx.ExitCode(1)); shErr != nil {
+							log.Error().Err(shErr).Str("consumer", r.spec.Name).Msg("corekafka: shutdown dell'applicazione fallito")
+						}
 					}
 				})
 			}
