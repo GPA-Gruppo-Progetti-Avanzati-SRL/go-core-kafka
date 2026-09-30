@@ -24,6 +24,9 @@ import (
 	"go.uber.org/fx"
 )
 
+// liberr costruisce gli errori del package con l'ambito della libreria (vedi core.Errors).
+var liberr = core.Errors{Ambit: Ambit}
+
 // abortTimeout limita l'abort di ripiego di TxProducer.Produce. Non è un knob di config: è la rete di
 // sicurezza di un percorso di errore, e un valore configurabile qui darebbe da scegliere su qualcosa
 // che nessuno può tarare meglio di così.
@@ -63,7 +66,7 @@ type Producer struct {
 // Produce invia i record e attende i delivery report.
 func (p *Producer) Produce(ctx context.Context, recs []*message.ProducerRecord) *core.ApplicationError {
 	if err := p.d.Produce(ctx, recs); err != nil {
-		return core.TechnicalError().WithAmbit(Ambit).WithCode(CodeProduce).WithCause(err)
+		return liberr.Tech(CodeProduce).WithCause(err)
 	}
 	return nil
 }
@@ -92,18 +95,18 @@ func (p *TxProducer) Produce(ctx context.Context, recs []*message.ProducerRecord
 		return nil
 	}
 	if err := p.d.Begin(ctx); err != nil {
-		return core.TechnicalError().WithAmbit(Ambit).WithCode(CodeProduce).WithCause(err)
+		return liberr.Tech(CodeProduce).WithCause(err)
 	}
 	if err := p.d.Produce(ctx, recs); err != nil {
 		p.abort(ctx)
-		return core.TechnicalError().WithAmbit(Ambit).WithCode(CodeProduce).WithCause(err)
+		return liberr.Tech(CodeProduce).WithCause(err)
 	}
 	if err := p.d.Commit(ctx); err != nil {
 		// L'abort DOPO un commit fallito non è ridondante: se il commit non è andato a buon fine la
 		// transazione è ancora aperta lato broker, e lasciarla tale blocca i consumer read_committed
 		// su quelle partizioni fino al transaction.timeout.ms.
 		p.abort(ctx)
-		return core.TechnicalError().WithAmbit(Ambit).WithCode(CodeProduce).WithCause(err)
+		return liberr.Tech(CodeProduce).WithCause(err)
 	}
 	return nil
 }
