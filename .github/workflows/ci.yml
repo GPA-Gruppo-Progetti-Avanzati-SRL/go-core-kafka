@@ -19,3 +19,6 @@ permissions:
 jobs:
   ci:
     uses: GPA-Gruppo-Progetti-Avanzati-SRL/go-core-ci/.github/workflows/module-ci.yml@master
+    with:
+      # I test di rebalance ed EOS su cluster simulato: sono quelli che provano "duplicati, mai buchi".
+      test-tags: mockcluster

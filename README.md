@@ -62,7 +62,9 @@ CGO_ENABLED=0 go build $(go list ./... | grep -v confluent)
 Esito **uniforme** tra i due seam (via lo stesso errore gestito): `nil` → commit; `corekafka.DeadLetter(
 cause, recs...)` → i record indicati vanno al **DLQ** (in handle via Producer; in transform prodotti nella
 stessa transazione EOS) e il resto viene committato; `corekafka.ErrFailFast` → replay; qualsiasi altro
-errore → policy `on-error` dello spec (`fail-fast` default | `deadletter`).
+errore → **niente commit e replay**, con la severità decisa da `on-error` (`fail-fast` default: errore di
+business, il processo esce | `deadletter`: transitorio, il consumer è ricostruito dopo il backoff). Un
+errore generico **non va mai al DLQ** — vedi [Errore generico e DLQ](#errore-generico-e-dlq).
 
 ## Struttura dell'app consumer (convenzioni GPA)
 
@@ -597,8 +599,36 @@ func (h *Handler) Handle(ctx context.Context, batch []*corekafka.Record) error {
 
 Regole d'esito (uniformi handle/transform): `nil` → commit; `corekafka.DeadLetter(...)` → DLQ dei
 record indicati + commit (richiede `deadletter-topic`); `corekafka.ErrFailFast` (anche wrappato) →
-fail-fast; **qualsiasi altro errore** → policy di default dello spec (`on-error`: `fail-fast` default |
-`deadletter`).
+fail-fast; **qualsiasi altro errore** → niente commit e replay, con la severità della policy
+`on-error` (`fail-fast` default | `deadletter`).
+
+### Errore generico e DLQ
+
+Al DLQ vanno **solo** i record che il processor indica come poison (`DeadLetter`, `DeadLetterEach`,
+`Convert`), sotto qualunque policy. Un errore generico ritornato da `Handle`/`Transform` non dice *quali*
+record lo abbiano causato né se rigiocarlo cambierebbe l'esito, e fino al 2026-09-30 sotto
+`on-error: deadletter` mandava al DLQ **l'intero batch** e lo committava: un `Handle` fallito perché il
+DB era irraggiungibile diventava una perdita funzionale. Ora le due policy differiscono solo per *come*
+si rigioca:
+
+| `on-error` | errore generico | quando si esce |
+|---|---|---|
+| `fail-fast` (default) | severità `business`: niente commit, il loop termina | subito, salvo `restart.on-business-error: true` |
+| `deadletter` | severità `retriable`: niente commit, il consumer è ricostruito dopo il backoff e il batch rigiocato | finito il budget di `restart` (default 5 tentativi) |
+
+**Cambio di semantica** per chi usava `deadletter`: un errore che prima finiva nel DLQ ora ferma il
+consumo finché non si risolve, poi esce. Chi contava su quel comportamento per scartare un record
+deterministico deve ritornarlo come `corekafka.DeadLetter(err, rec)` — è l'unica forma che dice al
+motore quale record è poison. I riavvii per errore transitorio si vedono in
+`corekafka_consumer_restarts_total{severity="retriable"}`, quindi `corekafka_deadlettered_records_total`
+conta ora solo poison: un picco lì è un problema di dati, non di infrastruttura.
+
+**Il DLQ è at-least-once** in modalità handle (e in transform `delivery: at-least-once`): i record poison
+sono prodotti *prima* del commit degli offset, quindi se il commit fallisce o il processo muore fra i due
+il batch è rigiocato e gli stessi record arrivano al DLQ una seconda volta. L'header
+`Kafka-Delivery-Attempts` non li distingue — è calcolato dal record consumato, che fra due tentativi non
+cambia. Chi legge il DLQ deduplica per topic/partizione/offset d'origine, che sono negli header. In
+transform exactly-once DLQ e offset stanno nella stessa transazione, e il problema non c'è.
 
 ## Config YAML
 
@@ -644,7 +674,7 @@ services:
         cut-frequency: 1s
         session-timeout-ms: 10000
         heartbeat-interval-ms: 3000
-        on-error: fail-fast                 # errore generico -> replay (default) | deadletter
+        on-error: fail-fast                 # errore generico: fail-fast (esce) | deadletter (restart); mai al DLQ
         deadletter-topic: gpa.DLQ           # anche il DLQ è ereditabile: i record ci arrivano etichettati
 
       # Default del client producer.

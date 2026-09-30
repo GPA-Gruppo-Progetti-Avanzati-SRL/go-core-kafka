@@ -263,9 +263,8 @@ func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Fa
 		if s.Consumer.OnError == spec.OnErrorDeadletter && s.Consumer.Deadletter() == "" {
 			return nil, fmt.Errorf("corekafka: processor %q: consumer.on-error=deadletter richiede consumer.deadletter-topic", s.Name)
 		}
-		// Il DLQ (via Producer condiviso) serve sia per la policy di default deadletter sia quando
-		// l'handler sceglie il deadletter a runtime (processor.DeadLetter): se c'è un
-		// deadletter-topic, il Producer deve essere presente.
+		// Il DLQ (via Producer condiviso) serve quando l'handler instrada record poison
+		// (processor.DeadLetter, Convert): se c'è un deadletter-topic, il Producer deve essere presente.
 		if s.HasDeadletter() && dlq == nil {
 			return nil, fmt.Errorf("corekafka: processor %q: consumer.deadletter-topic impostato richiede il Producer (usare corekafka.WithProducer)", s.Name)
 		}
@@ -472,10 +471,17 @@ func classify(err error, batch []*message.Record, onError string) (outcome, *pro
 	if pr, ok := errors.AsType[*processor.PoisonRecords](err); ok {
 		return outcomeDeadletter, pr, pr.Cause
 	}
-	// Errore generico: decide la policy di default dello spec. Nessuna causa per-record da attribuire:
-	// l'intero batch fallisce per lo stesso motivo.
+	// Errore generico: non si sa QUALI record lo abbiano causato, e nemmeno se sia deterministico.
+	// Non va MAI al DLQ: un Handle fallito perché il DB è irraggiungibile, mandato al DLQ e
+	// committato, è una perdita funzionale travestita da scarto. Al DLQ va solo ciò che il processor
+	// ha indicato come poison (DeadLetter, Convert) — ed è ciò che la policy deadletter promette.
+	//
+	// Cosa cambia fra le due policy è come si rigioca: fail-fast lo fa risalire come errore di
+	// business (esce, salvo restart.on-business-error); deadletter lo tratta come transitorio, cioè
+	// ricostruisce il consumer dopo il backoff dentro il budget di restart — il replay in-process
+	// che serve a un'infrastruttura applicativa momentaneamente giù, e che finito il budget esce.
 	if onError == spec.OnErrorDeadletter {
-		return outcomeDeadletter, &processor.PoisonRecords{Records: batch, Cause: err}, err
+		return outcomeFail, nil, driver.NewError(driver.SeverityRetriable, "processor", err)
 	}
 	return outcomeFail, nil, err
 }

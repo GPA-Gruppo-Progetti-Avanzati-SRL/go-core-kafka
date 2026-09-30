@@ -215,7 +215,7 @@ func TestClassify(t *testing.T) {
 		{"ErrFailFast wrappato", fmt.Errorf("ctx: %w", processor.ErrFailFast), spec.OnErrorDeadletter, outcomeFail, 0},
 		{"DeadLetter instrada i soli poison", processor.DeadLetter(cause, poison...), spec.OnErrorFailFast, outcomeDeadletter, 1},
 		{"errore generico con policy fail-fast", cause, spec.OnErrorFailFast, outcomeFail, 0},
-		{"errore generico con policy deadletter manda tutto il batch", cause, spec.OnErrorDeadletter, outcomeDeadletter, 2},
+		{"errore generico con policy deadletter non va al DLQ", cause, spec.OnErrorDeadletter, outcomeFail, 0},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -227,6 +227,26 @@ func TestClassify(t *testing.T) {
 				t.Errorf("record poison = %d, attesi %d", len(poisonRecords(got)), tc.wantPoison)
 			}
 		})
+	}
+}
+
+// Un errore generico non dice quali record lo abbiano causato né se sia deterministico: sotto
+// deadletter è transitorio (restart del consumer, replay), sotto fail-fast è di business. In nessun
+// caso va al DLQ — era il DB irraggiungibile che diventava una perdita.
+func TestClassify_ErroreGenericoSeveritaPerPolicy(t *testing.T) {
+	batch := []*message.Record{rec("t", 0, 1)}
+	cause := errors.New("dial tcp: connection refused")
+
+	_, _, got := classify(cause, batch, spec.OnErrorDeadletter)
+	if sev := driver.SeverityOf(got); sev != driver.SeverityRetriable {
+		t.Errorf("deadletter: severità = %v, attesa retriable", sev)
+	}
+	if !errors.Is(got, cause) {
+		t.Errorf("deadletter: causa persa: %v", got)
+	}
+	_, _, got = classify(cause, batch, spec.OnErrorFailFast)
+	if sev := driver.SeverityOf(got); sev != driver.SeverityBusiness {
+		t.Errorf("fail-fast: severità = %v, attesa business", sev)
 	}
 }
 

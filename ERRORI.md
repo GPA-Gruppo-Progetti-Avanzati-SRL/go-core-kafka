@@ -26,7 +26,7 @@ Ciò che l'`Handler`/`Transformer` ritorna è classificato da un'unica funzione 
 | `corekafka.DeadLetter(cause, recs...)` | i record vanno sul **deadletter-topic** e gli offset sono committati. La `cause` etichetta l'intero gruppo |
 | `corekafka.PoisonRecords` (da `Converted.DeadLetter()`) | come sopra, ma **la causa è per record**: quella del singolo record finisce nel *suo* header `corekafka-dlq-error` |
 | `corekafka.ErrFailFast` (`processor/processor.go:40`) | **nessun commit**: il batch viene replayato. È la richiesta esplicita di replay |
-| qualsiasi altro errore | decide la policy `consumer.on-error` dello spec: `fail-fast` (default, il processo esce) oppure `deadletter` |
+| qualsiasi altro errore | **mai al DLQ**: niente commit e replay, con la severità decisa da `consumer.on-error` — `fail-fast` (default: `business`, il processo esce salvo `restart.on-business-error`) oppure `deadletter` (`retriable`: il consumer è ricostruito dopo il backoff, dentro il budget di `restart`) |
 
 **Regola per chi scrive un Handler:** nella `conv` di `corekafka.Convert` vanno solo gli errori
 **deterministici** (payload malformato) → diventano poison → DLQ. Gli errori **transienti**

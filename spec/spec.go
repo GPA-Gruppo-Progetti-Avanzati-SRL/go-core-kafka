@@ -37,10 +37,19 @@ import (
 // mette il processore nel gruppo kafka_handlers, RegisterTransformer in kafka_transformers. L'engine
 // deriva il tipo dal gruppo di appartenenza (unica fonte di verità, niente mismatch con la config).
 
-// Policy sull'errore business (record "poison") in modalità handle.
+// Policy sull'errore GENERICO ritornato da Handle/Transform — non un DeadLetter, non ErrFailFast.
+// In nessuna delle due il batch va al DLQ: al DLQ vanno solo i record che il processor ha indicato
+// come poison (DeadLetter, Convert), sotto qualunque policy. Un errore generico non dice quali
+// record lo abbiano causato né se sia deterministico, e mandarlo al DLQ trasformava un'infrastruttura
+// momentaneamente giù in una perdita.
 const (
-	OnErrorDeadletter = "deadletter" // produce su DeadletterTopic, poi committa e prosegue
-	OnErrorFailFast   = "fail-fast"  // non committa ed esce: replay al riavvio (default)
+	// OnErrorDeadletter: l'errore è transitorio — niente commit, il consumer viene ricostruito dopo
+	// il backoff e il batch rigiocato, dentro il budget di `restart` (esaurito, il processo esce).
+	// Richiede deadletter-topic perché è la policy di chi instrada poison espliciti.
+	OnErrorDeadletter = "deadletter"
+	// OnErrorFailFast: l'errore è di business — niente commit e il processo esce (replay al
+	// riavvio), salvo restart.on-business-error (default).
+	OnErrorFailFast = "fail-fast"
 )
 
 // Regime di consegna di un processor in modalità TRANSFORM. Non si applica a handle, che è
@@ -626,8 +635,8 @@ func (s ProcessorSpec) Resolve(server KafkaServer) ProcessorSpec {
 // exactly-once, quindi non c'è nulla da normalizzare in Resolve (che non tocca i campi di identità).
 func (s ProcessorSpec) AtLeastOnce() bool { return s.Delivery == DeliveryAtLeastOnce }
 
-// HasDeadletter indica se è configurato un topic DLQ (abilita il deadletter, sia da policy di default
-// sia da scelta dell'handler/transformer a runtime).
+// HasDeadletter indica se è configurato un topic DLQ, cioè se l'handler/transformer può instradarci
+// i record poison (DeadLetter, Convert).
 func (s ProcessorSpec) HasDeadletter() bool {
 	return s.Consumer.Deadletter() != ""
 }

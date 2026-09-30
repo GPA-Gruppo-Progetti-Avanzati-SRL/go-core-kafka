@@ -20,7 +20,7 @@ var (
 
 	deadletteredTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "corekafka_deadlettered_records_total",
-		Help: "Numero di record poison instradati al DLQ per consumer.",
+		Help: "Numero di record poison (DeadLetter/Convert) instradati al DLQ per consumer.",
 	}, []string{"consumer"})
 
 	batchDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{

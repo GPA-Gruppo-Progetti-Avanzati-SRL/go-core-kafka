@@ -28,8 +28,19 @@ const (
 )
 
 // Handler è il contratto della modalità handle (at-least-once). Riceve un batch di record già pollati;
-// NON committa gli offset (lo fa l'engine dopo il ritorno). Ritorno nil -> l'engine committa; errore
-// -> l'engine applica la policy `consumer.on-error` del processor (deadletter | fail-fast).
+// NON committa gli offset (lo fa l'engine dopo il ritorno). Ritorno nil -> l'engine committa;
+// DeadLetter -> quei record al DLQ, poi commit; ErrFailFast -> niente commit, esce; qualsiasi altro
+// errore -> niente commit e replay, come transitorio (`on-error: deadletter`: il consumer è
+// ricostruito dopo il backoff) o di business (`on-error: fail-fast`: il processo esce). Un errore
+// generico non va MAI al DLQ: non dice quali record lo abbiano causato, né se rigiocarlo cambierebbe
+// l'esito.
+//
+// Il DLQ è AT-LEAST-ONCE: i record poison sono prodotti PRIMA del commit degli offset, quindi se il
+// commit fallisce (o il processo muore fra i due) il batch è rigiocato e gli stessi record arrivano
+// al DLQ una seconda volta, con lo stesso header Kafka-Delivery-Attempts (è calcolato dal record
+// consumato, che fra due tentativi non cambia). Chi legge il DLQ deduplica per (topic, partizione,
+// offset) d'origine, che sono negli header. In modalità transform exactly-once il problema non c'è:
+// DLQ e offset stanno nella stessa transazione.
 type Handler interface {
 	Handle(ctx context.Context, batch []*message.Record) error
 }
@@ -38,16 +49,17 @@ type Handler interface {
 // produrre. L'engine produce e committa gli offset consumati nella STESSA transazione. Modello a esiti
 // UNIFORME con Handler: ritorno (out, nil) -> produce out + commit; (out, *PoisonRecords via DeadLetter)
 // -> produce out E instrada i record poison al deadletter-topic, tutto nella stessa transazione EOS,
-// poi commit; (_, ErrFailFast) -> abort + replay; (_, altro errore) -> policy on-error dello spec.
+// poi commit; (_, ErrFailFast) -> abort + replay; (_, altro errore) -> abort + replay, con la
+// severità della policy on-error dello spec (mai al DLQ, vedi Handler).
 type Transformer interface {
 	Transform(ctx context.Context, batch []*message.Record) ([]*message.ProducerRecord, error)
 }
 
 // PoisonRecords, se ritornato da Handler.Handle, segnala all'engine che QUESTI specifici record sono
 // "poison" (es. errore di parsing deterministico) mentre il resto del batch è stato elaborato con
-// successo. L'engine instrada i record al DLQ (policy deadletter) — o esce (fail-fast) — e poi
-// committa gli offset del batch. Un qualsiasi altro errore ritornato da Handle è invece trattato come
-// transiente (es. sink irraggiungibile): l'engine NON committa e forza il replay.
+// successo. L'engine instrada i record al DLQ, sotto qualunque policy on-error, e poi committa gli
+// offset del batch. Un qualsiasi altro errore ritornato da Handle è invece trattato come transiente
+// (es. sink irraggiungibile): l'engine NON committa e forza il replay.
 type PoisonRecords struct {
 	Records []*message.Record
 	// Causes, se valorizzata, porta la causa del SINGOLO record (stessa lunghezza e stesso ordine di
@@ -85,7 +97,8 @@ var ErrFailFast = errors.New("corekafka: fail-fast requested by handler")
 // instradare QUESTI record al DLQ (e committare/produrre il resto), a prescindere dalla policy
 // on-error. In modalità handle il DLQ passa dal Producer condiviso; in modalità transform i record DLQ
 // sono prodotti nella stessa transazione EOS. Richiede un deadletter-topic configurato sullo spec;
-// altrimenti l'engine ripiega su fail-fast (nessuna perdita silenziosa).
+// altrimenti l'engine ripiega su fail-fast (nessuna perdita silenziosa). In handle il DLQ è
+// at-least-once: un commit fallito dopo la produzione ripubblica gli stessi record (vedi Handler).
 func DeadLetter(cause error, recs ...*message.Record) *PoisonRecords {
 	return &PoisonRecords{Records: recs, Cause: cause}
 }
