@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app/properties"
 )
 
 func TestProperties_Context(t *testing.T) {
@@ -16,7 +16,7 @@ func TestProperties_Context(t *testing.T) {
 		t.Fatalf("atteso nome vuoto, ottenuto %q", got)
 	}
 
-	ctx := ContextWithProperties(context.Background(), "condizione", core.Properties{"collection": "condizioni"})
+	ctx := ContextWithProperties(context.Background(), "condizione", properties.Properties{"collection": "condizioni"})
 	if got := PropertiesFromContext(ctx).GetString("collection", ""); got != "condizioni" {
 		t.Fatalf("property da ctx errata: %q", got)
 	}

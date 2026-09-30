@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// L'eredità è delegata a core.Inherit, che applica a OGNI campo la stessa regola. Questo test è la
+// L'eredità è delegata a properties.Inherit, che applica a OGNI campo la stessa regola. Questo test è la
 // controparte di quella scelta: enumera i campi per reflection e verifica che ognuno erediti e sia
 // sovrascrivibile. È ciò che prima non esisteva — l'eredità era scritta campo per campo, e un campo
 // aggiunto senza il suo ramo non ereditava senza che nulla lo segnalasse.
@@ -313,7 +313,7 @@ func TestTransactionalIDNonRaggiungeIlProducerEOS(t *testing.T) {
 	}
 	got := ProcessorSpec{Name: "ingest", Topics: []string{"t"}, GroupID: "g", TransactionalID: "eos-ingest"}.Resolve(server)
 
-	// L'eredità c'è (è la regola uniforme di core.Inherit, senza eccezioni per campo)...
+	// L'eredità c'è (è la regola uniforme di properties.Inherit, senza eccezioni per campo)...
 	if got.Producer.TransactionalID != "notifiche-pod-0" {
 		t.Fatalf("Producer.TransactionalID = %q: atteso il valore ereditato da server.producer", got.Producer.TransactionalID)
 	}

@@ -3,7 +3,7 @@ package corekafka
 import (
 	"context"
 
-	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app/properties"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/processor"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/producer"
@@ -47,8 +47,8 @@ type (
 	// Properties sono le proprietà applicative per-processor (valori con il tipo YAML nativo). Il modo
 	// raccomandato per leggerle è il mapping sui campi della struct del processor via tag `prop:`.
 	// Da non confondere con `kafka-properties`, che sono le proprietà del client librdkafka.
-	// È core.Properties: stesso tipo e stesso meccanismo dei task di go-core-batch.
-	Properties = core.Properties
+	// È properties.Properties: stesso tipo e stesso meccanismo dei task di go-core-batch.
+	Properties = properties.Properties
 	// Configurable è implementata da Handler/Transformer che vogliono le Properties all'avvio.
 	Configurable = processor.Configurable
 	// IProducer è il producer del processo, quello che l'app inietta con ProducerModule o
@@ -100,7 +100,7 @@ func DeadLetter(cause error, recs ...*Record) error {
 // BindProps mappa le properties di un processor sui campi di target taggati `prop:` (con `default:` e
 // `validate:` per campo). È il meccanismo usato automaticamente da RegisterHandler/RegisterTransformer
 // sui campi dell'Handler/Transformer: serve solo per il percorso manuale (un Configure scritto a mano).
-func BindProps(target any, props Properties) error { return core.BindProps(target, props) }
+func BindProps(target any, p Properties) error { return properties.BindProps(target, p) }
 
 // PropertiesFromContext ritorna le Properties del processor corrente (dentro Handle/Transform/Mapper).
 func PropertiesFromContext(ctx context.Context) Properties { return spec.PropertiesFromContext(ctx) }

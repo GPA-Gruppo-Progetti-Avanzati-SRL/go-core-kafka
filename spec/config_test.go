@@ -6,6 +6,7 @@ import (
 	"time"
 
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app/properties"
 )
 
 func boolPtr(b bool) *bool    { return &b }
@@ -476,7 +477,7 @@ func TestKafkaServerWithDefaults_SoloClientID(t *testing.T) {
 	if k.ClientID != "mia-app" {
 		t.Errorf("client-id = %q, atteso mia-app", k.ClientID)
 	}
-	if !core.IsZeroStruct(k.Consumer) || !k.Producer.IsZero() {
+	if !properties.IsZeroStruct(k.Consumer) || !k.Producer.IsZero() {
 		t.Error("WithDefaults non deve toccare i blocchi consumer/producer: sono le sorgenti dell'eredità")
 	}
 

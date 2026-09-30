@@ -150,7 +150,7 @@ func TestProduce(t *testing.T) {
 
 func TestProduce_ErroreDelDriverConservaLaCausa(t *testing.T) {
 	// La causa deve restare raggiungibile con errors.Is: chi produce sul DLQ deve poter distinguere un
-	// broker giù da un record rifiutato, e l'ApplicationError da solo non lo direbbe.
+	// broker giù da un record rifiutato, e il core.Error da solo non lo direbbe.
 	boom := errors.New("all brokers down")
 	d := &fakeDriverProducer{err: boom}
 	p, err := NewProducer(&fakeLifecycle{}, &fakeFactory{p: d}, validServer(), spec.ProducerTuning{})

@@ -30,6 +30,7 @@ import (
 	"time"
 
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app/properties"
 )
 
 // La modalità (handle vs transform) NON è in config: è DERIVATA dalla registrazione — RegisterHandler
@@ -175,7 +176,7 @@ type KafkaServer struct {
 // NON tocca i blocchi Consumer/Producer, ed è vincolante: quelli sono le SORGENTI dell'eredità
 // (ProcessorSpec.Resolve li usa come valori globali da cui i processor ereditano i campi non
 // valorizzati). Applicarci un default renderebbe indistinguibile "non scritto" da "scritto al
-// valore di default", e core.Inherit non avrebbe più modo di sapere cosa ereditare. I loro default
+// valore di default", e properties.Inherit non avrebbe più modo di sapere cosa ereditare. I loro default
 // li mette ConsumerTuning/ProducerTuning.WithDefaults, DOPO l'eredità.
 func (k KafkaServer) WithDefaults() KafkaServer {
 	if k.ClientID == "" {
@@ -249,11 +250,11 @@ type ConsumerTuning struct {
 
 // inherit riempie i campi non valorizzati con quelli del blocco globale `server.consumer`.
 //
-// La regola campo per campo sta in core.Inherit (go-core-app): è la stessa per tutti e tre i blocchi
+// La regola campo per campo sta in properties.Inherit (go-core-app): è la stessa per tutti e tre i blocchi
 // — "non valorizzato ⇒ prendi il valore globale" — e scriverla qui per ognuno dei 17 campi aggiungeva
 // solo la possibilità di dimenticarne uno, con un campo che silenziosamente non eredita.
 func (t ConsumerTuning) inherit(g ConsumerTuning) ConsumerTuning {
-	core.Inherit(&t, &g)
+	properties.Inherit(&t, &g)
 	return t
 }
 
@@ -384,7 +385,7 @@ type ProducerTuning struct {
 
 // inherit riempie i campi non valorizzati con quelli del blocco globale `server.producer`.
 func (p ProducerTuning) inherit(g ProducerTuning) ProducerTuning {
-	core.Inherit(&p, &g)
+	properties.Inherit(&p, &g)
 	return p
 }
 
@@ -436,7 +437,7 @@ func (p ProducerTuning) Idempotent() bool {
 // che non avrà effetto (vedi l'avviso in modalità handle).
 // Delega a isZeroStruct: ri-elencare i campi a mano era una seconda lista da tenere allineata, e
 // dimenticarne uno faceva sparire l'avviso.
-func (p ProducerTuning) IsZero() bool { return core.IsZeroStruct(p) }
+func (p ProducerTuning) IsZero() bool { return properties.IsZeroStruct(p) }
 
 // ptr è l'indirizzo di un valore costante: serve ai default dei campi puntatore, dove `&Costante`
 // non è scrivibile.
@@ -490,7 +491,7 @@ type RestartSpec struct {
 
 // inherit riempie i campi non valorizzati con quelli del blocco globale `server.restart`.
 func (r RestartSpec) inherit(g RestartSpec) RestartSpec {
-	core.Inherit(&r, &g)
+	properties.Inherit(&r, &g)
 	return r
 }
 
@@ -601,12 +602,12 @@ type ProcessorSpec struct {
 
 	// Properties applicative del processor. Il modo raccomandato per leggerle è il mapping sui campi
 	// della struct dell'Handler/Transformer via tag `prop:` (fatto al wiring, con default e validazione
-	// per campo: vedi core.BindProps); restano leggibili a runtime dal context o all'avvio tramite
+	// per campo: vedi properties.BindProps); restano leggibili a runtime dal context o all'avvio tramite
 	// l'interfaccia Configurable. È lo stesso tipo usato dai task di go-core-batch.
 	//
 	// NB: sono le properties del BUSINESS, non del client Kafka — quelle sono `kafka-properties`
 	// dentro i blocchi `consumer`/`producer`.
-	Properties core.Properties `yaml:"properties" mapstructure:"properties" json:"properties"`
+	Properties properties.Properties `yaml:"properties" mapstructure:"properties" json:"properties"`
 }
 
 // Resolve produce lo spec effettivo: eredita dai blocchi di `server` i campi non valorizzati, poi
@@ -640,18 +641,18 @@ const (
 
 // ContextWithProperties arricchisce ctx con le Properties e il nome del processor. L'engine lo chiama
 // una volta per goroutine-processor; la business logic (Handler/Transformer/Mapper) le legge da ctx.
-func ContextWithProperties(ctx context.Context, name string, p core.Properties) context.Context {
+func ContextWithProperties(ctx context.Context, name string, p properties.Properties) context.Context {
 	ctx = context.WithValue(ctx, propertiesKey, p)
 	ctx = context.WithValue(ctx, consumerNameKey, name)
 	return ctx
 }
 
 // PropertiesFromContext ritorna le Properties del processor corrente (o una mappa vuota).
-func PropertiesFromContext(ctx context.Context) core.Properties {
-	if p, ok := ctx.Value(propertiesKey).(core.Properties); ok {
+func PropertiesFromContext(ctx context.Context) properties.Properties {
+	if p, ok := ctx.Value(propertiesKey).(properties.Properties); ok {
 		return p
 	}
-	return core.Properties{}
+	return properties.Properties{}
 }
 
 // ConsumerNameFromContext ritorna il nome del processor corrente (o "").

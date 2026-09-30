@@ -553,7 +553,7 @@ Regole del mapping:
 | `default:"..."` | valore usato quando la chiave è assente; è una stringa e passa per la stessa conversione dei valori YAML (`"100"`, `"5s"`, `"true"`, `"a,b"`). |
 | `validate:"..."` | vincolo [go-playground/validator](https://github.com/go-playground/validator) applicato al singolo campo dopo il decode. Attenzione: `required` su un `int` fallisce anche col valore `0` — di norma si abbina a un `default:`. |
 
-Il meccanismo vive in **go-core-app** (`core.ProvideStruct` + `core.BindProps`) ed è lo stesso usato dai
+Il meccanismo vive in **go-core-app** (`core.ProvideStruct` + `properties.BindProps`) ed è lo stesso usato dai
 task di go-core-batch. Il costruttore fornito a fx è **sintetizzato**: dig riceve un param object con le
 sole dipendenze `inject:`/`from:`, quindi non vede mai i campi `prop:` e non prova a risolverli — e non
 serve `optional:"true"` per nasconderglieli. Per lo stesso motivo `core.In` nella struct del processor
@@ -997,7 +997,7 @@ Tre cose da sapere leggendolo:
 
 ## Metriche
 
-Registrate su Prometheus dall'engine (esposte da `core.NewServerMetrics` su `:2112/metrics`):
+Registrate su Prometheus dall'engine (esposte da `observability.NewServerMetrics` su `:2112/metrics`):
 
 | Metrica | Tipo | Label |
 |---|---|---|

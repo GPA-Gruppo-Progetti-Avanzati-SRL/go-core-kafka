@@ -3,7 +3,7 @@ package spec
 import (
 	"fmt"
 
-	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
 )
 
 // Questo file raccoglie le validazioni che la LIBRERIA garantisce, perché chiamate dai costruttori fx

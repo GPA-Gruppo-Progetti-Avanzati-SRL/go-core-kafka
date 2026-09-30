@@ -11,6 +11,7 @@ import (
 	"fmt"
 
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app/properties"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
 	"github.com/rs/zerolog/log"
@@ -93,7 +94,7 @@ func DeadLetter(cause error, recs ...*message.Record) *PoisonRecords {
 // Properties del proprio processor all'avvio (per precompute/validazione). Se implementata, l'engine
 // chiama Configure dopo il binding nome→handler; un errore fa fail-fast (l'app non parte).
 type Configurable interface {
-	Configure(props core.Properties) error
+	Configure(props properties.Properties) error
 }
 
 // HandlerRegistration lega un Handler al nome del processor (ProcessorSpec.Name).
@@ -189,7 +190,7 @@ func owner(consumerName string) string {
 // applicazione: la funzione di registrazione gira sincronamente dentro Apply, sempre nello stesso
 // punto in cui l'app chiama Module — non prima (init) né dopo (main).
 // activeConsumers mappa nome->spec dei processor attivi: serve lo spec (non il solo nome) perché il
-// wrapper di registrazione mappa le sue Properties sui campi `prop:` del processor (core.BindProps).
+// wrapper di registrazione mappa le sue Properties sui campi `prop:` del processor (properties.BindProps).
 var activeConsumers map[string]spec.ProcessorSpec // valido solo durante l'esecuzione sincrona di Apply; nil altrimenti
 
 // excludedByMode raccoglie i processor che il register ha escluso dal core.Mode corrente. Apply lo

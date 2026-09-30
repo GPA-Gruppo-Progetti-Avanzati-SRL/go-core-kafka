@@ -16,7 +16,8 @@ import (
 	"context"
 	"time"
 
-	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
+
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/internal/driver"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
@@ -24,15 +25,15 @@ import (
 	"go.uber.org/fx"
 )
 
-// liberr costruisce gli errori del package con l'ambito della libreria (vedi core.Errors).
-var liberr = core.Errors{Ambit: Ambit}
+// errs costruisce gli errori del package con l'ambito della libreria (vedi core.AmbitErrors).
+var errs = core.AmbitErrors{Ambit: Ambit}
 
 // abortTimeout limita l'abort di ripiego di TxProducer.Produce. Non è un knob di config: è la rete di
 // sicurezza di un percorso di errore, e un valore configurabile qui darebbe da scegliere su qualcosa
 // che nessuno può tarare meglio di così.
 const abortTimeout = 10 * time.Second
 
-// Ambit e codice del solo ApplicationError prodotto da corekafka: tutto il resto della
+// Ambit e codice del solo core.Error prodotto da corekafka: tutto il resto della
 // libreria ritorna error, perché l'engine non risponde a un client HTTP ma decide se
 // committare, replayare o ricostruire il consumer (vedi driver.Severity).
 const (
@@ -50,12 +51,12 @@ const (
 type IProducer interface {
 	// Produce invia i record e attende l'esito. Nella forma transazionale ogni chiamata è UNA
 	// transazione: i record diventano visibili ai consumer read_committed tutti o nessuno.
-	Produce(ctx context.Context, recs []*message.ProducerRecord) *core.ApplicationError
+	Produce(ctx context.Context, recs []*message.ProducerRecord) *core.Error
 	// ProduceTo è Produce con il topic di destinazione per i record che non ne portano uno: serve a
 	// chi pubblica su un topic deciso a runtime (una property di configurazione, il campo di un
 	// job) e non vuole ripeterlo su ogni record. Un Topic già impostato sul record NON viene
 	// sovrascritto, così resta possibile il fan-out nella stessa chiamata.
-	ProduceTo(ctx context.Context, topic string, recs []*message.ProducerRecord) *core.ApplicationError
+	ProduceTo(ctx context.Context, topic string, recs []*message.ProducerRecord) *core.Error
 }
 
 // Producer è il producer idempotente (non transazionale).
@@ -64,15 +65,15 @@ type Producer struct {
 }
 
 // Produce invia i record e attende i delivery report.
-func (p *Producer) Produce(ctx context.Context, recs []*message.ProducerRecord) *core.ApplicationError {
+func (p *Producer) Produce(ctx context.Context, recs []*message.ProducerRecord) *core.Error {
 	if err := p.d.Produce(ctx, recs); err != nil {
-		return liberr.Tech(CodeProduce).WithCause(err)
+		return errs.Tech(CodeProduce).WithCause(err)
 	}
 	return nil
 }
 
 // ProduceTo vedi IProducer.ProduceTo.
-func (p *Producer) ProduceTo(ctx context.Context, topic string, recs []*message.ProducerRecord) *core.ApplicationError {
+func (p *Producer) ProduceTo(ctx context.Context, topic string, recs []*message.ProducerRecord) *core.Error {
 	return p.Produce(ctx, withTopic(topic, recs))
 }
 
@@ -90,29 +91,29 @@ type TxProducer struct {
 
 // Produce apre una transazione, invia i record, attende l'esito e committa. Su qualsiasi errore
 // abortisce: i record prodotti non diventano visibili, e il chiamante può ritentare l'intero gruppo.
-func (p *TxProducer) Produce(ctx context.Context, recs []*message.ProducerRecord) *core.ApplicationError {
+func (p *TxProducer) Produce(ctx context.Context, recs []*message.ProducerRecord) *core.Error {
 	if len(recs) == 0 {
 		return nil
 	}
 	if err := p.d.Begin(ctx); err != nil {
-		return liberr.Tech(CodeProduce).WithCause(err)
+		return errs.Tech(CodeProduce).WithCause(err)
 	}
 	if err := p.d.Produce(ctx, recs); err != nil {
 		p.abort(ctx)
-		return liberr.Tech(CodeProduce).WithCause(err)
+		return errs.Tech(CodeProduce).WithCause(err)
 	}
 	if err := p.d.Commit(ctx); err != nil {
 		// L'abort DOPO un commit fallito non è ridondante: se il commit non è andato a buon fine la
 		// transazione è ancora aperta lato broker, e lasciarla tale blocca i consumer read_committed
 		// su quelle partizioni fino al transaction.timeout.ms.
 		p.abort(ctx)
-		return liberr.Tech(CodeProduce).WithCause(err)
+		return errs.Tech(CodeProduce).WithCause(err)
 	}
 	return nil
 }
 
 // ProduceTo vedi IProducer.ProduceTo.
-func (p *TxProducer) ProduceTo(ctx context.Context, topic string, recs []*message.ProducerRecord) *core.ApplicationError {
+func (p *TxProducer) ProduceTo(ctx context.Context, topic string, recs []*message.ProducerRecord) *core.Error {
 	return p.Produce(ctx, withTopic(topic, recs))
 }
 

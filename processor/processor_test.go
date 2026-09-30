@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	core "github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app"
+	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app/properties"
 
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/message"
 	"github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-kafka/spec"
@@ -173,13 +174,13 @@ func (h *propsHandler) Handle(context.Context, []*message.Record) error { return
 // verifica solo che il wrapper deleghi correttamente, default e validazione inclusi).
 func TestProps_BoundOnProcessorStruct(t *testing.T) {
 	var h propsHandler
-	if err := core.BindProps(&h, core.Properties{"collection": "events"}); err != nil {
+	if err := properties.BindProps(&h, properties.Properties{"collection": "events"}); err != nil {
 		t.Fatalf("errore inatteso: %v", err)
 	}
 	if h.Collection != "events" || h.BatchLimit != 100 {
 		t.Fatalf("properties non mappate: %+v", h)
 	}
-	if err := core.BindProps(&h, core.Properties{}); err == nil {
+	if err := properties.BindProps(&h, properties.Properties{}); err == nil {
 		t.Fatal("atteso errore di validazione per `collection` mancante")
 	}
 }
@@ -191,7 +192,7 @@ func TestRegisterHandler_SynthesizesInsideApply(t *testing.T) {
 		RegisterHandler[propsHandler]("eventi")
 		RegisterHandler[propsHandler]("spento") // non attivo: non deve nemmeno sintetizzare
 	}, map[string]spec.ProcessorSpec{
-		"eventi": {Name: "eventi", Properties: core.Properties{"collection": "events"}},
+		"eventi": {Name: "eventi", Properties: properties.Properties{"collection": "events"}},
 	}, nil)
 }
 
@@ -212,7 +213,7 @@ func TestRegisterTransformer_SynthesizesInsideApply(t *testing.T) {
 		RegisterTransformer[propsTransformer]("routing")
 		RegisterTransformer[propsTransformer]("spento") // non attivo: non deve nemmeno sintetizzare
 	}, map[string]spec.ProcessorSpec{
-		"routing": {Name: "routing", Properties: core.Properties{"topic": "out"}},
+		"routing": {Name: "routing", Properties: properties.Properties{"topic": "out"}},
 	}, nil)
 }
 
