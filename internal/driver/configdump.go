@@ -17,14 +17,19 @@ const Redacted = "[redacted]"
 // vocabolari diversi (librdkafka e franz-go) più l'escape hatch `kafka-properties`, che è per
 // definizione aperto — una lista chiusa avrebbe mancato la prima proprietà segreta non prevista, e
 // il modo in cui se ne sarebbe accorto qualcuno è leggendo una password nei log.
-func isSecret(key string) bool {
+//
+// Si guarda anche il VALORE: una chiave privata PEM inline (`ssl.key.pem` di librdkafka, o una
+// `kafka-properties` con un nome qualunque) ha un nome che non contiene nessuno dei marcatori, ma un
+// contenuto che si riconosce senza ambiguità. Il certificato pubblico e la CA restano in chiaro:
+// servono a diagnosticare e non sono segreti.
+func isSecret(key, value string) bool {
 	k := strings.ToLower(key)
-	for _, marker := range []string{"password", "secret", "token", "sasl.oauthbearer.config"} {
+	for _, marker := range []string{"password", "secret", "token", "sasl.oauthbearer.config", "ssl.key.pem", "private"} {
 		if strings.Contains(k, marker) {
 			return true
 		}
 	}
-	return false
+	return strings.Contains(value, "PRIVATE KEY")
 }
 
 // FormatConfig rende una configurazione una lista di righe `chiave = valore`, ordinate per chiave e
@@ -43,7 +48,7 @@ func FormatConfig(m map[string]string) []string {
 	lines := make([]string, 0, len(keys))
 	for _, k := range keys {
 		v := m[k]
-		if isSecret(k) {
+		if isSecret(k, v) {
 			v = Redacted
 		}
 		lines = append(lines, k+" = "+v)

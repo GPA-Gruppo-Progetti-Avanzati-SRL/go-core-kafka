@@ -18,6 +18,7 @@ func TestFormatConfig_SegretiMascherati(t *testing.T) {
 		// L'escape hatch kafka-properties è aperto: una chiave segreta non prevista dai due
 		// vocabolari deve essere coperta lo stesso.
 		"custom.auth.token",
+		"ssl.key.pem", // chiave privata inline di librdkafka
 	}
 	for _, k := range segreti {
 		t.Run(k, func(t *testing.T) {
@@ -32,6 +33,20 @@ func TestFormatConfig_SegretiMascherati(t *testing.T) {
 				t.Errorf("riga = %q, atteso il marcatore %s", got[0], Redacted)
 			}
 		})
+	}
+}
+
+// Una chiave privata PEM si riconosce dal contenuto, qualunque sia il nome della chiave: è la
+// forma che prende una kafka-properties scritta con un nome che nessun marcatore prevede.
+func TestFormatConfig_ChiavePrivataPerValore(t *testing.T) {
+	pem := "-----BEGIN PRIVATE KEY-----\nMIIEvQ...\n-----END PRIVATE KEY-----"
+	got := FormatConfig(map[string]string{"custom.client.material": pem, "ssl.ca.pem": "-----BEGIN CERTIFICATE-----"})
+	joined := strings.Join(got, "\n")
+	if strings.Contains(joined, "MIIEvQ") {
+		t.Fatalf("la chiave privata compare nel dump:\n%s", joined)
+	}
+	if !strings.Contains(joined, "BEGIN CERTIFICATE") {
+		t.Errorf("la CA è pubblica e serve a diagnosticare, non va mascherata:\n%s", joined)
 	}
 }
 

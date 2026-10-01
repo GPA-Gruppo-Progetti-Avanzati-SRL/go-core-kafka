@@ -1017,7 +1017,10 @@ Tre cose da sapere leggendolo:
 - **Le password non ci sono.** Qualsiasi chiave che contenga `password`, `secret`, `token` (o
   `sasl.oauthbearer.config`) è stampata come `[redacted]`. Il match è su sottostringa e non su una
   lista chiusa perché le `kafka-properties` sono un vocabolario aperto. Username, path dei certificati
-  e `security.protocol` restano in chiaro: servono a diagnosticare e non sono segreti.
+  e `security.protocol` restano in chiaro: servono a diagnosticare e non sono segreti. Anche le
+  **chiavi private** sono mascherate: per nome (`ssl.key.pem`, qualunque chiave con `private`) e per
+  contenuto — un valore che contiene un blocco `PRIVATE KEY` è `[redacted]` qualunque sia il nome,
+  perché una `kafka-properties` può chiamarlo come vuole. Il certificato pubblico e la CA restano.
 - **Le chiavi sono ordinate alfabeticamente**, così i dump di due pod si confrontano con un `diff`.
   Il blocco engine usa invece l'ordine logico in cui l'engine li applica.
 - **È la configurazione che go-core-kafka IMPOSTA, non quella che il client userà.** I default che
