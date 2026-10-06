@@ -7,8 +7,8 @@ require (
 	github.com/confluentinc/confluent-kafka-go/v2 v2.15.1
 	github.com/prometheus/client_golang v1.24.1
 	github.com/rs/zerolog v1.35.1
-	github.com/twmb/franz-go v1.22.0
-	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260915071250-4e79802e8909
+	github.com/twmb/franz-go v1.22.1
+	github.com/twmb/franz-go/pkg/kfake v0.0.0-20260927204940-b5a45ccfdf7e
 	github.com/twmb/franz-go/plugin/kotel v1.7.1
 	go.opentelemetry.io/otel v1.46.0
 	go.uber.org/fx v1.24.0
