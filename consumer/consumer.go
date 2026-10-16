@@ -266,7 +266,7 @@ func newRunner(raw spec.ProcessorSpec, k spec.KafkaServer, sm seams, f driver.Fa
 		// Il DLQ (via Producer condiviso) serve quando l'handler instrada record poison
 		// (processor.DeadLetter, Convert): se c'è un deadletter-topic, il Producer deve essere presente.
 		if s.HasDeadletter() && dlq == nil {
-			return nil, fmt.Errorf("corekafka: processor %q: consumer.deadletter-topic impostato richiede il Producer (usare corekafka.WithProducer)", s.Name)
+			return nil, fmt.Errorf("corekafka: processor %q: consumer.deadletter-topic impostato richiede il Producer del DLQ, che corekafka.Module fornisce da sé: questo errore indica un wiring fatto senza Module", s.Name)
 		}
 	case isTransformer:
 		r.transformer = t
