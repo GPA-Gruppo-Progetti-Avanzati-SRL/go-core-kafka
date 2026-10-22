@@ -1,7 +1,7 @@
-github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app v0.0.29-0.20261009130559-2b80f28e6e3b h1:+lRy94FcFl+UPZNjHUIojvxSRSBZle15cf/Rnk6c8Yw=
-github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app v0.0.29-0.20261009130559-2b80f28e6e3b/go.mod h1:nmwEylGaOLxv+VfrogU2XL2zYscjvNYkl9arQLT1Yfc=
-github.com/GPA-Gruppo-Progetti-Avanzati-SRL/tpm-common v0.1.95 h1:vuA6MhQ0/wuJmZnsPQxxc2viRo1PmtT4KQ5ZjVe4c8M=
-github.com/GPA-Gruppo-Progetti-Avanzati-SRL/tpm-common v0.1.95/go.mod h1:Q456LEsf8ywWb9GU1sIesWakRSIWe6MisfM2Q5lDJlw=
+github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app v0.0.29-0.20261022100736-e9d4241f255c h1:6Ss0yscurRtljqcxXDPMelwGj4SFp6WzR3AZyiV3jjM=
+github.com/GPA-Gruppo-Progetti-Avanzati-SRL/go-core-app v0.0.29-0.20261022100736-e9d4241f255c/go.mod h1:lAWX7m/STXeg7gdflfnyvHoFo5W19/OexeJ7hzvEzWE=
+github.com/GPA-Gruppo-Progetti-Avanzati-SRL/tpm-common v0.1.96 h1:v9SGfQpChflYHqQzTVSsHnJIcTz71klEg7aCTZmSy4s=
+github.com/GPA-Gruppo-Progetti-Avanzati-SRL/tpm-common v0.1.96/go.mod h1:Q456LEsf8ywWb9GU1sIesWakRSIWe6MisfM2Q5lDJlw=
 github.com/KimMachineGun/automemlimit v1.0.0 h1:+MqlvDE/pkJNjk1rU+O14QsH8k10nJAD0frB0lsxyvw=
 github.com/KimMachineGun/automemlimit v1.0.0/go.mod h1:n+BSXxQWDFS1DKh67Rqo0lgTsowsg6x65ak5uyngML0=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
